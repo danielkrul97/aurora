@@ -24,6 +24,7 @@ impl Default for HomeoParams {
 pub struct Homeostasis {
     pub params: HomeoParams,
     pub spike_trace: f64,
+    pub t_last_eval: Time,
 }
 
 impl Homeostasis {
@@ -32,6 +33,7 @@ impl Homeostasis {
         Self {
             params,
             spike_trace: 0.0,
+            t_last_eval: 0.0,
         }
     }
 
@@ -42,6 +44,28 @@ impl Homeostasis {
         }
         let rate_est = self.spike_trace / self.params.tau;
         self.params.eta * (rate_est - self.params.target_rate) * dt
+    }
+
+    /// Event-driven advance to absolute `t`; integrated threshold delta
+    /// over the silent interval is `eta · (s₀(1−exp(−Δt/τ)) − target·Δt)`.
+    pub fn evolve_to(&mut self, t: Time, fired_at_t: bool) -> Volts {
+        let dt = t - self.t_last_eval;
+        if dt <= 0.0 {
+            if fired_at_t {
+                self.spike_trace += 1.0;
+            }
+            self.t_last_eval = t;
+            return 0.0;
+        }
+        let decay = (-dt / self.params.tau).exp();
+        let integrated = (1.0 - decay).mul_add(self.spike_trace, -self.params.target_rate * dt);
+        let delta_v = self.params.eta * integrated;
+        self.spike_trace *= decay;
+        if fired_at_t {
+            self.spike_trace += 1.0;
+        }
+        self.t_last_eval = t;
+        delta_v
     }
 
     #[must_use]

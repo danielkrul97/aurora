@@ -16,4 +16,9 @@ path = "src/main.rs"
 [dependencies]
 
 [dev-dependencies]
+criterion = "0.5"
 rand = "0.9"
+
+[[bench]]
+name = "sparsity_scaling"
+harness = false

@@ -1,8 +1,15 @@
 //! Discrete-time network: pending synaptic deliveries inject charge into
 //! their target compartment, neurons tick, STDP updates fire on every spike.
+//!
+//! Two-factor mode (default): STDP delta is applied directly to `weight`.
+//! Three-factor mode (when both `eligibility_params` and `modulator` are
+//! `Some`): STDP delta accumulates in `synapse.eligibility`; per-step,
+//! `weight += η · M · e · dt` and `e` decays exponentially.
 
 use crate::dendrite::DendriteParams;
+use crate::eligibility::EligibilityParams;
 use crate::lif::LifParams;
+use crate::neuromodulator::Modulator;
 use crate::neuron::Neuron;
 use crate::stdp::StdpParams;
 use crate::synapse::Synapse;
@@ -21,6 +28,12 @@ pub struct Network {
     pub neurons: Vec<Neuron>,
     pub synapses: Vec<Synapse>,
     pub stdp_params: StdpParams,
+    pub eligibility_params: Option<EligibilityParams>,
+    pub modulator: Option<Modulator>,
+    /// When true, dendrite-targeted synapses route post-STDP through the
+    /// dendrite's own spikes (not the soma). Breaks the credit-assignment
+    /// symmetry that otherwise blocks R-STDP from learning XOR-like tasks.
+    pub dendrite_local_stdp: bool,
     pub now: Time,
     pending: Vec<Pending>,
     outgoing: Vec<Vec<usize>>,
@@ -69,34 +82,71 @@ impl Network {
         self.external_input[id.0] = input;
     }
 
+    pub fn schedule_input(
+        &mut self,
+        t: Time,
+        neuron: NeuronId,
+        dendrite: Option<usize>,
+        amplitude: Volts,
+    ) {
+        self.pending.push(Pending {
+            deliver_at: t,
+            target_neuron: neuron.0,
+            target_dendrite: dendrite,
+            weight: amplitude,
+        });
+    }
+
+    pub fn reward(&mut self, amount: f64) {
+        if let Some(ref mut m) = self.modulator {
+            m.reward(self.now, amount);
+        }
+    }
+
     pub fn step(&mut self, dt: Time) -> Vec<Spike> {
         self.now += dt;
 
-        let mut still_pending = Vec::with_capacity(self.pending.len());
-        for p in self.pending.drain(..) {
-            if p.deliver_at <= self.now {
+        if let Some(ref mut m) = self.modulator {
+            m.evolve_to(self.now);
+        }
+
+        let now = self.now;
+        let mut write = 0;
+        for read in 0..self.pending.len() {
+            let p = self.pending[read];
+            if p.deliver_at <= now {
                 match p.target_dendrite {
                     Some(d) => self.neurons[p.target_neuron].inject_dendrite(d, p.weight),
                     None => self.neurons[p.target_neuron].inject_soma(p.weight),
                 }
             } else {
-                still_pending.push(p);
+                self.pending[write] = p;
+                write += 1;
             }
         }
-        self.pending = still_pending;
+        self.pending.truncate(write);
 
         let mut spikes = Vec::new();
+        let mut dendrite_spikes: Vec<(usize, usize)> = Vec::new();
         for (i, neuron) in self.neurons.iter_mut().enumerate() {
-            if let Some(spike) = neuron.step(self.now, dt, self.external_input[i]) {
+            let step = neuron.step(self.now, dt, self.external_input[i]);
+            if let Some(spike) = step.soma_spike {
                 spikes.push(spike);
             }
+            for d_idx in step.dendrite_spikes {
+                dendrite_spikes.push((i, d_idx));
+            }
         }
+
+        let three_factor = self.eligibility_params.is_some() && self.modulator.is_some();
+        let dendrite_local = self.dendrite_local_stdp;
 
         for spike in &spikes {
             let i = spike.source.0;
             for &syn_idx in &self.outgoing[i] {
                 let syn = &mut self.synapses[syn_idx];
-                let _ = syn.on_pre_spike(self.now, &self.stdp_params);
+                let dw = syn.on_pre_spike(self.now, &self.stdp_params);
+                syn.apply_stdp_delta(dw, three_factor);
                 self.pending.push(Pending {
                     deliver_at: self.now + syn.delay,
                     target_neuron: syn.post_neuron.0,
@@ -106,7 +156,33 @@ impl Network {
             }
             for &syn_idx in &self.incoming[i] {
                 let syn = &mut self.synapses[syn_idx];
-                let _ = syn.on_post_spike(self.now, &self.stdp_params);
+                if dendrite_local && syn.post_dendrite.is_some() {
+                    continue;
+                }
+                let dw = syn.on_post_spike(self.now, &self.stdp_params);
+                syn.apply_stdp_delta(dw, three_factor);
+            }
+        }
+
+        if dendrite_local {
+            for &(n_idx, d_idx) in &dendrite_spikes {
+                for &syn_idx in &self.incoming[n_idx] {
+                    let syn = &mut self.synapses[syn_idx];
+                    if syn.post_dendrite != Some(d_idx) {
+                        continue;
+                    }
+                    let dw = syn.on_post_spike(self.now, &self.stdp_params);
+                    syn.apply_stdp_delta(dw, three_factor);
+                }
+            }
+        }
+
+        if let (Some(e_params), Some(m)) = (self.eligibility_params, self.modulator) {
+            let decay = (-dt / e_params.tau).exp();
+            let weight_factor = e_params.learning_rate * m.value * dt;
+            for syn in &mut self.synapses {
+                syn.weight += weight_factor * syn.eligibility;
+                syn.eligibility *= decay;
             }
         }
 

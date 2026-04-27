@@ -13,6 +13,12 @@ pub struct Neuron {
     pub homeo: Option<Homeostasis>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct NeuronStep {
+    pub soma_spike: Option<Spike>,
+    pub dendrite_spikes: Vec<usize>,
+}
+
 impl Neuron {
     #[must_use]
     pub const fn new(id: NeuronId, soma_params: LifParams) -> Self {
@@ -45,27 +51,36 @@ impl Neuron {
     }
 
     /// Dendrites tick before the soma so their boosts land in the same step.
-    pub fn step(&mut self, now: Time, dt: Time, soma_dc: Volts) -> Option<Spike> {
-        for d in &mut self.dendrites {
+    /// Returned `dendrite_spikes` lists indices of dendrites that crossed
+    /// threshold this step — used by Network for per-dendrite STDP routing.
+    pub fn step(&mut self, now: Time, dt: Time, soma_dc: Volts) -> NeuronStep {
+        let mut dendrite_spikes = Vec::new();
+        for (i, d) in self.dendrites.iter_mut().enumerate() {
             let boost = d.tick(dt);
             if boost != 0.0 {
                 self.soma.inject(boost);
+                dendrite_spikes.push(i);
             }
         }
 
-        let fired = self.soma.tick(now, dt, soma_dc);
+        let fired = self.soma.tick(now, soma_dc);
 
         if let Some(ref mut h) = self.homeo {
             self.soma.params.v_threshold += h.step(dt, fired);
         }
 
-        if fired {
+        let soma_spike = if fired {
             Some(Spike {
                 t: now,
                 source: self.id,
             })
         } else {
             None
+        };
+
+        NeuronStep {
+            soma_spike,
+            dendrite_spikes,
         }
     }
 }

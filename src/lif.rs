@@ -29,6 +29,7 @@ pub struct Lif {
     pub params: LifParams,
     pub v: Volts,
     pub last_spike_t: Option<Time>,
+    pub t_last_eval: Time,
 }
 
 impl Lif {
@@ -38,6 +39,7 @@ impl Lif {
             params,
             v: params.v_rest,
             last_spike_t: None,
+            t_last_eval: 0.0,
         }
     }
 
@@ -45,17 +47,34 @@ impl Lif {
         self.v += v;
     }
 
-    pub fn tick(&mut self, now: Time, dt: Time, dc: Volts) -> bool {
+    /// Analytically advance V to absolute time `t` with sustained input `dc`.
+    /// Refractory window of the last spike clamps V to `v_reset`.
+    pub fn evolve_to(&mut self, t: Time, dc: Volts) {
+        if t <= self.t_last_eval {
+            self.t_last_eval = t;
+            return;
+        }
         if let Some(t_last) = self.last_spike_t {
-            if now - t_last < self.params.tau_ref {
+            if t < t_last + self.params.tau_ref {
+                self.v = self.params.v_reset;
+                self.t_last_eval = t;
+                return;
+            }
+        }
+        let dt = t - self.t_last_eval;
+        let v_eq = self.params.v_rest + dc;
+        self.v = (self.v - v_eq).mul_add((-dt / self.params.tau_m).exp(), v_eq);
+        self.t_last_eval = t;
+    }
+
+    /// Refractory injects collapse V back to `v_reset` and never fire.
+    pub fn check_threshold(&mut self, now: Time) -> bool {
+        if let Some(t_last) = self.last_spike_t {
+            if now < t_last + self.params.tau_ref {
                 self.v = self.params.v_reset;
                 return false;
             }
         }
-
-        let v_eq = self.params.v_rest + dc;
-        self.v = (self.v - v_eq).mul_add((-dt / self.params.tau_m).exp(), v_eq);
-
         if self.v >= self.params.v_threshold {
             self.v = self.params.v_reset;
             self.last_spike_t = Some(now);
@@ -63,5 +82,10 @@ impl Lif {
         } else {
             false
         }
+    }
+
+    pub fn tick(&mut self, now: Time, dc: Volts) -> bool {
+        self.evolve_to(now, dc);
+        self.check_threshold(now)
     }
 }

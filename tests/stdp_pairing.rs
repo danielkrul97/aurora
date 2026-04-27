@@ -18,8 +18,8 @@ fn pre_then_post_pairing_potentiates_monotonically() {
     let mut last = syn.weight;
     let mut t = 0.0;
     for _ in 0..n_pairs {
-        let _ = syn.on_pre_spike(t, &params);
-        let _ = syn.on_post_spike(t + pair_dt, &params);
+        syn.weight += syn.on_pre_spike(t, &params);
+        syn.weight += syn.on_post_spike(t + pair_dt, &params);
         assert!(
             syn.weight >= last,
             "weight must grow monotonically: {last} → {}",
@@ -49,8 +49,8 @@ fn post_then_pre_pairing_depresses_monotonically() {
     let mut last = syn.weight;
     let mut t = 0.0;
     for _ in 0..n_pairs {
-        let _ = syn.on_post_spike(t, &params);
-        let _ = syn.on_pre_spike(t + pair_dt, &params);
+        syn.weight += syn.on_post_spike(t, &params);
+        syn.weight += syn.on_pre_spike(t + pair_dt, &params);
         assert!(
             syn.weight <= last,
             "weight must shrink monotonically: {last} → {}",

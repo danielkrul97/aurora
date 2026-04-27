@@ -1,5 +1,10 @@
 //! Synapse with pair-based STDP. Targets either a specific dendrite on the
 //! post-synaptic neuron (typical case) or the soma directly.
+//!
+//! `on_pre_spike` / `on_post_spike` return the STDP delta but do **not**
+//! mutate `weight`. The caller (Network) decides whether to apply it
+//! directly to `weight` (classical STDP) or accumulate into `eligibility`
+//! (three-factor R-STDP, committed later via the modulator).
 
 use crate::stdp::{stdp_delta, StdpParams};
 use crate::types::{NeuronId, Time, Weight};
@@ -13,6 +18,7 @@ pub struct Synapse {
     pub delay: Time,
     pub last_pre_t: Option<Time>,
     pub last_post_t: Option<Time>,
+    pub eligibility: f64,
 }
 
 impl Synapse {
@@ -32,15 +38,14 @@ impl Synapse {
             delay,
             last_pre_t: None,
             last_post_t: None,
+            eligibility: 0.0,
         }
     }
 
     pub fn on_pre_spike(&mut self, t: Time, params: &StdpParams) -> Weight {
         self.last_pre_t = Some(t);
         if let Some(t_post) = self.last_post_t {
-            let dw = stdp_delta(t_post - t, params);
-            self.weight += dw;
-            return dw;
+            return stdp_delta(t_post - t, params);
         }
         0.0
     }
@@ -48,10 +53,16 @@ impl Synapse {
     pub fn on_post_spike(&mut self, t: Time, params: &StdpParams) -> Weight {
         self.last_post_t = Some(t);
         if let Some(t_pre) = self.last_pre_t {
-            let dw = stdp_delta(t - t_pre, params);
-            self.weight += dw;
-            return dw;
+            return stdp_delta(t - t_pre, params);
         }
         0.0
+    }
+
+    pub fn apply_stdp_delta(&mut self, dw: Weight, three_factor: bool) {
+        if three_factor {
+            self.eligibility += dw;
+        } else {
+            self.weight += dw;
+        }
     }
 }

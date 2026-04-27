@@ -23,7 +23,7 @@ fn lif_firing_rate_matches_analytical() {
     let mut spike_count = 0_usize;
     for _ in 0..n_steps {
         now += dt;
-        if neuron.step(now, dt, input).is_some() {
+        if neuron.step(now, dt, input).soma_spike.is_some() {
             spike_count += 1;
         }
     }
@@ -54,6 +54,9 @@ fn lif_below_threshold_never_fires() {
     let mut now = 0.0;
     for _ in 0..n_steps {
         now += dt;
-        assert!(neuron.step(now, dt, sub_threshold_input).is_none());
+        assert!(neuron
+            .step(now, dt, sub_threshold_input)
+            .soma_spike
+            .is_none());
     }
 }

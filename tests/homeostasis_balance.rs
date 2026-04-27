@@ -52,7 +52,7 @@ fn population_converges_to_target_rate() {
     for _ in 0..measure_steps {
         now += dt;
         for (i, (n, &drive)) in neurons.iter_mut().zip(drives.iter()).enumerate() {
-            if n.step(now, dt, drive).is_some() {
+            if n.step(now, dt, drive).soma_spike.is_some() {
                 spike_counts[i] += 1;
             }
         }

@@ -28,6 +28,7 @@ impl Default for DendriteParams {
 pub struct Dendrite {
     pub params: DendriteParams,
     pub v_local: Volts,
+    pub t_last_eval: Time,
 }
 
 impl Dendrite {
@@ -36,6 +37,7 @@ impl Dendrite {
         Self {
             params,
             v_local: params.v_rest,
+            t_last_eval: 0.0,
         }
     }
 
@@ -43,15 +45,28 @@ impl Dendrite {
         self.v_local += v;
     }
 
-    pub fn tick(&mut self, dt: Time) -> Volts {
+    pub fn evolve_to(&mut self, t: Time) {
+        if t <= self.t_last_eval {
+            self.t_last_eval = t;
+            return;
+        }
+        let dt = t - self.t_last_eval;
         self.v_local = (self.v_local - self.params.v_rest)
             .mul_add((-dt / self.params.tau).exp(), self.params.v_rest);
+        self.t_last_eval = t;
+    }
 
+    pub fn check_threshold(&mut self) -> Volts {
         if self.v_local >= self.params.threshold {
             self.v_local = self.params.v_reset;
             self.params.boost
         } else {
             0.0
         }
+    }
+
+    pub fn tick(&mut self, dt: Time) -> Volts {
+        self.evolve_to(self.t_last_eval + dt);
+        self.check_threshold()
     }
 }
