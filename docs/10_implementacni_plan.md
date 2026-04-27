@@ -62,17 +62,18 @@
 **Cíl:** Neuron přestane být „jedna vana" a začne mít víc dendritů. Homeostáza drží sparsity.
 
 **Deliverables:**
-- `src/dendrite.rs` — `Dendrite { synapses: Vec<SynapseId>, V_local, threshold }` s lokálním prahováním a „dendritickým spike" do somy
-- Refaktor `Neuron`: `Neuron { soma: Lif, dendrites: Vec<Dendrite> }`
-- `src/homeostasis.rs` — pomalá adaptace prahu `θ` podle průměrné frekvence (sliding window, např. 1 s)
-- `tests/dendritic_xor.rs` — síť 4 neurony (2 vstupní, 1 dendritický s 2 kompartmenty, 1 výstupní), naučit XOR pomocí čisté STDP + manuální „odměny" (jednoduchá forma three-factor)
-- `tests/homeostasis_balance.rs` — náhodné vstupy, ověří že průměrná aktivita populace konverguje k cílovému ~3 %
+- `src/dendrite.rs` — `Dendrite { v_local, threshold, boost }` s lokálním prahováním a „dendritickým spike" do somy přes `inject`/`tick`
+- Refaktor `Neuron`: `Neuron { soma: Lif, dendrites: Vec<Dendrite>, homeo: Option<Homeostasis> }`
+- Refaktor `Lif` a `Synapse`: synapse cílí buď dendrit nebo přímo somu (`post_dendrite: Option<usize>`); dodávky vstupují přes `inject` (instantní charge), sustained currents přes `tick` DC parametr
+- `src/homeostasis.rs` — pomalá adaptace prahu `θ` přes exponentially-decaying spike trace (default τ=1 s)
+- `tests/dendritic_xor.rs` — handwired síť (2 vstupní, hidden se 2 dendrity ±, 1 výstupní), validace že dendrity + signed weights počítají XOR
+- `tests/homeostasis_balance.rs` — 100 neuronů s náhodnými drives, populační rate konverguje do pásma cílové frekvence
 
-**Exit kritérium:** XOR síť dosáhne ≥90 % accuracy po N tréninkových epizodách. Homeostáza udrží populační aktivitu v pásmu 2–5 % po dobu 10 simulovaných sekund.
+**Exit kritérium:** Handwired XOR dává správné spike counts pro všechny 4 patterns. Homeostáza drží populační rate v pásmu [1.5, 5.5] Hz při target 3 Hz.
 
-**Otevřené otázky:**
-- Počet dendritů per neuron: konstantní vs. konfigurovatelné. **Návrh: konfigurovatelné, default 4.**
-- Riziko: STDP samotné možná XOR nezvládne. Pokud ne, posune se XOR do sprintu 4 (po three-factor) a sprint 2 bude jen o dendritech + homeostáze.
+**Otevřené otázky vyřešené ve sprintu:**
+- Počet dendritů per neuron: konfigurovatelné, žádný default — uživatel volá `add_dendrite` explicitně.
+- **STDP-učené XOR posunuto do sprintu 4** (jak předpokládal contingency plan) — bez three-factor rule není reward-driven učení proveditelné. Sprint 2 dodal architektonickou primitivu (dendrity), sprint 4 přidá učení skrze ni.
 
 ---
 
@@ -102,7 +103,7 @@
 **Deliverables:**
 - `src/neuromodulator.rs` — `Modulator { value, decay }`. API `reward(amount)` zvedne `value`, `step(dt)` ho exponenciálně sníží.
 - Refaktor STDP: `Δw = stdp_base × M(t)` — synapse drží **eligibility trace** (krátkodobá paměť změny), která se „commitne" jen při vysokém `M`
-- `tests/reward_modulated_xor.rs` — XOR z reward signálu, ne z pre-stanovených párů
+- `tests/reward_modulated_xor.rs` — **STDP-učené XOR** (přesunuté ze sprintu 2): trénink z reward signálu, target ≥95 % accuracy
 - `tests/eligibility_trace.rs` — ověří že trace exponenciálně decaye a že late reward (~500 ms po spike) ještě stihne učení
 
 **Exit kritérium:** Reward-driven XOR ≥95 % accuracy. Eligibility trace test prochází.
