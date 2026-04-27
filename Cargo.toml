@@ -1,0 +1,16 @@
+[package]
+name = "aurora"
+version = "0.1.0"
+edition = "2021"
+description = "Biologically-inspired spiking neural network"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "aurora"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aurora"
+path = "src/main.rs"
+
+[dependencies]
