@@ -5,13 +5,17 @@
 
 pub mod dendrite;
 pub mod eligibility;
+pub mod encoding;
 pub mod engine;
 pub mod homeostasis;
 pub mod lif;
+pub mod mnist;
 pub mod network;
 pub mod neuromodulator;
 pub mod neuron;
+pub mod readout;
 pub mod scheduler;
 pub mod stdp;
 pub mod synapse;
+pub mod topology;
 pub mod types;

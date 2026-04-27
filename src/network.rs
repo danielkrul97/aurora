@@ -6,6 +6,8 @@
 //! `Some`): STDP delta accumulates in `synapse.eligibility`; per-step,
 //! `weight += η · M · e · dt` and `e` decays exponentially.
 
+use rayon::prelude::*;
+
 use crate::dendrite::DendriteParams;
 use crate::eligibility::EligibilityParams;
 use crate::lif::LifParams;
@@ -14,6 +16,9 @@ use crate::neuron::Neuron;
 use crate::stdp::StdpParams;
 use crate::synapse::Synapse;
 use crate::types::{NeuronId, Spike, SynapseId, Time, Volts, Weight};
+
+const M_EPSILON: f64 = 1e-4;
+const PAR_THRESHOLD: usize = 2_000;
 
 #[derive(Copy, Clone, Debug)]
 struct Pending {
@@ -34,11 +39,19 @@ pub struct Network {
     /// dendrite's own spikes (not the soma). Breaks the credit-assignment
     /// symmetry that otherwise blocks R-STDP from learning XOR-like tasks.
     pub dendrite_local_stdp: bool,
+    /// Inclusive `(min, max)` clamp applied to plastic synapse weights
+    /// after every commit. Stops Hebbian runaway. Non-plastic synapses
+    /// (e.g., lateral inhibition with hand-set strong weights) are exempt.
+    pub weight_clamp: Option<(Weight, Weight)>,
     pub now: Time,
     pending: Vec<Pending>,
     outgoing: Vec<Vec<usize>>,
     incoming: Vec<Vec<usize>>,
     external_input: Vec<Volts>,
+    /// Time the eligibility values were last brought up-to-date. Steps
+    /// where modulator is silent and no STDP fires don't touch synapses;
+    /// the deferred decay is applied lazily on the next flush.
+    t_last_eligibility_flush: Time,
 }
 
 impl Network {
@@ -103,6 +116,45 @@ impl Network {
         }
     }
 
+    /// # Panics
+    /// Panics if `syn` is out of bounds.
+    pub fn set_plastic(&mut self, syn: SynapseId, plastic: bool) {
+        self.synapses[syn.0].plastic = plastic;
+    }
+
+    /// Bring all synapse `eligibility` values up to `self.now` so that
+    /// readers (tests, diagnostics) see the value the simulation would
+    /// produce after the lazy-decay batch fires. Cheap no-op if already
+    /// current. Three-factor mode only; otherwise does nothing.
+    pub fn flush_eligibility_to_now(&mut self) {
+        if let Some(e_params) = self.eligibility_params {
+            self.flush_eligibility(e_params.tau);
+        }
+    }
+
+    fn flush_eligibility(&mut self, tau_e: Time) {
+        let dt_stale = self.now - self.t_last_eligibility_flush;
+        if dt_stale <= 0.0 {
+            return;
+        }
+        let factor = (-dt_stale / tau_e).exp();
+        if (factor - 1.0).abs() < f64::EPSILON {
+            self.t_last_eligibility_flush = self.now;
+            return;
+        }
+        if self.synapses.len() >= PAR_THRESHOLD {
+            self.synapses
+                .par_iter_mut()
+                .for_each(|s| s.eligibility *= factor);
+        } else {
+            for s in &mut self.synapses {
+                s.eligibility *= factor;
+            }
+        }
+        self.t_last_eligibility_flush = self.now;
+    }
+
+    #[allow(clippy::too_many_lines)]
     pub fn step(&mut self, dt: Time) -> Vec<Spike> {
         self.now += dt;
 
@@ -140,6 +192,14 @@ impl Network {
 
         let three_factor = self.eligibility_params.is_some() && self.modulator.is_some();
         let dendrite_local = self.dendrite_local_stdp;
+        let stdp_modifies_eligibility =
+            three_factor && (!spikes.is_empty() || (dendrite_local && !dendrite_spikes.is_empty()));
+
+        if let Some(e_params) = self.eligibility_params {
+            if stdp_modifies_eligibility {
+                self.flush_eligibility(e_params.tau);
+            }
+        }
 
         for spike in &spikes {
             let i = spike.source.0;
@@ -178,11 +238,59 @@ impl Network {
         }
 
         if let (Some(e_params), Some(m)) = (self.eligibility_params, self.modulator) {
-            let decay = (-dt / e_params.tau).exp();
+            let m_active = m.value.abs() > M_EPSILON;
             let weight_factor = e_params.learning_rate * m.value * dt;
-            for syn in &mut self.synapses {
-                syn.weight += weight_factor * syn.eligibility;
-                syn.eligibility *= decay;
+            let per_step_decay = (-dt / e_params.tau).exp();
+
+            let par = self.synapses.len() >= PAR_THRESHOLD;
+            let clamp = self.weight_clamp;
+            let apply_clamp = |w: &mut Weight, plastic: bool| {
+                if plastic {
+                    if let Some((lo, hi)) = clamp {
+                        *w = w.clamp(lo, hi);
+                    }
+                }
+            };
+            if stdp_modifies_eligibility {
+                if m_active {
+                    let f = |syn: &mut Synapse| {
+                        syn.weight += weight_factor * syn.eligibility;
+                        apply_clamp(&mut syn.weight, syn.plastic);
+                        syn.eligibility *= per_step_decay;
+                    };
+                    if par {
+                        self.synapses.par_iter_mut().for_each(f);
+                    } else {
+                        self.synapses.iter_mut().for_each(f);
+                    }
+                } else {
+                    let f = |syn: &mut Synapse| syn.eligibility *= per_step_decay;
+                    if par {
+                        self.synapses.par_iter_mut().for_each(f);
+                    } else {
+                        self.synapses.iter_mut().for_each(f);
+                    }
+                }
+                self.t_last_eligibility_flush = self.now + dt;
+            } else if m_active {
+                let dt_stale = self.now - self.t_last_eligibility_flush;
+                let flush_factor = if dt_stale > 0.0 {
+                    (-dt_stale / e_params.tau).exp()
+                } else {
+                    1.0
+                };
+                let f = |syn: &mut Synapse| {
+                    syn.eligibility *= flush_factor;
+                    syn.weight += weight_factor * syn.eligibility;
+                    apply_clamp(&mut syn.weight, syn.plastic);
+                    syn.eligibility *= per_step_decay;
+                };
+                if par {
+                    self.synapses.par_iter_mut().for_each(f);
+                } else {
+                    self.synapses.iter_mut().for_each(f);
+                }
+                self.t_last_eligibility_flush = self.now + dt;
             }
         }
 

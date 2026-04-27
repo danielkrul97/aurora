@@ -46,6 +46,7 @@ fn eligibility_decays_exponentially() {
     force_pre_post_pair(&mut net, 0.001, 0.005);
     run_for(&mut net, 0.010);
 
+    net.flush_eligibility_to_now();
     let e_initial = net.synapses[0].eligibility;
     assert!(
         e_initial > 0.0,
@@ -54,6 +55,7 @@ fn eligibility_decays_exponentially() {
 
     let t_initial = net.now;
     run_for(&mut net, TAU_E);
+    net.flush_eligibility_to_now();
     let e_after = net.synapses[0].eligibility;
 
     let elapsed = net.now - t_initial;

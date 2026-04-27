@@ -19,6 +19,11 @@ pub struct Synapse {
     pub last_pre_t: Option<Time>,
     pub last_post_t: Option<Time>,
     pub eligibility: f64,
+    /// When `false`, STDP deltas are ignored — the synapse keeps its
+    /// initial weight regardless of pre/post activity. Used for
+    /// architectural connections (e.g., lateral inhibition) that should
+    /// not erode under reward-modulated learning.
+    pub plastic: bool,
 }
 
 impl Synapse {
@@ -39,6 +44,7 @@ impl Synapse {
             last_pre_t: None,
             last_post_t: None,
             eligibility: 0.0,
+            plastic: true,
         }
     }
 
@@ -59,6 +65,9 @@ impl Synapse {
     }
 
     pub fn apply_stdp_delta(&mut self, dw: Weight, three_factor: bool) {
+        if !self.plastic {
+            return;
+        }
         if three_factor {
             self.eligibility += dw;
         } else {
