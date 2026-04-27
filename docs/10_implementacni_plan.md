@@ -159,11 +159,3 @@
 - **Benchmark vs. PyTorch SNN knihovny** (snnTorch, Norse, BindsNET). Až po sprintu 5 — porovnávat s referencí dává smysl, jen když máme co.
 
 ---
-
-## Sledování postupu
-
-Každý sprint má svou větev `sprint-N-<jmeno>` a PR do `main` po splnění exit kritéria. PR popis odkazuje na příslušnou sekci tohoto plánu a uvádí, **co se ukázalo jako jiné, než plán předpokládal** — tyhle poznámky pak iterujeme zpět do plánu.
-
----
-
-*Verze 0.1 — návrh ke schválení. Datum: 27. 4. 2026.*
