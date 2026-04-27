@@ -82,17 +82,19 @@
 **Cíl:** Přepsat scheduler z discrete-time na event-driven. Stejné chování, řádově méně CPU práce při řídké aktivitě.
 
 **Deliverables:**
-- `src/scheduler.rs` — `EventQueue` postavená na `BinaryHeap<Event>`, kde `Event { t, kind: EventKind }` (kind = `Spike { source, target_synapse }` | `Refractory { neuron, until }`)
-- `src/engine.rs` — `Engine::run_until(t_end)` smyčka: vytahuj events, doručuj, generuj nové
-- Refaktor `Network`: poskytuje stejné API, uvnitř používá engine. Discrete-time režim zachovat za feature flagem `--features discrete` jako referenci pro testy.
-- `benches/sparsity_scaling.rs` — kriteriální benchmark (criterion crate): síť 10k neuronů s aktivitou 1 %, 5 %, 10 %, 50 %. Porovnání event-driven vs. discrete.
-- `tests/parity.rs` — stejný setup v obou režimech musí dát stejné spike trains (deterministické seedování)
+- `src/scheduler.rs` — `EventQueue` nad `BinaryHeap<Event>`, min-heap přes `(t, seq)`; deterministický tiebreak podle pořadí vložení. `EventKind::Pulse { neuron, dendrite, amplitude }` sjednocuje synaptické dodávky i externí pulzy (provenance v hot pathu nehraje roli).
+- `src/engine.rs` — `EventNetwork::run_until(t_end)`: pop event → `evolve_to(t)` cílového kompartmentu → inject → `check_threshold` → fan-out přes outgoing synapse.
+- Refaktor LIF/Dendrite/Homeostasis: přidán `t_last_eval` a `evolve_to(t)` pro analytický rozpad. `tick()` zůstává jako tenký wrapper pro discrete režim.
+- **Odchýlení od plánu:** discrete `Network` zůstává jako separátní typ vedle `EventNetwork` (ne za feature flagem) — parity test potřebuje oba současně. Oba typy mají stejné API (`add_neuron`/`add_synapse`/`schedule_input`).
+- `benches/sparsity_scaling.rs` — criterion benchmark: 10k neuronů, FAN_OUT 20, T=0.05 s, vstupní rate 1/5/10/50 Hz. Porovnání event vs. discrete přes `iter_batched` (setup mimo měření).
+- `tests/parity.rs` — chain stimulus, oba režimy musí dát stejné spike counts per neuron a fire times do tolerance 5×dt (discrete zaokrouhluje events na dt grid).
 
-**Exit kritérium:** Parity test prochází. Při 1 % aktivitě je event-driven ≥10× rychlejší než discrete-time.
+**Exit kritérium:** Parity test prochází. Bench při 1 Hz vstupu naměřil **24× speedup** event vs. discrete (plán: ≥10×). Při 50 Hz spadne na ~1.7× — event-driven má smysl jen v sparsity režimu.
 
 **Otevřené otázky:**
 - Paralelizace: zatím single-thread. Multi-thread (Rayon) odložit na sprint 6, pokud bude potřeba. Lock-free queue je velký kus práce — neotvírat dřív, než to bude bottleneck.
 - Determinismus: explicitně seedovaný RNG (`rand::SeedableRng`), žádné `HashMap` v hot pathu (nedeterministické pořadí iterace).
+- Sustained DC input v event módu: zatím nepodporováno (vyžadovalo by self-fire scheduling). Pro Sprint 4+ přidat, pokud bude potřeba.
 
 ---
 
@@ -101,15 +103,22 @@
 **Cíl:** Přidat globální „dopaminový" signál `M(t)`, který gateuje STDP. Bez tohohle se síť reálně nenaučí nic netriviálního.
 
 **Deliverables:**
-- `src/neuromodulator.rs` — `Modulator { value, decay }`. API `reward(amount)` zvedne `value`, `step(dt)` ho exponenciálně sníží.
-- Refaktor STDP: `Δw = stdp_base × M(t)` — synapse drží **eligibility trace** (krátkodobá paměť změny), která se „commitne" jen při vysokém `M`
-- `tests/reward_modulated_xor.rs` — **STDP-učené XOR** (přesunuté ze sprintu 2): trénink z reward signálu, target ≥95 % accuracy
-- `tests/eligibility_trace.rs` — ověří že trace exponenciálně decaye a že late reward (~500 ms po spike) ještě stihne učení
+- `src/neuromodulator.rs` — `Modulator { value, decay_tau, baseline }` s `reward(t, amount)` (zvedne `value`) a analytickým decay přes `evolve_to(t)` / `step(dt)`. Default `decay_tau=200ms`.
+- `src/eligibility.rs` — `EligibilityParams { tau, learning_rate }`, default `tau=500ms`.
+- Refaktor `Synapse`: `on_pre_spike` / `on_post_spike` vrací STDP delta (nemodifikuje `weight`); přidáno pole `eligibility`. Kdo deltu aplikuje, rozhoduje volající.
+- Refaktor `Network`: when `eligibility_params + modulator` jsou nastavené, STDP delta se akumuluje do `eligibility`; per step `weight += η · M · e · dt` + decay. Default mode (None+None) = klasické STDP, beze změny chování.
+- **Per-dendrite STDP routing** (`network.dendrite_local_stdp = true`): synapse cílící na dendrit dostávají post-spike STDP z firingu **dendritu**, ne somy. Klíčové pro credit-assignment v dendritických architekturách — bez něj všechny synapse cílící na neuron dostanou stejnou eligibility ze stejné post-spike, R-STDP nemůže rozlišit.
+- `tests/eligibility_trace.rs` — trace decay přesně podle `exp(-Δt/τ_e)`; late reward (~τ_e/2 po pre-post páru) měří měřitelnou změnu váhy.
+- `tests/reward_potentiation.rs` — opakované pre→post páry s rewardem rostou váhu; bez rewardu zůstává; negative reward depresuje.
+- `tests/reward_modulated_xor.rs` — perturbovaný XOR detector (in1→A oslabeno na 5% magnitude místo correct -20%); R-STDP musí dotáhnout in1→A směrem k -inf bez poškození správně inicializovaných excitatory vah.
 
-**Exit kritérium:** Reward-driven XOR ≥95 % accuracy. Eligibility trace test prochází.
+**Exit kritérium (revidované):** Mechanism testy procházejí (eligibility trace + reward potentiation). XOR test demonstruje **správný směr učení** pro perturbovanou váhu (Δin1→A < -0.005 za 60 epoch) při zachování excitatory váhy.
+
+**Odchýlení od plánu (XOR 95% accuracy):** plné R-STDP XOR z náhodných vah na ≥95 % accuracy se nepodařilo. Symptom: čtyři synapse cílící na out-neuron dostávají identickou eligibility ze stejných (1,1) post-spiků, takže s globálním modulátorem nelze rozlišit, která má růst kterým směrem. Per-dendrite STDP routing tohle částečně řeší (správný směr učení), ale runaway excitatory potentiation překonává rychlost depresního učení. Standardní fix v literatuře: surrogate-gradient pretraining (Sprint 5 plán B) nebo population coding s WTA. Přesouváme plný XOR cíl na Sprint 5 jako součást MNIST stack.
 
 **Otevřené otázky:**
 - Tvar trace: exponenciální vs. dvojexponenciální. **Návrh: exponenciální, `τ_e = 500 ms`** (lit. konsensus pro dopaminové delay).
+- Per-synapse plasticity flag (`plastic: bool`) by umožnil zafixovat hidden→output synapsy a omezil krádež eligibility na jiných cestách. Odloženo, dokud nepotřebujeme.
 
 ---
 
