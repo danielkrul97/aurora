@@ -127,22 +127,55 @@
 **Cíl:** Klasifikace MNIST spiking sítí. První „nezávislé" měření — buď to funguje, nebo nefunguje, žádné výmluvy.
 
 **Deliverables:**
-- `src/encoding.rs` — převod obrázku 28×28 na spike train (rate coding: pixel intenzita → frekvence; alt. latency coding)
-- `src/topology.rs` — builder pro vrstvené sítě (`784 → 400 → 10`), zatím feedforward
-- `src/readout.rs` — klasifikace podle rate-based readoutu z výstupní vrstvy (počet spiků za okno)
-- `examples/mnist_train.rs` — trénovací smyčka (online, jeden vzorek = jedna epizoda)
-- `examples/mnist_eval.rs` — eval na test setu
-- `data/` v `.gitignore`, download script v `scripts/get_mnist.sh`
+- `src/encoding.rs` — Poisson rate coding: pixel intenzita ∈ [0,1] → spike train s mean rate `intensity · max_rate_hz` přes nezávislé inverse-CDF Poisson sampling.
+- `src/topology.rs` — `build_feedforward(layer_sizes, weight_range, delay, rng)`: vrstvy plně propojené náhodnými váhami, vrací `Network` + per-layer `Vec<NeuronId>` listy.
+- `src/readout.rs` — `count_spikes_per_neuron`, `argmax`, `predict_class` přes okno; vrací `None` pokud žádný spike.
+- `src/mnist.rs` — IDX (big-endian binary) loader pro images + labels; magic-number a size validace.
+- `src/synapse.rs` přidán `plastic: bool` flag + `Network::set_plastic(syn, false)` pro architektonické konexe (lateral inhibition apod.), které nesmí erodovat pod R-STDP.
+- `examples/mnist_train.rs` — supervised training s teacher-pulse (single +pulse na expected output ~5ms po prezentaci); ukládá váhy do `data/aurora_mnist_weights.bin`.
+- `examples/mnist_eval.rs` — načte uložené váhy, eval na test setu, hlásí accuracy a coverage.
+- `scripts/get_mnist.sh` — `curl` + `gunzip` čtyř MNIST IDX souborů z `cvdf-datasets/mnist/`.
+- `tests/classify_synthetic.rs` — smoke test na 4×4 stripe-classification (16→8→2 net): ověří, že pipeline funguje (encoding → spikes → predikce, R-STDP měřitelně mění váhy).
 
-**Exit kritérium:** ≥85 % test accuracy na MNIST. (Reference: dobré SNN mají 95–98 %, ale 85 % je důkaz, že architektura učí.)
+**Exit kritérium (revidované):** Plný 85% MNIST cíl **nesplněn v session-time scope**. Důvody jsou dva:
+1. **Compute:** plný 60k-train × 784→400→10 net by trval hodiny v debug build i s optimalizací event-driven engine; v rámci jednoho session je proveditelný jen subset (1k vzorků, scaled-down topology), což strukturálně nemůže dosáhnout 85% target.
+2. **Architektura:** Sprint 4 ukázal, že R-STDP credit-assignment selhává když konkurující synapse soutěží o credit z jednoho globálního modulátoru. Diagnostika ze synthetic testu potvrdila, že fully-connected feedforward s R-STDP vede ke kolapsu jednoho output neuronu (vždy jedna predikce). Diehl & Cook 2015 dosahují 95% s lateral inhibition + threshold adaptation + WTA — bez té architektury nelze 85% čekat ani s plným tréninkem.
+
+**Co Sprint 5 dodává místo:** kompletní infrastrukturu pro klasifikaci (encoding/topology/readout/MNIST loader/training+eval examples) + smoke test ověřující, že stack funguje end-to-end. Plný benchmark + dosažení 85% přesouváme do Sprintu 6 spolu s přidáním WTA/lateral-inhibition primitiv (a/nebo plán B: surrogate gradient pretraining).
 
 **Otevřené otázky:**
-- Pokud STDP+three-factor nedosáhne 85 %: **plán B** je surrogate gradient pretraining (jeden epoch klasickou backprop přes spike-based aktivace pomocí straight-through estimatoru), pak online fine-tuning lokální plasticitou. Tohle je hybridní cesta z dokumentu 09 sekce 7a.
-- Pokud nefunguje ani plán B: **velký design review** než pokračovat. Možná je problém v topologii (chybí inhibiční neurony? lateral inhibition?) nebo encoding (rate vs. latency vs. population coding).
+- Surrogate gradients vyžadují vlastní autograd-like vrstvu (backprop přes spike-based aktivace přes straight-through estimator). Náročné, ale dobře dokumentované — v Sprintu 6 to bude pravděpodobně preferovaná cesta.
+- WTA/lateral inhibition lze přidat hned (`set_plastic(false)` infrastruktura už existuje), ale potřebuje ladění (jak silná inhibice, kolik inhibitory neurons per layer, atd.).
 
 ---
 
-## Sprint 6 — Vyhodnocení a další směr (decision point, ne kódovací sprint)
+## Sprint 6 — WTA primitivy + lazy commit (pokus o MNIST iterace #1)
+
+**Změna scope vs. původní plán:** Sprint 6 byl plánovaný jako rozhodovací bod, ale vzhledem k Sprint 5 stropu (R-STDP credit-assignment) prioritizoval implementaci WTA architektonických primitiv + perf optimalizace, aby vůbec šlo MNIST trénovat.
+
+**Deliverables:**
+- `Network::weight_clamp: Option<(min, max)>` — clamp aplikovaný pouze na plastic synapse v commit loopu, brání Hebbian runaway.
+- `topology::add_lateral_inhibition(net, layer, strength, delay)` — all-to-all inhibitorní synapse uvnitř vrstvy, automaticky `set_plastic(false)` aby R-STDP neerodovalo.
+- **Lazy eligibility commit** v `Network::step`: kroky kde modulator je tichý a žádné STDP eventy se nedějí (typicky 80%+ inter-trial waitu) zcela přeskočí O(synapses) loop. Decay se akumuluje a aplikuje při dalším flushu.
+- **Rayon paralelizace** pro bulk synapse loop nad threshold 2 000 synapsí.
+- `Network::flush_eligibility_to_now()` — public API pro test/diagnostic kód, který chce číst aktuální eligibility hodnoty bez čekání na další step.
+- Refactor `examples/mnist_train.rs` na WTA setup (lateral hidden + output, weight clamp, supervised inhibice non-target outputs).
+- `tests/classify_synthetic.rs` smoke test s WTA primitivami.
+
+**Exit kritérium (revidované):** WTA primitivy fungující a unit-testované. Lazy commit poskytuje měřitelné zrychlení (eval ~10×, training ~3-5×). Plný 85% MNIST cíl **nadále nesplněn** — i s WTA primitivami a strong supervised inhibition v default tuningu se MNIST nedostane výrazně nad chance.
+
+**Co jsme se naučili:**
+- WTA samotné nestačí. Diehl & Cook 2015 dosahuje 95% s **kombinací**: lateral inhibition + adaptive thresholds (homeostasis) + STDP s clipping + post-hoc neuron-class assignment z aktivit. Náš homeostasis modul existuje (Sprint 2), ale nikdy nebyl integrován do MNIST setupu.
+- R-STDP s globálním modulátorem strukturálně limituje class-discrimination, protože všechny synapse z vrstvy do vrstvy "vidí" stejný reward signal. Output WTA pomáhá v inferenci ale ne v učení.
+
+**Otevřené otázky pro Sprint 7+:**
+- Integrovat homeostasis (Sprint 2 modul) do MNIST hidden vrstvy — neurons s vysokou rate adaptují threshold nahoru, vynucená diverzita features.
+- Surrogate gradient pretraining (původní Sprint 5 plán B) jako baseline, který může na MNIST uspět.
+- Per-output reward attribution (každý output má vlastní modulátor, signal jen pro synapse cílící na něj) — strukturální fix R-STDP credit-assignment.
+
+---
+
+## Sprint 7 — Vyhodnocení a další směr (původní Sprint 6, decision point)
 
 **Cíl:** Rozhodnout, kam dál. Tady končí „základní výzkum" a začíná buď scale-up k LLM, nebo iterace na architektuře.
 
