@@ -1,4 +1,5 @@
-//! Synapse with pair-based STDP. Updates run lazily on pre/post spike events.
+//! Synapse with pair-based STDP. Targets either a specific dendrite on the
+//! post-synaptic neuron (typical case) or the soma directly.
 
 use crate::stdp::{stdp_delta, StdpParams};
 use crate::types::{NeuronId, Time, Weight};
@@ -7,7 +8,8 @@ use crate::types::{NeuronId, Time, Weight};
 pub struct Synapse {
     pub weight: Weight,
     pub pre: NeuronId,
-    pub post: NeuronId,
+    pub post_neuron: NeuronId,
+    pub post_dendrite: Option<usize>,
     pub delay: Time,
     pub last_pre_t: Option<Time>,
     pub last_post_t: Option<Time>,
@@ -15,19 +17,24 @@ pub struct Synapse {
 
 impl Synapse {
     #[must_use]
-    pub const fn new(pre: NeuronId, post: NeuronId, weight: Weight, delay: Time) -> Self {
+    pub const fn new(
+        pre: NeuronId,
+        post_neuron: NeuronId,
+        post_dendrite: Option<usize>,
+        weight: Weight,
+        delay: Time,
+    ) -> Self {
         Self {
             weight,
             pre,
-            post,
+            post_neuron,
+            post_dendrite,
             delay,
             last_pre_t: None,
             last_post_t: None,
         }
     }
 
-    /// Pre-synaptic spike at time `t`. If a post-spike preceded it, applies
-    /// depression (`Δt < 0`). Returns the applied Δw (zero if no prior post).
     pub fn on_pre_spike(&mut self, t: Time, params: &StdpParams) -> Weight {
         self.last_pre_t = Some(t);
         if let Some(t_post) = self.last_post_t {
@@ -38,8 +45,6 @@ impl Synapse {
         0.0
     }
 
-    /// Post-synaptic spike at time `t`. If a pre-spike preceded it, applies
-    /// potentiation (`Δt > 0`). Returns the applied Δw (zero if no prior pre).
     pub fn on_post_spike(&mut self, t: Time, params: &StdpParams) -> Weight {
         self.last_post_t = Some(t);
         if let Some(t_pre) = self.last_pre_t {

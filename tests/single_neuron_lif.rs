@@ -1,6 +1,7 @@
 //! Constant-current LIF neuron must fire at the analytical rate within ±5%.
 
-use aurora::lif::{LifParams, Neuron};
+use aurora::lif::LifParams;
+use aurora::neuron::Neuron;
 use aurora::types::NeuronId;
 
 #[test]
@@ -18,9 +19,11 @@ fn lif_firing_rate_matches_analytical() {
     let t_total = 2.0;
     let n_steps = (t_total / dt) as usize;
 
+    let mut now = 0.0;
     let mut spike_count = 0_usize;
     for _ in 0..n_steps {
-        if neuron.step(dt, input).is_some() {
+        now += dt;
+        if neuron.step(now, dt, input).is_some() {
             spike_count += 1;
         }
     }
@@ -48,7 +51,9 @@ fn lif_below_threshold_never_fires() {
     let dt = 0.0001;
     let n_steps = 10_000;
 
+    let mut now = 0.0;
     for _ in 0..n_steps {
-        assert!(neuron.step(dt, sub_threshold_input).is_none());
+        now += dt;
+        assert!(neuron.step(now, dt, sub_threshold_input).is_none());
     }
 }

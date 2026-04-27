@@ -1,6 +1,9 @@
-//! Discrete-time network: synapses deliver, neurons integrate, STDP updates.
+//! Discrete-time network: pending synaptic deliveries inject charge into
+//! their target compartment, neurons tick, STDP updates fire on every spike.
 
-use crate::lif::{LifParams, Neuron};
+use crate::dendrite::DendriteParams;
+use crate::lif::LifParams;
+use crate::neuron::Neuron;
 use crate::stdp::StdpParams;
 use crate::synapse::Synapse;
 use crate::types::{NeuronId, Spike, SynapseId, Time, Volts, Weight};
@@ -8,7 +11,8 @@ use crate::types::{NeuronId, Spike, SynapseId, Time, Volts, Weight};
 #[derive(Copy, Clone, Debug)]
 struct Pending {
     deliver_at: Time,
-    target: usize,
+    target_neuron: usize,
+    target_dendrite: Option<usize>,
     weight: Volts,
 }
 
@@ -30,26 +34,34 @@ impl Network {
         Self::default()
     }
 
-    pub fn add_neuron(&mut self, params: LifParams) -> NeuronId {
+    pub fn add_neuron(&mut self, soma_params: LifParams) -> NeuronId {
         let id = NeuronId(self.neurons.len());
-        self.neurons.push(Neuron::new(id, params));
+        self.neurons.push(Neuron::new(id, soma_params));
         self.outgoing.push(Vec::new());
         self.incoming.push(Vec::new());
         self.external_input.push(0.0);
         id
     }
 
+    /// # Panics
+    /// Panics if `neuron` is out of bounds.
+    pub fn add_dendrite(&mut self, neuron: NeuronId, params: DendriteParams) -> usize {
+        self.neurons[neuron.0].add_dendrite(params)
+    }
+
     pub fn add_synapse(
         &mut self,
         pre: NeuronId,
-        post: NeuronId,
+        post_neuron: NeuronId,
+        post_dendrite: Option<usize>,
         weight: Weight,
         delay: Time,
     ) -> SynapseId {
         let idx = self.synapses.len();
-        self.synapses.push(Synapse::new(pre, post, weight, delay));
+        self.synapses
+            .push(Synapse::new(pre, post_neuron, post_dendrite, weight, delay));
         self.outgoing[pre.0].push(idx);
-        self.incoming[post.0].push(idx);
+        self.incoming[post_neuron.0].push(idx);
         SynapseId(idx)
     }
 
@@ -57,16 +69,16 @@ impl Network {
         self.external_input[id.0] = input;
     }
 
-    /// Advance the network by `dt`. Returns spikes emitted this step.
     pub fn step(&mut self, dt: Time) -> Vec<Spike> {
         self.now += dt;
-
-        let mut inputs = self.external_input.clone();
 
         let mut still_pending = Vec::with_capacity(self.pending.len());
         for p in self.pending.drain(..) {
             if p.deliver_at <= self.now {
-                inputs[p.target] += p.weight;
+                match p.target_dendrite {
+                    Some(d) => self.neurons[p.target_neuron].inject_dendrite(d, p.weight),
+                    None => self.neurons[p.target_neuron].inject_soma(p.weight),
+                }
             } else {
                 still_pending.push(p);
             }
@@ -75,7 +87,7 @@ impl Network {
 
         let mut spikes = Vec::new();
         for (i, neuron) in self.neurons.iter_mut().enumerate() {
-            if let Some(spike) = neuron.step(dt, inputs[i]) {
+            if let Some(spike) = neuron.step(self.now, dt, self.external_input[i]) {
                 spikes.push(spike);
             }
         }
@@ -87,7 +99,8 @@ impl Network {
                 let _ = syn.on_pre_spike(self.now, &self.stdp_params);
                 self.pending.push(Pending {
                     deliver_at: self.now + syn.delay,
-                    target: syn.post.0,
+                    target_neuron: syn.post_neuron.0,
+                    target_dendrite: syn.post_dendrite,
                     weight: syn.weight,
                 });
             }

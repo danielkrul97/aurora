@@ -8,7 +8,7 @@ use aurora::types::NeuronId;
 #[test]
 fn pre_then_post_pairing_potentiates_monotonically() {
     let params = StdpParams::default();
-    let mut syn = Synapse::new(NeuronId(0), NeuronId(1), 0.5, 0.0);
+    let mut syn = Synapse::new(NeuronId(0), NeuronId(1), None, 0.5, 0.0);
     let initial = syn.weight;
 
     let pair_dt = 0.005;
@@ -39,7 +39,7 @@ fn pre_then_post_pairing_potentiates_monotonically() {
 #[test]
 fn post_then_pre_pairing_depresses_monotonically() {
     let params = StdpParams::default();
-    let mut syn = Synapse::new(NeuronId(0), NeuronId(1), 0.5, 0.0);
+    let mut syn = Synapse::new(NeuronId(0), NeuronId(1), None, 0.5, 0.0);
     let initial = syn.weight;
 
     let pair_dt = 0.005;

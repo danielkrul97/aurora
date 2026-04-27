@@ -1,11 +1,7 @@
-//! Leaky Integrate-and-Fire neuron with exact exponential integration.
-//!
-//! Dynamics: `τ_m · dV/dt = -(V - V_rest) + input`. Between steps the input
-//! is treated as piecewise constant, so we integrate the ODE analytically:
-//! `V(t+dt) = V_eq + (V(t) - V_eq) · exp(-dt/τ_m)` with `V_eq = V_rest + input`.
-//! This avoids the O(dt) bias of explicit Euler.
+//! Leaky integrate-and-fire soma. Exact exponential integration between
+//! steps avoids the O(dt) bias of explicit Euler.
 
-use crate::types::{NeuronId, Spike, Time, Volts};
+use crate::types::{Time, Volts};
 
 #[derive(Copy, Clone, Debug)]
 pub struct LifParams {
@@ -29,49 +25,43 @@ impl Default for LifParams {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct Neuron {
-    pub id: NeuronId,
+pub struct Lif {
     pub params: LifParams,
     pub v: Volts,
     pub last_spike_t: Option<Time>,
-    pub now: Time,
 }
 
-impl Neuron {
+impl Lif {
     #[must_use]
-    pub const fn new(id: NeuronId, params: LifParams) -> Self {
-        let v = params.v_rest;
+    pub const fn new(params: LifParams) -> Self {
         Self {
-            id,
             params,
-            v,
+            v: params.v_rest,
             last_spike_t: None,
-            now: 0.0,
         }
     }
 
-    pub fn step(&mut self, dt: Time, input: Volts) -> Option<Spike> {
-        self.now += dt;
+    pub fn inject(&mut self, v: Volts) {
+        self.v += v;
+    }
 
+    pub fn tick(&mut self, now: Time, dt: Time, dc: Volts) -> bool {
         if let Some(t_last) = self.last_spike_t {
-            if self.now - t_last < self.params.tau_ref {
+            if now - t_last < self.params.tau_ref {
                 self.v = self.params.v_reset;
-                return None;
+                return false;
             }
         }
 
-        let v_eq = self.params.v_rest + input;
+        let v_eq = self.params.v_rest + dc;
         self.v = (self.v - v_eq).mul_add((-dt / self.params.tau_m).exp(), v_eq);
 
         if self.v >= self.params.v_threshold {
             self.v = self.params.v_reset;
-            self.last_spike_t = Some(self.now);
-            Some(Spike {
-                t: self.now,
-                source: self.id,
-            })
+            self.last_spike_t = Some(now);
+            true
         } else {
-            None
+            false
         }
     }
 }
