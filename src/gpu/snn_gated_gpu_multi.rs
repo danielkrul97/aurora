@@ -241,7 +241,13 @@ pub struct MultiLayerGatedSnnGpu {
     pub n_hidden: u32,
     pub n_output: u32,
     pub threshold: f32,
+    /// Sprint 30: kept as fallback for legacy paths; per-layer α below
+    /// is what `gated_cell_back` actually consumes.
     pub alpha: f32,
+    /// Per-layer surrogate width (Sprint 30 LSG). Same length as the
+    /// underlying CPU model's `layers`. Updated by `from_cpu` and any
+    /// future GPU α-grad path.
+    pub alpha_per_layer: Vec<f32>,
 
     // Layer 0 weights
     pub w_in_0: GpuBuffer,
@@ -369,6 +375,7 @@ impl MultiLayerGatedSnnGpu {
             n_output: n_output as u32,
             threshold: net.spike_fn.threshold,
             alpha: net.spike_fn.alpha,
+            alpha_per_layer: net.layers.iter().map(|l| l.alpha).collect(),
             w_in_0, w_rec_0, w_gate_in_0, w_gate_rec_0, b_h_0, b_gate_0,
             w_in_1, w_rec_1, w_gate_in_1, w_gate_rec_1, b_h_1, b_gate_1,
             w_out, b_o,
@@ -497,6 +504,11 @@ impl MultiLayerGatedSnnGpu {
         let layer_dims = [n_input, n_hidden, n_hidden];
         let mut g = MultiLayerGatedGrads::zeros(&layer_dims, n_output);
         // Layer 0
+        // Sprint 30: GPU does not yet compute per-layer α gradient
+        // (Sprint 31 unlock). Leave d_alpha at 0 — parity tests with
+        // CPU compare both at the same α value, so alpha grad mismatch
+        // doesn't matter as long as both are 0 (CPU is 0 too when α
+        // doesn't move).
         g.layers[0] = LayerGrads {
             w_in: self.grads.w_in_0.download(&self.ctx),
             w_rec: self.grads.w_rec_0.download(&self.ctx),
@@ -504,6 +516,7 @@ impl MultiLayerGatedSnnGpu {
             w_gate_rec: self.grads.w_gate_rec_0.download(&self.ctx),
             b_h: self.grads.b_h_0.download(&self.ctx),
             b_gate: self.grads.b_gate_0.download(&self.ctx),
+            d_alpha: 0.0,
         };
         g.layers[1] = LayerGrads {
             w_in: self.grads.w_in_1.download(&self.ctx),
@@ -512,6 +525,7 @@ impl MultiLayerGatedSnnGpu {
             w_gate_rec: self.grads.w_gate_rec_1.download(&self.ctx),
             b_h: self.grads.b_h_1.download(&self.ctx),
             b_gate: self.grads.b_gate_1.download(&self.ctx),
+            d_alpha: 0.0,
         };
         g.w_out = self.grads.w_out.download(&self.ctx);
         g.b_o = self.grads.b_o.download(&self.ctx);
@@ -545,11 +559,13 @@ impl MultiLayerGatedSnnGpu {
         net.layers[0].w_gate_rec = self.w_gate_rec_0.download(&self.ctx);
         net.layers[0].b_h = self.b_h_0.download(&self.ctx);
         net.layers[0].b_gate = self.b_gate_0.download(&self.ctx);
+        net.layers[0].alpha = self.alpha_per_layer.first().copied().unwrap_or(self.alpha);
         net.layers[1].w_in = self.w_in_1.download(&self.ctx);
         net.layers[1].w_rec = self.w_rec_1.download(&self.ctx);
         net.layers[1].w_gate_in = self.w_gate_in_1.download(&self.ctx);
         net.layers[1].w_gate_rec = self.w_gate_rec_1.download(&self.ctx);
         net.layers[1].b_h = self.b_h_1.download(&self.ctx);
+        net.layers[1].alpha = self.alpha_per_layer.get(1).copied().unwrap_or(self.alpha);
         net.layers[1].b_gate = self.b_gate_1.download(&self.ctx);
         net.w_out = self.w_out.download(&self.ctx);
         net.b_o = self.b_o.download(&self.ctx);
@@ -800,7 +816,7 @@ impl MultiLayerGatedSnnGpu {
                     &self.fb.d_cell_packed[layer],
                     h,
                     self.threshold,
-                    self.alpha,
+                    self.alpha_per_layer.get(layer).copied().unwrap_or(self.alpha),
                     h_v_pre_off,
                     h_v_after_prev_off,
                     gate_off,

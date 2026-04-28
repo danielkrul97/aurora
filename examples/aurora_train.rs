@@ -276,11 +276,13 @@ fn main() -> ExitCode {
         let train_bpb =
             bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
         let net_snapshot = net_gpu.to_cpu();
-        let val_bpb = evaluate(&net_snapshot, val_toks, cli.chunk, comp);
+        let (val_bpb, rates) = evaluate(&net_snapshot, val_toks, cli.chunk, comp);
         if val_bpb < best_val {
             best_val = val_bpb;
         }
         epoch_done(train_bpb, val_bpb, epoch_start.elapsed().as_secs_f64());
+        let alphas: Vec<f32> = net_snapshot.layers.iter().map(|l| l.alpha).collect();
+        epoch_diagnostics(&rates, &alphas);
 
         if let Err(e) = checkpoint::save(&cli.checkpoint, &net_snapshot, epoch + 1) {
             eprintln!("⚠ checkpoint save failed: {e}");
@@ -388,27 +390,47 @@ fn load_or_init_net(
     (net, 0)
 }
 
-fn evaluate(net: &MultiLayerGatedSnn, val_toks: &[u32], chunk: usize, comp: f32) -> f32 {
+fn evaluate(
+    net: &MultiLayerGatedSnn,
+    val_toks: &[u32],
+    chunk: usize,
+    comp: f32,
+) -> (f32, Vec<f32>) {
     if val_toks.len() < chunk + 1 {
-        return f32::INFINITY;
+        return (f32::INFINITY, vec![0.0; net.layers.len()]);
     }
+    // Stateful eval: carry hidden state across val chunks so the
+    // firing-rate measurement reflects accumulated dynamics, not just
+    // the first 64 timesteps from a cold start.
+    let mut states = net.fresh_states();
     let mut total_nats = 0.0_f32;
     let mut total_tokens = 0_usize;
+    let mut rate_acc = vec![0.0_f32; net.layers.len()];
+    let mut chunks_seen = 0_usize;
     let mut pos = 0;
     while pos + chunk < val_toks.len() {
         let inputs = &val_toks[pos..pos + chunk];
         let targets = &val_toks[pos + 1..pos + chunk + 1];
-        let cache = net.forward_lm_tokens(inputs);
+        let cache = net.forward_lm_tokens_stateful(inputs, &mut states);
         for (logits_t, &target) in cache.logits.iter().zip(targets.iter()) {
             let max = logits_t.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let log_sum_exp =
                 max + logits_t.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
             total_nats += log_sum_exp - logits_t[target as usize];
         }
+        for (acc, r) in rate_acc.iter_mut().zip(cache.firing_rates()) {
+            *acc += r;
+        }
+        chunks_seen += 1;
         total_tokens += chunk;
         pos += chunk;
     }
-    bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize)
+    let mean_rates: Vec<f32> = rate_acc
+        .into_iter()
+        .map(|s| if chunks_seen == 0 { 0.0 } else { s / chunks_seen as f32 })
+        .collect();
+    let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
+    (bpb, mean_rates)
 }
 
 fn generate(
@@ -544,6 +566,23 @@ fn epoch_done(train: f32, val: f32, elapsed: f64) {
     let body = format!(
         " epoch done — train bpb {train:>5.3}  val bpb {val:>5.3}  ({elapsed:>5.1}s)"
     );
+    println!("{}", line(&body));
+}
+
+/// Sprint 30: per-layer firing-rate + surrogate-α diagnostics. Healthy
+/// rates land in 0.05–0.20; deviations point to dead/saturated layers.
+fn epoch_diagnostics(rates: &[f32], alphas: &[f32]) {
+    let rates_s = rates
+        .iter()
+        .map(|r| format!("{r:.4}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let alphas_s = alphas
+        .iter()
+        .map(|a| format!("{a:.2}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(" rates [{rates_s}]  α [{alphas_s}]");
     println!("{}", line(&body));
 }
 fn sample_block(seed: &[u8], generated: &[u8]) {

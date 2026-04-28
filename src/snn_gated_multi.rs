@@ -48,10 +48,25 @@ pub struct GatedLayer {
     pub w_gate_rec: Vec<f32>, // [n_hidden, n_hidden]
     pub b_h: Vec<f32>,        // [n_hidden]
     pub b_gate: Vec<f32>,     // [n_hidden]
+    /// Sprint 30: per-layer learnable surrogate-gradient width.
+    /// Replaces the global `SpikeFn::alpha` in the backward pass so each
+    /// layer can adapt its surrogate to its own membrane-potential
+    /// distribution (Lian et al., IJCAI 2023). Forward (heaviside) is
+    /// unaffected — this only enters the backward via
+    /// `surrogate(v) = 1 / (1 + α|v−θ|)²`.
+    pub alpha: f32,
 }
+
+const DEFAULT_ALPHA: f32 = 4.0;
 
 impl GatedLayer {
     pub fn new<R: Rng>(n_in: usize, n_hidden: usize, rng: &mut R) -> Self {
+        // He-style init. Variance-conserving init from Klos &
+        // Memmesheimer 2024 was tried in Sprint 30 but doesn't apply
+        // cleanly: layer 0 sees a one-hot input (effective rate 1/n_in,
+        // not the canonical ν), so a single formula across layers
+        // overestimates the input variance and silences the network.
+        // Differentiating layer-0 vs deeper layers is open work.
         let scale_in = (2.0 / n_in as f32).sqrt();
         let scale_rec = 0.9 / (n_hidden as f32).sqrt();
         let scale_gate_in = 0.1 * scale_in;
@@ -79,6 +94,7 @@ impl GatedLayer {
             w_gate_rec,
             b_h: vec![0.0; n_hidden],
             b_gate: vec![1.0; n_hidden], // forget-gate-bias-1 trick
+            alpha: DEFAULT_ALPHA,
         }
     }
 }
@@ -92,6 +108,8 @@ pub struct LayerGrads {
     pub w_gate_rec: Vec<f32>,
     pub b_h: Vec<f32>,
     pub b_gate: Vec<f32>,
+    /// Sprint 30 LSG: scalar gradient for the per-layer surrogate width α.
+    pub d_alpha: f32,
 }
 
 impl LayerGrads {
@@ -103,6 +121,7 @@ impl LayerGrads {
             w_gate_rec: vec![0.0; n_hidden * n_hidden],
             b_h: vec![0.0; n_hidden],
             b_gate: vec![0.0; n_hidden],
+            d_alpha: 0.0,
         }
     }
 
@@ -113,6 +132,7 @@ impl LayerGrads {
         self.w_gate_rec.fill(0.0);
         self.b_h.fill(0.0);
         self.b_gate.fill(0.0);
+        self.d_alpha = 0.0;
     }
 
     pub fn add(&mut self, other: &Self) {
@@ -134,6 +154,7 @@ impl LayerGrads {
         for (a, b) in self.b_gate.iter_mut().zip(&other.b_gate) {
             *a += b;
         }
+        self.d_alpha += other.d_alpha;
     }
 
     pub fn iter_all(&self) -> impl Iterator<Item = &f32> {
@@ -144,6 +165,7 @@ impl LayerGrads {
             .chain(&self.w_gate_rec)
             .chain(&self.b_h)
             .chain(&self.b_gate)
+            .chain(std::iter::once(&self.d_alpha))
     }
 
     pub fn iter_all_mut(&mut self) -> impl Iterator<Item = &mut f32> {
@@ -154,6 +176,7 @@ impl LayerGrads {
             .chain(&mut self.w_gate_rec)
             .chain(&mut self.b_h)
             .chain(&mut self.b_gate)
+            .chain(std::iter::once(&mut self.d_alpha))
     }
 }
 
@@ -255,8 +278,31 @@ pub struct MultiLayerCache {
     pub logits: Vec<Vec<f32>>,
 }
 
+impl MultiLayerCache {
+    /// Sprint 30: per-layer mean firing rate over the cached forward
+    /// pass. Useful as a sanity probe — too low (≪ 0.05) means the
+    /// network is dead, too high (≫ 0.4) means the active-indices
+    /// compaction loses its sparsity advantage. Target band ~0.05–0.20.
+    #[must_use]
+    pub fn firing_rates(&self) -> Vec<f32> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                if layer.h_spike.is_empty() {
+                    return 0.0;
+                }
+                let n_h = layer.h_spike[0].len();
+                let total = (layer.h_spike.len() * n_h) as f32;
+                let count: f32 = layer.h_spike.iter().flatten().copied().sum();
+                if total > 0.0 { count / total } else { 0.0 }
+            })
+            .collect()
+    }
+}
+
 /// `n_layers` per-layer Adam state pairs (m1, m2) for each of 6
-/// parameter groups, plus top-level w_out + b_o.
+/// parameter groups, plus top-level w_out + b_o. Sprint 30 adds a
+/// 1-element group for the per-layer surrogate width α (LSG).
 #[derive(Clone, Debug)]
 struct LayerAdam {
     m_w_in: AdamGroup,
@@ -265,6 +311,7 @@ struct LayerAdam {
     m_w_gate_rec: AdamGroup,
     m_b_h: AdamGroup,
     m_b_gate: AdamGroup,
+    m_alpha: AdamGroup,
 }
 
 impl LayerAdam {
@@ -276,6 +323,7 @@ impl LayerAdam {
             m_w_gate_rec: AdamGroup::zeros(n_hidden * n_hidden),
             m_b_h: AdamGroup::zeros(n_hidden),
             m_b_gate: AdamGroup::zeros(n_hidden),
+            m_alpha: AdamGroup::zeros(1),
         }
     }
 }
@@ -412,6 +460,25 @@ impl MultiLayerGatedSnn {
                 bc1,
                 bc2,
             );
+            // Sprint 30 LSG: Adam step on per-layer surrogate width α.
+            // Treat α as a 1-element parameter vector. softplus
+            // reparametrization is unnecessary at this scale; a hard
+            // floor in `forward_lm_tokens` would be fine but in
+            // practice Adam keeps α positive on its own with default
+            // hyperparameters.
+            let mut alpha_buf = [layer.alpha];
+            let alpha_grad = [g.d_alpha];
+            adam_apply(
+                &mut alpha_buf,
+                &alpha_grad,
+                &mut st.m_alpha,
+                config,
+                bc1,
+                bc2,
+            );
+            // Floor at 0.1 — surrogate becomes ~step function as α→∞,
+            // ~constant as α→0. Stay in the useful range.
+            layer.alpha = alpha_buf[0].max(0.1);
         }
         adam_apply(
             &mut self.w_out,
@@ -638,11 +705,24 @@ impl MultiLayerGatedSnn {
 
                 // d_h_v_pre[l, t] = d_h_spike[l, t] * surrogate'(h_v_pre)
                 //                 + d_h_v_after_carry[l] (from t+1).
+                // Sprint 30 LSG: surrogate uses per-layer learnable α
+                //   surrogate(v − θ) = 1 / (1 + α|v − θ|)²
+                //   ∂surrogate/∂v = ±2α / (1 + α|v − θ|)³  (sign of v − θ)
+                //   ∂surrogate/∂α = -2|v − θ| / (1 + α|v − θ|)³
+                // Both derivatives share the cubic denominator so we
+                // compute it once per neuron-step.
+                let theta = self.spike_fn.threshold;
+                let alpha_l = layer.alpha;
                 let mut d_h_v_pre_t = vec![0.0_f32; n_h];
                 for i in 0..n_h {
-                    d_h_v_pre_t[i] = d_h_spike_t[i]
-                        * self.spike_fn.backward(cache.layers[l].h_v_pre[t][i])
-                        + d_h_v_after_carry[l][i];
+                    let dv = cache.layers[l].h_v_pre[t][i] - theta;
+                    let abs_dv = dv.abs();
+                    let denom = 1.0 + alpha_l * abs_dv;
+                    let cubic = denom * denom * denom;
+                    let s_grad = 1.0 / (denom * denom);
+                    d_h_v_pre_t[i] = d_h_spike_t[i] * s_grad + d_h_v_after_carry[l][i];
+                    // ∂L/∂α += d_h_spike × ∂surrogate/∂α
+                    layer_grad.d_alpha += d_h_spike_t[i] * (-2.0 * abs_dv / cubic);
                 }
 
                 // Layer's own input active list (for grad_w_in /

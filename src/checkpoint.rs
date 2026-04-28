@@ -9,12 +9,14 @@
 //!
 //! Binary format (little-endian):
 //! ```text
-//! magic       : [u8; 8] = b"AURORA01"
+//! magic       : [u8; 8] = b"AURORA01" or b"AURORA02"
 //! n_input     : u32
 //! n_output    : u32
 //! n_layers    : u32
 //! threshold   : f32
-//! alpha       : f32
+//! alpha       : f32   (legacy global α; v2: still written for
+//!                      compatibility, but per-layer α below is
+//!                      authoritative)
 //! epoch       : u32   (training metadata: completed epochs)
 //! _pad        : u32
 //! per layer:
@@ -26,9 +28,14 @@
 //!   w_gate_rec: f32[n_hidden * n_hidden]
 //!   b_h       : f32[n_hidden]
 //!   b_gate    : f32[n_hidden]
+//!   alpha     : f32   (Sprint 30 LSG, v2 only)
 //! w_out       : f32[n_output * top_hidden]
 //! b_o         : f32[n_output]
 //! ```
+//!
+//! Sprint 30 bumps the format to AURORA02 to carry per-layer
+//! surrogate-gradient widths (LSG). The loader still reads AURORA01
+//! and falls back per-layer α to the global one.
 //!
 //! Adam state is intentionally NOT serialized — resuming uses fresh
 //! moments. The slight optimizer warmup is acceptable; storing m1/m2
@@ -44,7 +51,8 @@ use rand::SeedableRng;
 use crate::snn_gated_multi::MultiLayerGatedSnn;
 use crate::surrogate::SpikeFn;
 
-const MAGIC: &[u8; 8] = b"AURORA01";
+const MAGIC_V1: &[u8; 8] = b"AURORA01";
+const MAGIC_V2: &[u8; 8] = b"AURORA02";
 
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
@@ -60,7 +68,7 @@ pub fn save<P: AsRef<Path>>(path: P, net: &MultiLayerGatedSnn, epoch: u32) -> io
     let f = File::create(path)?;
     let mut w = BufWriter::new(f);
 
-    w.write_all(MAGIC)?;
+    w.write_all(MAGIC_V2)?;
     write_u32(&mut w, net.n_input as u32)?;
     write_u32(&mut w, net.n_output as u32)?;
     write_u32(&mut w, net.layers.len() as u32)?;
@@ -78,6 +86,7 @@ pub fn save<P: AsRef<Path>>(path: P, net: &MultiLayerGatedSnn, epoch: u32) -> io
         write_f32_slice(&mut w, &layer.w_gate_rec)?;
         write_f32_slice(&mut w, &layer.b_h)?;
         write_f32_slice(&mut w, &layer.b_gate)?;
+        write_f32(&mut w, layer.alpha)?;
     }
     write_f32_slice(&mut w, &net.w_out)?;
     write_f32_slice(&mut w, &net.b_o)?;
@@ -95,12 +104,16 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
 
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
-    if &magic != MAGIC {
+    let version: u32 = if &magic == MAGIC_V2 {
+        2
+    } else if &magic == MAGIC_V1 {
+        1
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "bad checkpoint magic",
         ));
-    }
+    };
     let n_input = read_u32(&mut r)? as usize;
     let n_output = read_u32(&mut r)? as usize;
     let n_layers = read_u32(&mut r)? as usize;
@@ -110,7 +123,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     let _pad = read_u32(&mut r)?;
 
     let mut hidden_dims = Vec::with_capacity(n_layers);
-    let mut layer_blobs: Vec<[Vec<f32>; 6]> = Vec::with_capacity(n_layers);
+    let mut layer_blobs: Vec<([Vec<f32>; 6], f32)> = Vec::with_capacity(n_layers);
     for _ in 0..n_layers {
         let n_in = read_u32(&mut r)? as usize;
         let n_hidden = read_u32(&mut r)? as usize;
@@ -121,7 +134,15 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
         let w_gate_rec = read_f32_vec(&mut r, n_hidden * n_hidden)?;
         let b_h = read_f32_vec(&mut r, n_hidden)?;
         let b_gate = read_f32_vec(&mut r, n_hidden)?;
-        layer_blobs.push([w_in, w_rec, w_gate_in, w_gate_rec, b_h, b_gate]);
+        let layer_alpha = if version >= 2 {
+            read_f32(&mut r)?
+        } else {
+            alpha
+        };
+        layer_blobs.push((
+            [w_in, w_rec, w_gate_in, w_gate_rec, b_h, b_gate],
+            layer_alpha,
+        ));
     }
     let top_hidden = *hidden_dims.last().expect("≥1 layer");
     let w_out = read_f32_vec(&mut r, n_output * top_hidden)?;
@@ -135,7 +156,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
         SpikeFn { threshold, alpha },
         &mut rng,
     );
-    for (i, blob) in layer_blobs.into_iter().enumerate() {
+    for (i, (blob, layer_alpha)) in layer_blobs.into_iter().enumerate() {
         let [w_in, w_rec, w_gate_in, w_gate_rec, b_h, b_gate] = blob;
         let layer = &mut net.layers[i];
         layer.w_in = w_in;
@@ -144,6 +165,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
         layer.w_gate_rec = w_gate_rec;
         layer.b_h = b_h;
         layer.b_gate = b_gate;
+        layer.alpha = layer_alpha;
     }
     net.w_out = w_out;
     net.b_o = b_o;
