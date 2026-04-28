@@ -10,7 +10,8 @@
     clippy::missing_panics_doc,
     clippy::doc_markdown,
     clippy::assigning_clones,
-    clippy::struct_field_names
+    clippy::struct_field_names,
+    clippy::too_long_first_doc_paragraph
 )]
 
 //! Multi-layer gated recurrent SNN (Sprint 23).
@@ -368,6 +369,35 @@ impl LayerAdam {
     }
 }
 
+/// Sprint 32: spike-rate regularization. Adds a constant-per-layer
+/// term to the `b_h` gradient proportional to `(rate − target)`, which
+/// pushes the bias down when the layer over-fires (runaway recurrent
+/// integration) and up when it under-fires. Decoupled from the
+/// surrogate path so the regularization signal is always non-zero,
+/// even when the surrogate has gone flat at saturation.
+#[derive(Clone, Copy, Debug)]
+pub struct RateReg {
+    pub target: f32,
+    pub lambda: f32,
+}
+
+impl Default for RateReg {
+    fn default() -> Self {
+        // target=0.1 is the firing rate that keeps the active-indices
+        // compaction comfortably sparse. λ=0.01 is a gentle default —
+        // doesn't kill firing on small/short tests, doesn't dominate
+        // CE gradients. For overnight runs where membrane runaway
+        // matters more, callers can crank λ on the network directly.
+        // Adam's moment normalization mostly absorbs the constant
+        // bias correction, so seeing a measurable rate shift requires
+        // either much higher λ or many epochs.
+        Self {
+            target: 0.1,
+            lambda: 0.01,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MultiLayerGatedSnn {
     pub n_input: usize,
@@ -376,6 +406,7 @@ pub struct MultiLayerGatedSnn {
     pub w_out: Vec<f32>,
     pub b_o: Vec<f32>,
     pub spike_fn: SpikeFn,
+    pub rate_reg: RateReg,
     grads: MultiLayerGatedGrads,
     adam_t: usize,
     layer_adam: Vec<LayerAdam>,
@@ -422,6 +453,7 @@ impl MultiLayerGatedSnn {
             w_out,
             b_o: vec![0.0; n_output],
             spike_fn,
+            rate_reg: RateReg::default(),
             adam_t: 0,
             layer_adam,
             adam_w_out: AdamGroup::zeros(n_output * top_hidden),
@@ -852,6 +884,28 @@ impl MultiLayerGatedSnn {
                     d_h_spike_from_above = (0..n_in)
                         .map(|i| d_from_w_in[i] + d_from_w_gate_in[i])
                         .collect();
+                }
+            }
+        }
+
+        // Sprint 32 spike-rate l2 regularization. Push b_h toward
+        // settings that produce a target firing rate. Decoupled from
+        // the surrogate path on purpose — prevents the runaway
+        // membrane integration observed in Sprint 31 (peaks > 30 k)
+        // even when the surrogate is saturated.
+        let RateReg { target, lambda } = self.rate_reg;
+        if lambda > 0.0 && t_steps > 0 {
+            for (l, layer_cache) in cache.layers.iter().enumerate() {
+                let n_h = self.layers[l].n_hidden;
+                let total = (t_steps * n_h) as f32;
+                if total == 0.0 {
+                    continue;
+                }
+                let count: f32 = layer_cache.h_spike.iter().flatten().copied().sum();
+                let rate = count / total;
+                let correction = 2.0 * lambda * (rate - target);
+                for bh in &mut grads.layers[l].b_h {
+                    *bh += correction;
                 }
             }
         }

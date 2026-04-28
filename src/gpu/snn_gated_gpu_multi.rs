@@ -166,6 +166,10 @@ struct FbScratch {
 
     initial_h_v_after: GpuBuffer,
     initial_h_spike: GpuBuffer,
+
+    /// Sprint 32: 2-element scratch (one per layer) holding spike sums
+    /// from the rate-reduce kernel. Reused per chunk.
+    spike_count: GpuBuffer,
 }
 
 impl FbScratch {
@@ -223,6 +227,7 @@ impl FbScratch {
             ],
             initial_h_v_after: GpuBuffer::zeros(ctx, "initial_h_v_after", b * l * n_hidden),
             initial_h_spike: GpuBuffer::zeros(ctx, "initial_h_spike", b * l * n_hidden),
+            spike_count: GpuBuffer::zeros(ctx, "spike_count", l),
         }
     }
 
@@ -281,6 +286,9 @@ pub struct MultiLayerGatedSnnGpu {
     adam_kernel: Arc<AdamStepKernel>,
     scale: Arc<ScaleBufferKernel>,
     zero: Arc<ZeroBufferKernel>,
+    spike_rate_reduce: Arc<crate::gpu::kernels::SpikeRateReduceKernel>,
+    rate_reg_bias: Arc<crate::gpu::kernels::RateRegBiasKernel>,
+    pub rate_reg: crate::snn_gated_multi::RateReg,
 
     bind_l0: wgpu::BindGroup,
     bind_l1: wgpu::BindGroup,
@@ -337,6 +345,10 @@ impl MultiLayerGatedSnnGpu {
         let adam_kernel = Arc::new(AdamStepKernel::new(&ctx));
         let scale = Arc::new(ScaleBufferKernel::new(&ctx));
         let zero = Arc::new(ZeroBufferKernel::new(&ctx));
+        let spike_rate_reduce =
+            Arc::new(crate::gpu::kernels::SpikeRateReduceKernel::new(&ctx));
+        let rate_reg_bias =
+            Arc::new(crate::gpu::kernels::RateRegBiasKernel::new(&ctx));
 
         let grads = MultiLayerGpuGrads::zeros(&ctx, n_input, n_hidden, n_output);
         let adam = MultiLayerGpuAdam::zeros(&ctx, n_input, n_hidden, n_output);
@@ -392,6 +404,9 @@ impl MultiLayerGatedSnnGpu {
             adam_kernel,
             scale,
             zero,
+            spike_rate_reduce,
+            rate_reg_bias,
+            rate_reg: net.rate_reg,
             bind_l0,
             bind_l1,
             bind_io: None,
@@ -664,6 +679,9 @@ impl MultiLayerGatedSnnGpu {
         self.gpu_forward(t_steps, batch_size);
         let total_loss = self.compute_d_logits_gpu(batch_size, t_steps);
         self.gpu_backward(t_steps, batch_size);
+        if self.rate_reg.lambda > 0.0 {
+            self.apply_rate_reg(t_steps, batch_size);
+        }
 
         let n = self.n_hidden as usize;
         let h_v_after_full = self.fb.h_v_after_packed.download(&self.ctx);
@@ -680,6 +698,57 @@ impl MultiLayerGatedSnnGpu {
         }
 
         total_loss
+    }
+
+    /// Sprint 32: dispatch the spike-rate l2 regularization correction.
+    /// Two passes per layer (reduce → bias add). Both are tiny (one
+    /// workgroup for reduce, `n_hidden / 256` for add) so overhead
+    /// stays under ~50 µs per chunk even at hidden=1024.
+    fn apply_rate_reg(&mut self, t_steps: usize, batch_size: usize) {
+        let n = self.n_hidden as usize;
+        let l = 2_usize;
+        let slice_len = (t_steps + 1) * n; // includes the initial slot
+        let sample_stride = l * slice_len;
+        let initial_skip = n; // first N elements are the t=0 initial state
+        let total_elems = (batch_size * t_steps * n) as f32;
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("aurora multi rate_reg"),
+            });
+        for layer_idx in 0..2u32 {
+            let layer_offset = layer_idx as usize * slice_len;
+            self.spike_rate_reduce.dispatch_into(
+                &self.ctx,
+                &mut encoder,
+                &self.fb.h_spike_packed,
+                &self.fb.spike_count,
+                layer_offset as u32,
+                sample_stride as u32,
+                slice_len as u32,
+                initial_skip as u32,
+                batch_size as u32,
+                layer_idx,
+            );
+            let b_h_grad = if layer_idx == 0 {
+                &self.grads.b_h_0
+            } else {
+                &self.grads.b_h_1
+            };
+            self.rate_reg_bias.dispatch_into(
+                &self.ctx,
+                &mut encoder,
+                &self.fb.spike_count,
+                b_h_grad,
+                self.n_hidden,
+                layer_idx,
+                total_elems,
+                self.rate_reg.lambda,
+                self.rate_reg.target,
+            );
+        }
+        self.ctx.queue.submit(Some(encoder.finish()));
     }
 
     fn gpu_forward(&mut self, t_steps: usize, batch_size: usize) {

@@ -136,32 +136,59 @@ Implementace Sprintu 30 odhalila zásadní fakt: **hidden vrstvy nikdy nefires**
 
 ---
 
-## Sprint 32 — Stabilizace + dotáhnout zbylé Sprint 30 items
+## Sprint 32 — Spike-rate l2 reg ✓ DONE (částečně)
 
-**Cíl:** Membrane runaway pod kontrolu, plus zbylé items z Sprintu 30 na všechny tréninkové cesty.
+**Hotovo:**
 
-**Deliverables:**
+1. **Spike-rate l2 reg na bias** (CPU + GPU). `RateReg { target: 0.1, lambda: 0.01 }` na `MultiLayerGatedSnn`. Dva nové GPU kernely:
+   - `SpikeRateReduceKernel` — workgroup-shared reduction `h_spike_packed[layer_slice]` → scalar count per layer (1 dispatch per layer per chunk)
+   - `RateRegBiasKernel` — adds `2λ × (count/total − target)` ke každé `b_h_grad[i]` v layer
+   - Total overhead: ~50 µs per chunk per layer, zanedbatelné
 
-1. **Spike-rate l2 reg na bias.** Hlavní páka pro krocení runaway peaks (7k–30k naměřené v Sprintu 31).
-   - CPU: per-layer rate spočítán v forward, přidán `2 × λ × (rate − target) / (B × T × N)` do `b_h` gradientu.
-   - GPU: rate counted v megakernelu (1 atomic per layer), přidáno k bias gradientu po backward.
-   - λ=0.01, target=0.1 jako startovní hodnoty.
+   CPU varianta dělá totéž v `backward_lm_tokens_into` před návratem.
 
-2. **TET loss.**
-   - CPU `snn_loss::cross_entropy_with_grad` rozšířen o `tet_lambda: f32` (default 0.05). Při λ > 0 přidá `λ × MSE(softmax(z), onehot(y))` do loss; gradient `2 × p_i × (p_i − y_i)`.
-   - GPU `softmax_ce` kernel: stejný add ze strany WGSL (push constant `tet_lambda`).
+   `MultiLayerGatedSnnGpu` přebírá `rate_reg` z CPU netu při `from_cpu`. `aurora_train` pracuje s defaultními hodnotami; user může přepsat na CPU netu před `from_cpu`.
 
-3. **GPU side α-gradient.** Reduction kernel (`reduce_alpha_grad.wgsl`):
-   - Vstup: `d_h_spike` packed (B × T × N), `h_v_pre` packed (stejný shape).
-   - Per-thread compute `d_h_spike[i] × ∂surrogate/∂α` for `α_local`.
-   - Workgroup-shared reduction → 1 atomic add do per-layer α-grad scalaru.
-   - Adam step pro α buffer na GPU.
+**Měřené delty proti Sprint 31 baseline:**
 
-**Exit kritéria:**
-- Membrane peaks pod 100 (vs současné 7k–30k).
-- Per-layer rates konvergují k cílovým 0.1 ± 0.05 do konce 1. epochy.
-- BPB stejný nebo lepší než Sprint 31 baseline (2.684 na tiny_200k h=1024 vocab=4096).
-- Žádná regression v gpu_parity testech.
+| Test | Před | Po | Delta |
+|---|---|---|---|
+| GPU aurora_train tiny_200k h=1024 vocab=4096, 1 ep | val BPB 2.684, peaks 7k/30k | val BPB 2.684, peaks 9.6k/32k | žádná, runaway nezmenšen |
+| GPU parity tests | 6/6 ✓ | 6/6 ✓ | žádná regrese |
+| CPU regression byte 50K | 4.68, rates [0.50, 0.54] | 4.68, rates [0.50, 0.54] | žádná regrese |
+
+**Co jsme se dozvěděli (Adam absorbuje signal):**
+
+Per-layer rate reg correction je konstantní napříč vrstvou (`2λ × diff` přidáno ke všem `b_h_grad[i]`). Adam moment-normalizace tuto konstantní pertubaci v podstatě absorbuje — efektivní step na bias je drcen tím že ostatní parametry mají typically srovnatelné magnitude gradientů. Vyšší λ (0.05–0.1) sice viditelně shifne rate, ale na CPU regression suite (50K corpus, 80 chunks) zabije firing entirely (BPB 7.77 = random).
+
+**Důsledek:** mechanismus je v pipelině, ale potřebuje *smarter formulation* aby měl reálný účinek bez destabilizace. Kandidáti pro Sprint 33:
+
+| Přístup | Effort | Riziko |
+|---|---|---|
+| **Per-neuron rate reg** — každý neuron má vlastní rate, vlastní correction; jemnější kontrola | medium | low |
+| **AdamW-style decoupled rate reg** — bias decay aplikován po Adam stepu, mimo gradient cestu | small | low |
+| **Surrogate-aware rate reg** — `correction_per_neuron = 2λ × (rate − target) × Σ surrogate(v_t,i)`, projde naturalním gradient flow | small | medium |
+
+**Záměrně neřešeno v Sprintu 32 (přesouváme do 33+):**
+- TET loss (`softmax_ce` kernel surgery — větší než 2-h sprint).
+- GPU side α-gradient (reduction kernel, malý ale samostatný).
+
+---
+
+## Sprint 33 — Tuning rate reg + zbylé Sprint 30 items
+
+**Cíl:** Reálně využít rate reg (smarter formulation) + dotáhnout zbylé items.
+
+**Priority deliverables:**
+
+1. **Per-neuron rate reg** — místo per-layer scalar correction použít per-neuron rate, per-neuron correction. Implementace:
+   - Reduce kernel mění output shape: `[n_hidden]` per layer místo `[1]`. Per-neuron sum přes (B, T).
+   - Bias add kernel reads per-neuron rate, applies `2λ × (rate_i − target)` per neuron.
+   - Tohle dá modelu možnost potlačit přemíru-firing neurony zvlášť aniž by tlačil dolů celou vrstvu.
+
+2. **TET loss** (CPU + GPU).
+
+3. **GPU side α-gradient** (reduction kernel + Adam step na α buffer).
 
 ---
 

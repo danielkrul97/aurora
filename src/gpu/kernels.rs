@@ -2090,3 +2090,303 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+// =====================================================================
+// Sprint 32: spike-rate l2 regularization (GPU port).
+// =====================================================================
+
+// Reduction kernel: sums `h_spike_packed[layer_offset .. + slice_len]`
+// across the batch, writing one f32 to `count_out[layer_idx]`.
+//
+// `h_spike_packed` layout: per sample `b`, per layer `l`, per
+// `slot` ∈ 0..=T (slot 0 is initial state — skip it via `initial_skip`).
+// We sum spikes over (B × T × N) for a given layer.
+const SPIKE_RATE_REDUCE_WGSL: &str = "
+struct SR {
+    layer_offset: u32,         // per-sample offset for this layer's slice
+    sample_stride: u32,        // bytes... wait, elements: total per-sample stride across all layers
+    slice_len: u32,            // (T+1) * N  for this layer
+    initial_skip: u32,         // = N (we don't count slot 0 = initial state)
+    batch_size: u32,
+    layer_idx: u32,
+    _p0: u32,
+    _p1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> h_spike: array<f32>;
+@group(0) @binding(1) var<storage, read_write> count_out: array<f32>;
+var<push_constant> p: SR;
+
+var<workgroup> sh: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    var local: f32 = 0.0;
+    let total = p.batch_size * p.slice_len;
+    var i: u32 = tid;
+    loop {
+        if (i >= total) { break; }
+        let b = i / p.slice_len;
+        let elem = i % p.slice_len;
+        if (elem >= p.initial_skip) {
+            let idx = b * p.sample_stride + p.layer_offset + elem;
+            local = local + h_spike[idx];
+        }
+        i = i + 256u;
+    }
+    sh[tid] = local;
+    workgroupBarrier();
+
+    var s: u32 = 128u;
+    loop {
+        if (s == 0u) { break; }
+        if (tid < s) { sh[tid] = sh[tid] + sh[tid + s]; }
+        workgroupBarrier();
+        s = s / 2u;
+    }
+    if (tid == 0u) { count_out[p.layer_idx] = sh[0]; }
+}
+";
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct SpikeRateReduceParams {
+    layer_offset: u32,
+    sample_stride: u32,
+    slice_len: u32,
+    initial_skip: u32,
+    batch_size: u32,
+    layer_idx: u32,
+    _p0: u32,
+    _p1: u32,
+}
+
+pub struct SpikeRateReduceKernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bind_group_layout: Arc<wgpu::BindGroupLayout>,
+}
+
+impl SpikeRateReduceKernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("aurora spike_rate_reduce wgsl"),
+                source: wgpu::ShaderSource::Wgsl(SPIKE_RATE_REDUCE_WGSL.into()),
+            });
+        let bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("aurora spike_rate_reduce bgl"),
+                entries: &[storage_entry(0, true), storage_entry(1, false)],
+            });
+        let pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("aurora spike_rate_reduce pl"),
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..32,
+                }],
+            });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("aurora spike_rate_reduce pipeline"),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        Self {
+            pipeline: Arc::new(pipeline),
+            bind_group_layout: Arc::new(bgl),
+        }
+    }
+
+    pub fn dispatch_into(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        h_spike: &GpuBuffer,
+        count_out: &GpuBuffer,
+        layer_offset: u32,
+        sample_stride: u32,
+        slice_len: u32,
+        initial_skip: u32,
+        batch_size: u32,
+        layer_idx: u32,
+    ) {
+        let p = SpikeRateReduceParams {
+            layer_offset,
+            sample_stride,
+            slice_len,
+            initial_skip,
+            batch_size,
+            layer_idx,
+            _p0: 0,
+            _p1: 0,
+        };
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora spike_rate_reduce bind"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: h_spike.inner.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: count_out.inner.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("aurora spike_rate_reduce pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+}
+
+// Adds a constant rate-regularization correction to every entry of a
+// bias gradient buffer:
+//   `b_h_grad[i] += 2 * lambda * (count[layer_idx] / total - target)`
+const RATE_REG_BIAS_WGSL: &str = "
+struct RR {
+    n_hidden: u32,
+    layer_idx: u32,
+    inv_total: f32,
+    lambda: f32,
+    target_rate: f32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+};
+
+@group(0) @binding(0) var<storage, read>       count: array<f32>;
+@group(0) @binding(1) var<storage, read_write> b_h_grad: array<f32>;
+var<push_constant> p: RR;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= p.n_hidden) { return; }
+    let rate = count[p.layer_idx] * p.inv_total;
+    let correction = 2.0 * p.lambda * (rate - p.target_rate);
+    b_h_grad[i] = b_h_grad[i] + correction;
+}
+";
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RateRegBiasParams {
+    n_hidden: u32,
+    layer_idx: u32,
+    inv_total: f32,
+    lambda: f32,
+    target_rate: f32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+}
+
+pub struct RateRegBiasKernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bind_group_layout: Arc<wgpu::BindGroupLayout>,
+}
+
+impl RateRegBiasKernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("aurora rate_reg_bias wgsl"),
+                source: wgpu::ShaderSource::Wgsl(RATE_REG_BIAS_WGSL.into()),
+            });
+        let bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("aurora rate_reg_bias bgl"),
+                entries: &[storage_entry(0, true), storage_entry(1, false)],
+            });
+        let pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("aurora rate_reg_bias pl"),
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..32,
+                }],
+            });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("aurora rate_reg_bias pipeline"),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        Self {
+            pipeline: Arc::new(pipeline),
+            bind_group_layout: Arc::new(bgl),
+        }
+    }
+
+    pub fn dispatch_into(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        count: &GpuBuffer,
+        b_h_grad: &GpuBuffer,
+        n_hidden: u32,
+        layer_idx: u32,
+        total_elems: f32,
+        lambda: f32,
+        target_rate: f32,
+    ) {
+        let p = RateRegBiasParams {
+            n_hidden,
+            layer_idx,
+            inv_total: 1.0 / total_elems,
+            lambda,
+            target_rate,
+            _p0: 0,
+            _p1: 0,
+            _p2: 0,
+        };
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora rate_reg_bias bind"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: count.inner.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b_h_grad.inner.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("aurora rate_reg_bias pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(n_hidden.div_ceil(256), 1, 1);
+    }
+}
+
