@@ -408,20 +408,138 @@
 
 ---
 
-## Sprint 13 — GPU port nebo větší corpus
+## Sprint 13 — GPU port (původně Sprint 12 odložené C)
+
+**Sprint 12 status:** mini-batching dodaný (deterministická batch-parita), Czech corpus stack hotový. GPU port byl explicitně odložen na Sprint 13. Aktuální CPU rychlost: ~3-5 min na 1 MB corpu × 3 epochy. Pro scale-up na 10-100 MB text nebo hidden ≥1024 budeme potřebovat GPU.
+
+**Cíl:** Portovat `GatedRecurrentSnn` forward + backward na GPU, dosáhnout **≥10× speedup** vs CPU multi-thread (Sprint 12 baseline). Zachovat numerickou paritu s CPU implementací (FP tolerance ~1e-4 kvůli SIMD reordering).
+
+**Princip plánování:**
+- **wgpu, ne CUDA.** Vyhodnocení frameworků:
+  - `cust` (CUDA): nejrychlejší, ale NVIDIA-only, vyžaduje toolchain. Nepřizpůsobivé na uživatelově HW.
+  - `wgpu` + WGSL: cross-platform (Vulkan/Metal/DX12), pure Rust dependency, kernel jazyk WGSL je uchopitelný. Performance ~70-90 % CUDA.
+  - `cubecl`: Rust-native abstraction nad wgpu/cuda. Mladší, méně dokumentace.
+  - **Volba: wgpu** — risk: hardware compatibility = nízký, debugging = vlastní (žádný cuda-gdb), perf strop = ~85 % CUDA.
+- **Inkrementální parita.** Implementovat po vrstvě: nejdřív GPU matvec (jádro forward), pak hidden cell, pak batch dim, pak backward. Po každém kroku CPU↔GPU parity test. Žádný "big bang" port.
+- **Jen `GatedRecurrentSnn` LM cesta.** Vanilla `RecurrentSurrogateSnn`, MNIST examples zůstávají CPU — jejich rychlost je dostatečná. GPU stack je `gated_lm_*` only.
+- **Float precision.** GPU shadery jsou f32 only. Naše CPU implementace už je f32, takže přechod je clean. Souborový formát checkpointů zůstává f32 little-endian.
+
+**Deliverables (~1500 LOC):**
+- `src/gpu/mod.rs` — `GpuContext` (instance, adapter, device, queue), single-instance držený přes lifetime training.
+- `src/gpu/buffers.rs` — typed wrappers nad `wgpu::Buffer`: `GpuMatrix [rows×cols]`, `GpuVec [n]`, helpery `upload_from_slice`, `download_to_vec`. Shared storage policy.
+- `src/gpu/kernels.wgsl` — WGSL compute shadery:
+  - `matvec_sparse_onehot` — `out[h] = W[h*I + byte_idx]` (column copy)
+  - `matvec_sparse_binary` — `out[h] = sum over c where mask[c]==1 of W[h*N + c]`
+  - `cell_step_forward` — fused gate/membrane/spike per timestep
+  - `cell_step_backward` — fused backward s surrogate gradient
+  - `adam_step_apply` — vectorized Adam update přes parameter group
+- `src/snn_gated_gpu.rs` — `GatedRecurrentSnnGpu` mirror struktura `GatedRecurrentSnn`. Public API:
+  - `from_cpu(net: &GatedRecurrentSnn, ctx: &GpuContext) -> Self` — upload weights
+  - `to_cpu(&self) -> GatedRecurrentSnn` — download weights
+  - `forward_backward_batch_gpu(&mut self, batch_inputs, batch_targets) -> f32`
+  - `step_adam_gpu`, `clip_grads_gpu`, `zero_grad_gpu`
+- `tests/gpu_parity.rs` (gated by `#[cfg(feature = "gpu")]`):
+  - Forward parity: GPU vs CPU output difference < 1e-4 max
+  - Backward parity: gradient difference < 1e-3 (chyba akumuluje přes BPTT)
+  - End-to-end training: 10 batched steps GPU vs CPU stejný direction
+- `benches/lm_gpu_speedup.rs` — měření throughput chunks/sec GPU vs CPU multi-thread:
+  - Hidden 256, 512, 1024
+  - Batch 16, 32, 64
+  - Identifikovat batch threshold kde GPU vyhraje
+- `examples/char_lm_gated_gpu.rs` — drop-in replacement `char_lm_gated` s `--gpu` flag (default), fallback na CPU pokud `wgpu` initialization fails.
+- `Cargo.toml`: `wgpu = "23"` (nebo aktuální stable), volitelný `bytemuck` pro safe pod casts. Feature flag `gpu` aby CPU-only build šel postavit bez GPU dependencies.
+
+**Exit kritérium:**
+- Forward parity < 1e-4 max diff vs CPU
+- Backward parity < 1e-3 max diff per gradient buffer (BPTT accumulation tolerance)
+- End-to-end training na char_lm_gated tiny-shakespeare s GPU: BPB ≤ Sprint 12 výsledek + 0.1 (allow for FP noise)
+- Throughput benchmark: hidden=512 batch=16 → **≥5× wall-clock** speedup vs CPU multi-thread; hidden=1024 batch=32 → **≥10×**
+
+**Co Sprint 13 záměrně NEŘEŠÍ:**
+- CUDA backend přes `cust`. Pokud wgpu performance je nedostatečná, můžeme přidat jako Sprint 14 add-on.
+- GPU port `RecurrentSurrogateSnn`, `SurrogateSnn`, MNIST examples. Ne core LM cesta.
+- Multi-GPU. Zatím irrelevant.
+- Mixed precision (f16). f32 je default; f16 je další optimization sprint.
+- Stateful BPTT (carry-with-detach). Pokud Sprint 13 dodá speedup, Sprint 14 = stateful BPTT na GPU.
+
+**Otevřené otázky:**
+- **Memory layout.** Row-major vs column-major matic v GPU paměti — určuje paměťové hits při matvec/matmul. Default row-major (jako CPU); pokud benchmark ukáže problém, transpose před uploadem.
+- **Bind group reuse.** Vytvořit bind groups jednou per `GatedRecurrentSnnGpu` instance, ne per `forward_backward_batch_gpu` volání. Drobnost ale významná pro overhead při malém batch size.
+- **Backward fusion vs. unfusion.** Naivní implementace: 3-4 separate compute passes per timestep (gate gradient, h_v_pre gradient, weight grad accumulation). Fused: jeden pass přes hidden dim. Začneme unfused (čitelnost + ladění); fusion jako optimization v Sprintu 14.
+- **wgpu version churn.** wgpu major versions break často. Pinout exact verze v Cargo.toml + plan na update jednou ročně.
+- **Tooling.** RUST_LOG=wgpu_core=info pro debug. Není GPU profiler v ekosystému stejně dobrý jako Nsight; spoléháme na wall-clock benchmarks.
+
+**Risks (a mitigation):**
+- **R1: wgpu setup fail na uživatelově HW.** Mitigation: detekce při `GpuContext::new`, jasný error message, fallback na CPU implementaci v `char_lm_gated_gpu`.
+- **R2: numerická divergence shaderů.** Mitigation: parity testy po každém kroku, ne až na konci. WGSL `f32` IEEE 754 dělá rounding stejně jako Rust f32 jen reordering ovlivňuje sumy.
+- **R3: BPTT memory.** Pro chunk T=64, hidden=512, batch=16: forward cache = 4 × 64 × 16 × 512 × 4 bytes = 8.4 MB per layer. OK, ale hidden=1024 batch=64 = 67 MB → blízko limitů integrated GPU. Watch.
+- **R4: scope creep.** GPU port může fungovat jako "rabbit hole" (mixed precision, fusion, multi-stream, …). Strict scope: forward + backward + Adam, žádné optimalizace nad rámec exit kritéria.
+
+**Realistický odhad rozsahu:** ~1500 LOC, rozprostřeno na 4-5 dní soustředěné práce. Z toho ~30 % je WGSL kernely, ~30 % je Rust GPU wrapper, ~20 % testy a benchmarky, ~20 % Cargo configuration / wgpu-specific debugging.
+
+**Status (foundation hotová):**
+- ✅ Stateful TBPTT: `forward_lm_bytes_stateful` čte/píše `GatedState` přes chunk boundaries, gradient detached. `forward_backward_batch_stateful` paralelně přes batch dim s per-stream stavem. Identity test ověřuje bit-paritu se stateless cestou; smoke test ověřuje, že `cache.initial_h_*` skutečně přenáší netriviální stav. Oba `char_lm_gated*` examples používají parallel-stream stateful TBPTT (každý batch slot má vlastní contiguous slice korpu).
+- ✅ wgpu foundation: `Cargo.toml` s `gpu` feature flagem (deps `wgpu = "23"`, `bytemuck`, `pollster`). `src/gpu/{mod,context,buffers,kernels}.rs` — `GpuContext` init, typed `GpuBuffer` s upload/download přes staging buffer, první WGSL kernel `sparse_matvec_onehot`.
+- ✅ GPU parity test (`tests/gpu_parity.rs`, gated by `--features gpu`): naměřeno **bit-identical** výstup `sparse_matvec_onehot` vs CPU column-read na NVIDIA GTX 1650 (Vulkan backend).
+
+**Sprint 13 followups (next session):**
+- WGSL `sparse_matvec_binary` kernel (`out[h] = sum over c where mask[c]==1 of W[h*N+c]`)
+- WGSL fused gated cell forward (gate + membrane + spike + reset v jednom passu)
+- WGSL fused gated cell backward s surrogate gradient
+- WGSL Adam step kernel
+- `GatedRecurrentSnnGpu` mirror struktura, `from_cpu`/`to_cpu` weight transfer
+- `forward_backward_batch_gpu` end-to-end na GPU
+- `examples/char_lm_gated_gpu.rs` + benchmark měření chunks/sec speedup
+
+---
+
+## Sprint 14 — GPU forward end-to-end
+
+**Sprint 14 status (forward port hotový):**
+- ✅ WGSL `dense_matvec` kernel s volitelným bias add — generický `out = W @ v (+ bias)`. Použito pro `W_rec`, `W_gate_rec`, `W_out`.
+- ✅ WGSL `gated_cell_step` kernel — fused element-wise per timestep: gate sigmoid, membrane integration s adaptivním decay, spike threshold, subtraction reset. Outputy packed do single bufferu `[gate, h_v_pre, h_spike, h_v_after]` aby se vešlo do limitu 8 storage bindings.
+- ✅ `GatedRecurrentSnnGpu` mirror struct s GPU-resident weights + cached compute pipelines. `from_cpu(net, ctx)` uploadne všech 8 parameter buffers + zkompiluje 3 kernely.
+- ✅ `forward_lm_bytes_gpu` — multi-timestep dispatch loop:
+  1. `sparse_matvec_onehot` pro `W_in[:, byte]` a `W_gate_in[:, byte]`
+  2. `dense_matvec` pro `W_rec @ h_spike_prev` a `W_gate_rec @ h_spike_prev`
+  3. CPU pre-sum gate_pre = `b_gate + W_gate_in_contrib + W_gate_rec_contrib` (3 KB roundtrip per step — fused-add WGSL kernel je followup)
+  4. `gated_cell_step` kernel
+  5. `copy_buffer_to_buffer` extrahuje h_spike a h_v_after z packed bufferu
+  6. `dense_matvec` pro `W_out @ h_spike + b_o` → logits
+- ✅ Forward parity test (`gated_forward_lm_matches_cpu_within_tolerance`): GPU output matches CPU within **1e-3** tolerance per logit per timestep, max diff naměřena ~1e-7. Test pouští se hidden=32, T=16 byte sequence na NVIDIA GTX 1650.
+
+**Sprint 14 ZÁMĚRNĚ NEŘEŠÍ:**
+- Backward port (Sprint 15+).
+- Fused-add WGSL kernel pro `gate_pre` (Sprint 14.1 micro-optim).
+- Sparse W_rec / W_out matvec (binární spike skipping na GPU s prefix-sum); aktuální dense matvec je dostatečný a clean.
+- GPU end-to-end training. Až po backward portu.
+- `char_lm_gated_gpu.rs` example. Až po training port.
+
+**Sprint 15+ followups:**
+- WGSL `gated_cell_step_backward` kernel s surrogate gradient (per-timestep gradient inputs/outputs, dependence na cache)
+- WGSL `outer_product_accum` kernel pro `grad_w += d_out ⊗ in` (W_out, W_rec, W_gate_rec gradient updates)
+- WGSL `column_accum` kernel pro `grad_w[:, byte_idx] += d_h_v_pre` (W_in, W_gate_in sparse gradient)
+- WGSL `adam_step` kernel — Adam update přes parameter buffer
+- `forward_backward_batch_gpu` end-to-end
+- `examples/char_lm_gated_gpu.rs` s `--gpu` flag
+- `benches/lm_gpu_speedup.rs` měření chunks/sec speedup
+
+---
+
+## Sprint 14 a dál — možné větve (decision point po 13)
 
 **Vstupy do rozhodnutí:**
-- Sprint 12 tiny-shakespeare BPB
-- CPU profilace: kolik času ještě tráví ve forward/backward
-- Realistický odhad: jak velký corpus chceme trénovat (10 MB? 100 MB?)
+- Sprint 13 GPU speedup
+- BPB strop vanilla gated SNN
+- Realistický next milestone (10 MB corpus? Hybrid? Recurrent topologie změny?)
 
 **Možné větve:**
-- **A: GPU port (CUDA přes `cust` nebo wgpu compute).** Cílem `≥10×` speedup nad current CPU multi-core. Velký engineering scope (~1500 LOC + parity testy).
-- **B: Stateful BPTT.** Carry hidden state s detach mezi chunks. Levný (~50 LOC), ale jen pomáhá pokud LM má long-range dependencies it can use.
-- **C: Větší corpus + delší trénink na CPU.** Pokud Sprint 12 ukáže BPB ≤ 2.0, scale-up na ~10 MB text + multi-hour CPU trénink může pokračovat bez GPU.
-- **D: Hybrid surrogate→STDP.** Biological plausibility experiment. Pokud LM stack je "good enough", zajímavý vědecký test.
-
-**Toto rozhodnutí padne až po Sprintu 12.**
+- **Stateful BPTT** — carry hidden state s detach mezi chunks. Long-range dependencies. ~50 LOC.
+- **Větší corpus + delší trénink** — 10-100 MB text, multi-hour GPU trénink. Test scaling.
+- **Hybrid surrogate→STDP** — pretrained LM, STDP fine-tune. Biological plausibility experiment.
+- **CIFAR-10 přes gated SNN** — image classification benchmark, srovnání s SOTA SNN.
+- **f16 mixed precision** — další 2× speedup na GPU (na NVIDIA s tensor cores 4×).
+- **Multi-layer gated SNN** — 2-3 hidden vrstvy místo 1, depth scaling experiment.
 
 ---
 

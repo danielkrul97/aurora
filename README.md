@@ -22,6 +22,9 @@ neuromodulace), žádný backprop.
 - Byte-level char-level LM (next-byte prediction, BPB metric, autoregressive generation)
 - Gated recurrent SNN (LSTM-style per-neuron forget gate, řeší vanishing gradient)
 - Mini-batched parallel BPTT pro gated cell (rayon přes batch dim, externalizovaný grad buffer)
+- Stateful TBPTT s detach na chunk hranicích (`forward_lm_bytes_stateful`, parallel streams)
+- GPU foundation přes wgpu (feature `gpu`, NVIDIA/Vulkan/Metal/DX12); první kernel + parity test
+- GPU forward end-to-end pro gated SNN (`GatedRecurrentSnnGpu`, multi-timestep dispatch, CPU↔GPU parity test)
 
 ## Spuštění
 
