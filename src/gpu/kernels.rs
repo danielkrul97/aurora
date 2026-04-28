@@ -1228,7 +1228,7 @@ struct VA {
 @group(0) @binding(1) var<storage, read_write> b: array<f32>;
 var<push_constant>             p: VA;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.len) { return; }
@@ -1342,7 +1342,7 @@ impl VectorAddKernel {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind, &[]);
             pass.set_push_constants(0, bytemuck::bytes_of(&p));
-            let workgroups = len.div_ceil(64);
+            let workgroups = len.div_ceil(256);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
     }
@@ -1366,7 +1366,7 @@ struct AS {
 @group(0) @binding(3) var<storage, read_write> m2: array<f32>;
 var<push_constant>             p: AS;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.len) { return; }
@@ -1507,7 +1507,7 @@ impl AdamStepKernel {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind, &[]);
             pass.set_push_constants(0, bytemuck::bytes_of(&p));
-            let workgroups = len.div_ceil(64);
+            let workgroups = len.div_ceil(256);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
     }
@@ -1519,7 +1519,7 @@ struct SB { len: u32, factor: f32, _pad0: u32, _pad1: u32 };
 @group(0) @binding(0) var<storage, read_write> b: array<f32>;
 var<push_constant>             p: SB;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.len) { return; }
@@ -1604,7 +1604,7 @@ impl ScaleBufferKernel {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind, &[]);
             pass.set_push_constants(0, bytemuck::bytes_of(&p));
-            let workgroups = (b.len as u32).div_ceil(64);
+            let workgroups = (b.len as u32).div_ceil(256);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
     }
@@ -1616,7 +1616,7 @@ struct ZB { len: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
 @group(0) @binding(0) var<storage, read_write> b: array<f32>;
 var<push_constant>             p: ZB;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.len) { return; }
@@ -1701,7 +1701,7 @@ impl ZeroBufferKernel {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind, &[]);
             pass.set_push_constants(0, bytemuck::bytes_of(&p));
-            let workgroups = (b.len as u32).div_ceil(64);
+            let workgroups = (b.len as u32).div_ceil(256);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
     }
