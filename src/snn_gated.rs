@@ -32,7 +32,7 @@
 use rand::Rng;
 use rayon::prelude::*;
 
-use crate::linalg::{matvec, matvec_transpose};
+use crate::linalg::{active_indices, matvec_transpose};
 use crate::optimizer::{adam_apply, bias_correction, AdamConfig, AdamGroup};
 use crate::snn_loss::cross_entropy_with_grad;
 use crate::surrogate::SpikeFn;
@@ -149,6 +149,13 @@ pub struct GatedLmCache {
     pub h_spike: Vec<Vec<f32>>,
     pub gate: Vec<Vec<f32>>,
     pub logits: Vec<Vec<f32>>,
+    /// Hidden state at t = -1 (before the first timestep of this chunk).
+    /// Zeros for stateless calls, the previous chunk's final values for
+    /// stateful BPTT. Backward uses it to compute correct gate gradient
+    /// and `W_rec`/`W_gate_rec` gradient at t = 0; gradients across the chunk
+    /// boundary are NOT propagated (DETACH).
+    pub initial_h_v_after: Vec<f32>,
+    pub initial_h_spike: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -301,17 +308,37 @@ impl GatedRecurrentSnn {
     }
 
     /// Sparse byte-level LM forward. Logits are non-spiking linear
-    /// projection of hidden spikes — same convention as
-    /// `RecurrentSurrogateSnn::forward_lm_bytes`.
+    /// projection of hidden spikes. Stateless: starts hidden state at
+    /// zero. For TBPTT-with-detach across chunk boundaries see
+    /// `forward_lm_bytes_stateful`.
     pub fn forward_lm_bytes(&self, input_bytes: &[u8]) -> GatedLmCache {
+        let mut state = self.fresh_state();
+        self.forward_lm_bytes_stateful(input_bytes, &mut state)
+    }
+
+    /// Stateful sparse byte-level LM forward (truncated BPTT). Hidden
+    /// state at t = -1 comes from `state`; at end of forward, `state`
+    /// is overwritten with the chunk's final hidden values for use as
+    /// t = -1 of the next chunk. Gradients across the chunk boundary
+    /// are detached automatically by `backward_lm_bytes_into`: weights
+    /// receive correct local-time updates but no signal propagates back
+    /// into the previous chunk.
+    pub fn forward_lm_bytes_stateful(
+        &self,
+        input_bytes: &[u8],
+        state: &mut GatedState,
+    ) -> GatedLmCache {
         let t_steps = input_bytes.len();
         let h_dim = self.n_hidden;
         let i_dim = self.n_input;
         let o_dim = self.n_output;
         let theta = self.spike_fn.threshold;
 
-        let mut h_v_after_prev = vec![0.0_f32; h_dim];
-        let mut active_prev: Vec<usize> = Vec::new();
+        let initial_h_v_after = state.h_v_after.clone();
+        let initial_h_spike = state.h_spike.clone();
+
+        let mut h_v_after_prev = state.h_v_after.clone();
+        let mut active_prev = active_indices(&state.h_spike);
 
         let mut h_v_pre_seq = Vec::with_capacity(t_steps);
         let mut h_v_after_seq = Vec::with_capacity(t_steps);
@@ -356,11 +383,7 @@ impl GatedRecurrentSnn {
                 .map(|(&v, &s)| v - theta * s)
                 .collect();
 
-            let active_t: Vec<usize> = h_spike_t
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &s)| if s == 0.0 { None } else { Some(i) })
-                .collect();
+            let active_t = active_indices(&h_spike_t);
 
             let mut logits_t = vec![0.0_f32; o_dim];
             for o in 0..o_dim {
@@ -381,12 +404,21 @@ impl GatedRecurrentSnn {
             logits_seq.push(logits_t);
         }
 
+        if let Some(last_h_v_after) = h_v_after_seq.last() {
+            state.h_v_after.clone_from(last_h_v_after);
+        }
+        if let Some(last_h_spike) = h_spike_seq.last() {
+            state.h_spike.clone_from(last_h_spike);
+        }
+
         GatedLmCache {
             h_v_pre: h_v_pre_seq,
             h_v_after: h_v_after_seq,
             h_spike: h_spike_seq,
             gate: gate_seq,
             logits: logits_seq,
+            initial_h_v_after,
+            initial_h_spike,
         }
     }
 
@@ -428,11 +460,7 @@ impl GatedRecurrentSnn {
             let (loss_t, d_logits) = cross_entropy_with_grad(&cache.logits[t], targets[t] as usize);
             total_loss += loss_t;
 
-            let active_t: Vec<usize> = cache.h_spike[t]
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &s)| if s == 0.0 { None } else { Some(i) })
-                .collect();
+            let active_t = active_indices(&cache.h_spike[t]);
 
             // grad_w_out and d_h_spike via output.
             for o in 0..self.n_output {
@@ -462,14 +490,14 @@ impl GatedRecurrentSnn {
             }
 
             // grad_b_h, grad_w_in (column update for byte_t), grad_w_rec (sparse over active_prev).
-            let active_prev: Vec<usize> = if t == 0 {
-                Vec::new()
+            // For TBPTT-with-detach: at t=0 we still update grad_w_rec /
+            // grad_w_gate_rec via cache.initial_h_spike (local-time gradient
+            // is valid); only the carry-over into step t-1 is dropped (which
+            // we already handle by simply exiting the loop after t=0).
+            let active_prev = if t == 0 {
+                active_indices(&cache.initial_h_spike)
             } else {
-                cache.h_spike[t - 1]
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &s)| if s == 0.0 { None } else { Some(i) })
-                    .collect()
+                active_indices(&cache.h_spike[t - 1])
             };
             let byte_t = input_bytes[t] as usize;
             for h in 0..h_dim {
@@ -477,20 +505,18 @@ impl GatedRecurrentSnn {
                 if d != 0.0 {
                     grads.b_h[h] += d;
                     grads.w_in[h * i_dim + byte_t] += d;
-                    if t > 0 {
-                        let row_offset = h * h_dim;
-                        for &j in &active_prev {
-                            grads.w_rec[row_offset + j] += d;
-                        }
+                    let row_offset = h * h_dim;
+                    for &j in &active_prev {
+                        grads.w_rec[row_offset + j] += d;
                     }
                 }
             }
 
             // Gate gradient. d_loss / d_gate[h] = d_h_v_pre[t][h] * h_v_after_prev[h]
-            let h_v_after_prev = if t == 0 {
-                vec![0.0_f32; h_dim]
+            let h_v_after_prev: &[f32] = if t == 0 {
+                &cache.initial_h_v_after
             } else {
-                cache.h_v_after[t - 1].clone()
+                &cache.h_v_after[t - 1]
             };
             let mut d_gate_pre = vec![0.0_f32; h_dim];
             for h in 0..h_dim {
@@ -507,11 +533,9 @@ impl GatedRecurrentSnn {
                 }
                 grads.b_gate[h] += d;
                 grads.w_gate_in[h * i_dim + byte_t] += d;
-                if t > 0 {
-                    let row_offset = h * h_dim;
-                    for &j in &active_prev {
-                        grads.w_gate_rec[row_offset + j] += d;
-                    }
+                let row_offset = h * h_dim;
+                for &j in &active_prev {
+                    grads.w_gate_rec[row_offset + j] += d;
                 }
             }
 
@@ -536,16 +560,10 @@ impl GatedRecurrentSnn {
     pub fn step_lm_byte(&self, byte: u8, state: &mut GatedState) -> Vec<f32> {
         let h_dim = self.n_hidden;
         let i_dim = self.n_input;
-        let o_dim = self.n_output;
         let theta = self.spike_fn.threshold;
         let b = byte as usize;
 
-        let active_prev: Vec<usize> = state
-            .h_spike
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &s)| if s == 0.0 { None } else { Some(i) })
-            .collect();
+        let active_prev = active_indices(&state.h_spike);
 
         let mut gate_pre = vec![0.0_f32; h_dim];
         for hi in 0..h_dim {
@@ -575,9 +593,7 @@ impl GatedRecurrentSnn {
             .map(|(&v, &s)| v - theta * s)
             .collect();
 
-        let _ = matvec(&self.w_in, &[0.0; 0], 0, 0);
         let mut logits = self.b_o.clone();
-        let _ = o_dim;
         for o in 0..self.n_output {
             let row_offset = o * h_dim;
             for (h, &s) in h_spike.iter().enumerate() {
@@ -610,7 +626,31 @@ impl GatedRecurrentSnn {
         batch_inputs: &[&[u8]],
         batch_targets: &[&[u8]],
     ) -> f32 {
+        let mut states: Vec<GatedState> = (0..batch_inputs.len())
+            .map(|_| self.fresh_state())
+            .collect();
+        self.forward_backward_batch_stateful(batch_inputs, batch_targets, &mut states)
+    }
+
+    /// Stateful batched training: each batch slot has its own
+    /// `GatedState` carried across calls. Use this for TBPTT-with-detach,
+    /// where each batch position streams contiguous chunks of a long
+    /// sequence and hidden state persists across chunk boundaries.
+    /// Caller manages the `Vec<GatedState>` (one per batch slot) — this
+    /// method reads the incoming state, runs forward+backward+grad
+    /// accumulation in parallel, and writes the chunk's final state back.
+    ///
+    /// # Panics
+    /// Panics if `batch_inputs.len() != batch_targets.len()` or
+    /// `batch_inputs.len() != states.len()`.
+    pub fn forward_backward_batch_stateful(
+        &mut self,
+        batch_inputs: &[&[u8]],
+        batch_targets: &[&[u8]],
+        states: &mut [GatedState],
+    ) -> f32 {
         assert_eq!(batch_inputs.len(), batch_targets.len());
+        assert_eq!(batch_inputs.len(), states.len());
         if batch_inputs.is_empty() {
             return 0.0;
         }
@@ -618,9 +658,10 @@ impl GatedRecurrentSnn {
         let results: Vec<(f32, GatedGrads)> = batch_inputs
             .par_iter()
             .zip(batch_targets.par_iter())
-            .map(|(inputs, targets)| {
+            .zip(states.par_iter_mut())
+            .map(|((inputs, targets), state)| {
                 let mut grads = weights.alloc_grads();
-                let cache = weights.forward_lm_bytes(inputs);
+                let cache = weights.forward_lm_bytes_stateful(inputs, state);
                 let loss = weights.backward_lm_bytes_into(&cache, inputs, targets, &mut grads);
                 (loss, grads)
             })

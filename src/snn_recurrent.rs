@@ -15,7 +15,7 @@
 
 use rand::Rng;
 
-use crate::linalg::{matvec, matvec_transpose};
+use crate::linalg::{active_indices, matvec, matvec_transpose};
 use crate::optimizer::{adam_apply, bias_correction, sgd_apply, AdamConfig, AdamGroup};
 use crate::snn_loss::{argmax, cross_entropy_with_grad};
 use crate::surrogate::SpikeFn;
@@ -392,11 +392,7 @@ impl RecurrentSurrogateSnn {
                 .map(|(&v, &s)| v - theta * s)
                 .collect();
 
-            let active_t: Vec<usize> = h_spike_t
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &s)| if s != 0.0 { Some(i) } else { None })
-                .collect();
+            let active_t = active_indices(&h_spike_t);
 
             let mut logits_t = vec![0.0_f32; o_dim];
             for o in 0..o_dim {
@@ -448,11 +444,7 @@ impl RecurrentSurrogateSnn {
             let (loss_t, d_logits) = cross_entropy_with_grad(&cache.logits[t], targets[t] as usize);
             total_loss += loss_t;
 
-            let active_t: Vec<usize> = cache.h_spike[t]
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &s)| if s != 0.0 { Some(i) } else { None })
-                .collect();
+            let active_t = active_indices(&cache.h_spike[t]);
 
             for o in 0..self.n_output {
                 let d = d_logits[o];
@@ -478,11 +470,7 @@ impl RecurrentSurrogateSnn {
             let active_prev: Vec<usize> = if t == 0 {
                 Vec::new()
             } else {
-                cache.h_spike[t - 1]
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &s)| if s != 0.0 { Some(i) } else { None })
-                    .collect()
+                active_indices(&cache.h_spike[t - 1])
             };
             let byte_t = input_bytes[t] as usize;
             for h in 0..h_dim {

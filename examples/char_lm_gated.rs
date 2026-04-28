@@ -61,34 +61,33 @@ fn main() -> ExitCode {
         let epoch_start = Instant::now();
         epoch_open(epoch);
 
+        let stream_len = train.len() / BATCH_SIZE;
+        let n_chunks_per_stream = stream_len.saturating_sub(1) / chunk;
+        let report_every = (n_chunks_per_stream / 10).max(1);
         let mut total_nats = 0.0_f32;
         let mut total_bytes = 0_usize;
-        let mut pos = 0;
-        let chunk_stride = chunk * BATCH_SIZE;
-        let n_batches = (train.len().saturating_sub(1)) / chunk_stride;
-        let report_every = (n_batches / 10).max(1);
-        let mut batch_idx = 0_usize;
+        let mut states: Vec<_> = (0..BATCH_SIZE).map(|_| net.fresh_state()).collect();
+        let mut inputs_owned: Vec<&[u8]> = Vec::with_capacity(BATCH_SIZE);
+        let mut targets_owned: Vec<&[u8]> = Vec::with_capacity(BATCH_SIZE);
 
-        while pos + chunk_stride < train.len() {
-            // Build B (input, target) pairs from contiguous regions of the
-            // corpus. They share weights but have independent hidden state.
-            let mut inputs_owned: Vec<&[u8]> = Vec::with_capacity(BATCH_SIZE);
-            let mut targets_owned: Vec<&[u8]> = Vec::with_capacity(BATCH_SIZE);
+        for chunk_idx in 0..n_chunks_per_stream {
+            inputs_owned.clear();
+            targets_owned.clear();
             for b in 0..BATCH_SIZE {
-                let p = pos + b * chunk;
+                let stream_start = b * stream_len;
+                let p = stream_start + chunk_idx * chunk;
                 inputs_owned.push(&train[p..p + chunk]);
                 targets_owned.push(&train[p + 1..p + chunk + 1]);
             }
-            let loss = net.forward_backward_batch(&inputs_owned, &targets_owned);
+            let loss =
+                net.forward_backward_batch_stateful(&inputs_owned, &targets_owned, &mut states);
             net.clip_grads(GRAD_CLIP);
             net.step_adam(&adam);
             total_nats += loss;
             total_bytes += chunk * BATCH_SIZE;
-            pos += chunk_stride;
-            batch_idx += 1;
 
-            if batch_idx.is_multiple_of(report_every) {
-                let frac = batch_idx as f64 / n_batches as f64;
+            if (chunk_idx + 1).is_multiple_of(report_every) {
+                let frac = (chunk_idx + 1) as f64 / n_chunks_per_stream as f64;
                 let bpb = bits_per_byte(total_nats, total_bytes);
                 epoch_progress(frac, bpb, epoch_start.elapsed().as_secs_f64());
             }

@@ -7,6 +7,8 @@ pub mod dendrite;
 pub mod eligibility;
 pub mod encoding;
 pub mod engine;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod homeostasis;
 pub mod lif;
 pub mod linalg;

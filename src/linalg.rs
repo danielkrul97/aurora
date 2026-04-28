@@ -20,6 +20,15 @@ pub fn matvec(m: &[f32], v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 }
 
 #[must_use]
+pub fn active_indices(spikes: &[f32]) -> Vec<usize> {
+    spikes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &s)| if s == 0.0 { None } else { Some(i) })
+        .collect()
+}
+
+#[must_use]
 pub fn matvec_transpose(m: &[f32], v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     debug_assert_eq!(m.len(), rows * cols);
     debug_assert_eq!(v.len(), rows);
