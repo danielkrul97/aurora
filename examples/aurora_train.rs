@@ -62,6 +62,7 @@ struct Cli {
     lr: f32,
     checkpoint: PathBuf,
     bpe_path: Option<PathBuf>,
+    metrics: Option<PathBuf>,
 }
 
 impl Cli {
@@ -74,6 +75,7 @@ impl Cli {
         let mut lr: f32 = 0.002;
         let mut checkpoint: Option<PathBuf> = None;
         let mut bpe_path: Option<PathBuf> = None;
+        let mut metrics: Option<PathBuf> = None;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -116,6 +118,10 @@ impl Cli {
                     bpe_path = Some(next()?.into());
                     i += 2;
                 }
+                "--metrics" => {
+                    metrics = Some(next()?.into());
+                    i += 2;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
@@ -140,6 +146,7 @@ impl Cli {
             lr,
             checkpoint,
             bpe_path,
+            metrics,
         })
     }
 }
@@ -213,6 +220,39 @@ fn main() -> ExitCode {
         ..AdamConfig::default()
     };
 
+    // Sprint 36: structured metrics output. Defaults to
+    // `logs/<ckpt_stem>_<unix_ts>.jsonl`; pass `--metrics path.jsonl`
+    // to override or `/dev/null` to disable.
+    let metrics_path = cli.metrics.clone().unwrap_or_else(|| {
+        let stem = cli
+            .checkpoint
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("aurora_train");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        PathBuf::from(format!("logs/{stem}_{ts}.jsonl"))
+    });
+    let mut metrics = match MetricsWriter::open(&metrics_path) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("⚠ metrics log open failed ({e}); continuing without metrics");
+            None
+        }
+    };
+    if let Some(m) = metrics.as_mut() {
+        m.run_meta(
+            &cli,
+            corpus.len(),
+            tokens.len(),
+            actual_vocab,
+            start_epoch,
+            &info.name,
+        );
+    }
+
     print_header(
         &cli,
         corpus.len(),
@@ -269,7 +309,11 @@ fn main() -> ExitCode {
             if (chunk_idx + 1).is_multiple_of(report_every) {
                 let frac = (chunk_idx + 1) as f64 / n_chunks_per_stream as f64;
                 let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
-                epoch_progress(frac, bpb, epoch_start.elapsed().as_secs_f64());
+                let elapsed = epoch_start.elapsed().as_secs_f64();
+                epoch_progress(frac, bpb, elapsed);
+                if let Some(m) = metrics.as_mut() {
+                    m.chunk(epoch, chunk_idx + 1, bpb, elapsed);
+                }
             }
         }
 
@@ -280,9 +324,25 @@ fn main() -> ExitCode {
         if val_bpb < best_val {
             best_val = val_bpb;
         }
-        epoch_done(train_bpb, val_bpb, epoch_start.elapsed().as_secs_f64());
+        let epoch_elapsed = epoch_start.elapsed().as_secs_f64();
+        epoch_done(train_bpb, val_bpb, epoch_elapsed);
         let alphas: Vec<f32> = net_snapshot.layers.iter().map(|l| l.alpha).collect();
         epoch_diagnostics(&rates, &alphas, &mem);
+
+        if let Some(m) = metrics.as_mut() {
+            let v_means: Vec<f32> = mem.iter().map(|(m, _)| *m).collect();
+            let v_peaks: Vec<f32> = mem.iter().map(|(_, p)| *p).collect();
+            m.epoch_done(
+                epoch,
+                train_bpb,
+                val_bpb,
+                &rates,
+                &alphas,
+                &v_means,
+                &v_peaks,
+                epoch_elapsed,
+            );
+        }
 
         if let Err(e) = checkpoint::save(&cli.checkpoint, &net_snapshot, epoch + 1) {
             eprintln!("⚠ checkpoint save failed: {e}");
@@ -291,6 +351,9 @@ fn main() -> ExitCode {
                 "{}",
                 line(&format!(" checkpoint saved → {}", cli.checkpoint.display()))
             );
+            if let Some(m) = metrics.as_mut() {
+                m.checkpoint(epoch + 1, &cli.checkpoint);
+            }
         }
         epoch_close();
 
@@ -649,6 +712,126 @@ fn render_bar(frac: f64, width: usize) -> String {
     s.push('[');
     for i in 0..width {
         s.push(if i < filled { '█' } else { '·' });
+    }
+    s.push(']');
+    s
+}
+
+// =====================================================================
+// Sprint 36: structured metrics writer (JSON Lines).
+//
+// One JSON object per line. Schema is hand-rolled to avoid a serde_json
+// dep — strings are static (no escaping needed beyond `\n` in samples)
+// and numbers are float-formatted with `{}` (NaN/Inf become "NaN"/"inf"
+// strings, deliberately invalid JSON so analysis script flags them).
+// =====================================================================
+
+use std::fs::File;
+use std::io::{BufWriter, Write};
+
+struct MetricsWriter {
+    out: BufWriter<File>,
+}
+
+impl MetricsWriter {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let f = File::create(path)?;
+        Ok(Self {
+            out: BufWriter::new(f),
+        })
+    }
+
+    fn run_meta(
+        &mut self,
+        cli: &Cli,
+        corpus_bytes: usize,
+        n_tokens: usize,
+        actual_vocab: usize,
+        start_epoch: u32,
+        gpu_name: &str,
+    ) {
+        let _ = writeln!(
+            self.out,
+            r#"{{"event":"run","corpus":{corpus:?},"corpus_bytes":{corpus_bytes},"n_tokens":{n_tokens},"vocab":{actual_vocab},"hidden":{hidden},"chunk":{chunk},"lr":{lr},"epochs":{epochs},"start_epoch":{start_epoch},"checkpoint":{ckpt:?},"gpu":{gpu:?}}}"#,
+            corpus = cli.corpus.display().to_string(),
+            hidden = cli.hidden,
+            chunk = cli.chunk,
+            lr = format_finite(cli.lr),
+            epochs = cli.epochs,
+            ckpt = cli.checkpoint.display().to_string(),
+            gpu = gpu_name,
+        );
+        let _ = self.out.flush();
+    }
+
+    fn chunk(&mut self, epoch: u32, chunk_idx: usize, train_bpb: f32, elapsed_s: f64) {
+        let _ = writeln!(
+            self.out,
+            r#"{{"event":"chunk","epoch":{epoch},"chunk":{chunk_idx},"train_bpb":{bpb},"elapsed_s":{elapsed:.3}}}"#,
+            bpb = format_finite(train_bpb),
+            elapsed = elapsed_s,
+        );
+        // Flush so `tail -f` reflects training progress with sub-second
+        // lag and SIGTERM-killed runs leave a usable JSONL trail.
+        let _ = self.out.flush();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn epoch_done(
+        &mut self,
+        epoch: u32,
+        train_bpb: f32,
+        val_bpb: f32,
+        rates: &[f32],
+        alphas: &[f32],
+        v_means: &[f32],
+        v_peaks: &[f32],
+        elapsed_s: f64,
+    ) {
+        let _ = writeln!(
+            self.out,
+            r#"{{"event":"epoch_done","epoch":{epoch},"train_bpb":{train},"val_bpb":{val},"rates":{rates},"alphas":{alphas},"v_means":{v_means},"v_peaks":{v_peaks},"elapsed_s":{elapsed:.3}}}"#,
+            train = format_finite(train_bpb),
+            val = format_finite(val_bpb),
+            rates = format_array(rates),
+            alphas = format_array(alphas),
+            v_means = format_array(v_means),
+            v_peaks = format_array(v_peaks),
+            elapsed = elapsed_s,
+        );
+        let _ = self.out.flush();
+    }
+
+    fn checkpoint(&mut self, epoch: u32, path: &Path) {
+        let _ = writeln!(
+            self.out,
+            r#"{{"event":"checkpoint","epoch":{epoch},"path":{path:?}}}"#,
+            path = path.display().to_string(),
+        );
+        let _ = self.out.flush();
+    }
+}
+
+fn format_finite(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        // Deliberately emit invalid JSON token so the parser fails
+        // loudly. Typical SNN training failure: NaN loss after runaway.
+        format!("\"{v}\"")
+    }
+}
+
+fn format_array(xs: &[f32]) -> String {
+    let mut s = String::from("[");
+    for (i, x) in xs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format_finite(*x));
     }
     s.push(']');
     s

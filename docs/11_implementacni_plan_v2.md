@@ -281,7 +281,40 @@ SpikGPT (RWKV-style spiking, 46M params) hits BPC 1.26 na enwik8. Aurora s SDSA 
 
 ---
 
-## Sprint 36+ — Pokračování
+## Sprint 36 — MetricsWriter + Python diagnostics ✓ DONE
+
+**Cíl:** Strukturovaný metrický log z aurora_train do JSON Lines + Python post-mortem skript pro diagnostické grafy. Tier 1 z analýzy (žádné nové Rust deps).
+
+**Hotovo:**
+
+1. **`MetricsWriter`** v `examples/aurora_train.rs` — hand-rolled JSONL writer (avoid serde_json dep, schema je fully controlled). Eventy:
+   - `{"event":"run", ...}` — 1× při startu (corpus, arch, hyperparams, GPU)
+   - `{"event":"chunk", ...}` — per progress report (epoch, chunk_idx, train_bpb, elapsed_s)
+   - `{"event":"epoch_done", ...}` — 1× per epoch (train_bpb, val_bpb, rates, alphas, v_means, v_peaks, elapsed_s)
+   - `{"event":"checkpoint", ...}` — po save
+   - Flush per event → `tail -f` má sub-second lag, SIGTERM-killed runs zachovávají use­ful trail
+   - NaN/Inf serializované jako string `"NaN"` (deliberately invalid JSON token aby parser hlasitě selhal)
+
+2. **CLI flag `--metrics <path>`** s default `logs/<ckpt_stem>_<unix_ts>.jsonl`. Opt-out: `--metrics /dev/null`.
+
+3. **`analysis/diagnostics.py`** — pure Python (jen std lib + matplotlib):
+   - Parsuje JSONL, summary v terminálu (run config, BPB nejlepší, last rates/alphas/peaks, runaway warning)
+   - 4 PNG plots: BPB convergence (per-chunk + per-epoch), per-layer firing rates, α evolution, membrane mean/peak (s log-scale + θ=1.0 referenční čára)
+   - Usage: `python analysis/diagnostics.py logs/run.jsonl [--out plots/]`
+
+**Co tohle umožňuje (diagnostika):**
+- "Proč BPB stagnuje" → křivka loss + per-chunk variance ukáže zda je gradient nulový nebo skutečné plato
+- "Kdy začalo runaway" → membrane peaks per epoch; když najednou skok = identifikujeme chunk
+- "Konverguje α?" → α evolution graf
+- "Aurora-train vs SDSA-aurora" → 2 JSONL souboary + side-by-side plots = empirický A/B
+
+**Neudělané (Tier 2+3 z analýzy):**
+- Snapshot dumps (spike rastery, weight histogramy) per epoch — vyžaduje binary `.npy` formát + bigger file management. Sprint 37+, ne kritické.
+- Live UI (rerun.io) — overhead vs. value tradeoff. `tail -f logs/<run>.jsonl | jq` v terminálu pokrývá 80 %.
+
+---
+
+## Sprint 37+ — Pokračování
 
 ---
 
