@@ -431,15 +431,17 @@ impl MultiLayerGatedSnn {
         );
     }
 
-    /// Stateful sparse byte-level LM forward. `states` is one
-    /// `GatedState` per layer; updated in place.
-    pub fn forward_lm_bytes_stateful(
+    /// Stateful sparse LM forward over arbitrary token IDs (u32).
+    /// Sprint 26: takes token indices into a vocab of size
+    /// `self.n_input` — works for byte-level (n_input=256), BPE
+    /// (n_input=4096), or any other vocabulary.
+    pub fn forward_lm_tokens_stateful(
         &self,
-        input_bytes: &[u8],
+        input_tokens: &[u32],
         states: &mut [GatedState],
     ) -> MultiLayerCache {
         assert_eq!(states.len(), self.layers.len());
-        let t_steps = input_bytes.len();
+        let t_steps = input_tokens.len();
         let n_layers = self.layers.len();
         let mut cache = MultiLayerCache {
             layers: (0..n_layers).map(|_| LayerCache::with_capacity(t_steps)).collect(),
@@ -453,8 +455,8 @@ impl MultiLayerGatedSnn {
         let theta = self.spike_fn.threshold;
         let top_hidden = self.layers.last().unwrap().n_hidden;
 
-        for &byte in input_bytes {
-            let b = byte as usize;
+        for &tok in input_tokens {
+            let b = tok as usize;
             debug_assert!(b < self.n_input);
 
             // Active indices INTO layer l (i.e., for layer 0 it's
@@ -546,16 +548,34 @@ impl MultiLayerGatedSnn {
         self.forward_lm_bytes_stateful(input_bytes, &mut states)
     }
 
+    pub fn forward_lm_tokens(&self, input_tokens: &[u32]) -> MultiLayerCache {
+        let mut states = self.fresh_states();
+        self.forward_lm_tokens_stateful(input_tokens, &mut states)
+    }
+
+    /// Byte-level wrapper around `forward_lm_tokens_stateful` —
+    /// converts `&[u8]` to `Vec<u32>`. Aurora's existing byte-level
+    /// training code can keep calling this without changes.
+    pub fn forward_lm_bytes_stateful(
+        &self,
+        input_bytes: &[u8],
+        states: &mut [GatedState],
+    ) -> MultiLayerCache {
+        let tokens: Vec<u32> = input_bytes.iter().map(|&b| u32::from(b)).collect();
+        self.forward_lm_tokens_stateful(&tokens, states)
+    }
+
     /// Backward pass over the full chunk, accumulating into `grads`.
     /// Returns total cross-entropy loss (sum over all timesteps).
-    pub fn backward_lm_bytes_into(
+    /// Sprint 26: takes token IDs (u32). Byte-level wrapper below.
+    pub fn backward_lm_tokens_into(
         &self,
         cache: &MultiLayerCache,
-        input_bytes: &[u8],
-        targets: &[u8],
+        input_tokens: &[u32],
+        targets: &[u32],
         grads: &mut MultiLayerGatedGrads,
     ) -> f32 {
-        let t_steps = input_bytes.len();
+        let t_steps = input_tokens.len();
         debug_assert_eq!(targets.len(), t_steps);
         let n_layers = self.layers.len();
         let top_hidden = self.layers.last().unwrap().n_hidden;
@@ -630,7 +650,7 @@ impl MultiLayerGatedSnn {
                 // For layer L>0: active indices of layer L-1's spike
                 // output at THIS timestep.
                 let layer_input_active: Vec<usize> = if l == 0 {
-                    vec![input_bytes[t] as usize]
+                    vec![input_tokens[t] as usize]
                 } else {
                     active_indices(&cache.layers[l - 1].h_spike[t])
                 };
@@ -719,6 +739,19 @@ impl MultiLayerGatedSnn {
         total_loss
     }
 
+    /// Byte-level wrapper around `backward_lm_tokens_into` (Sprint 26).
+    pub fn backward_lm_bytes_into(
+        &self,
+        cache: &MultiLayerCache,
+        input_bytes: &[u8],
+        targets: &[u8],
+        grads: &mut MultiLayerGatedGrads,
+    ) -> f32 {
+        let toks: Vec<u32> = input_bytes.iter().map(|&b| u32::from(b)).collect();
+        let tgts: Vec<u32> = targets.iter().map(|&b| u32::from(b)).collect();
+        self.backward_lm_tokens_into(cache, &toks, &tgts, grads)
+    }
+
     pub fn backward_lm_bytes(
         &mut self,
         cache: &MultiLayerCache,
@@ -731,15 +764,28 @@ impl MultiLayerGatedSnn {
         loss
     }
 
-    /// Streaming inference for a single byte. Per-layer state persists
-    /// across calls so the network can be sampled autoregressively.
-    pub fn step_lm_byte(&self, byte: u8, states: &mut [GatedState]) -> Vec<f32> {
+    pub fn backward_lm_tokens(
+        &mut self,
+        cache: &MultiLayerCache,
+        input_tokens: &[u32],
+        targets: &[u32],
+    ) -> f32 {
+        let mut grads = std::mem::take(&mut self.grads);
+        let loss = self.backward_lm_tokens_into(cache, input_tokens, targets, &mut grads);
+        self.grads = grads;
+        loss
+    }
+
+    /// Streaming inference for a single token (u32). Sprint 26: works
+    /// for arbitrary vocab via token id; the byte-level version is a
+    /// thin wrapper.
+    pub fn step_lm_token(&self, token: u32, states: &mut [GatedState]) -> Vec<f32> {
         assert_eq!(states.len(), self.layers.len());
         let n_layers = self.layers.len();
         let theta = self.spike_fn.threshold;
         let top_hidden = self.layers.last().unwrap().n_hidden;
 
-        let mut layer_input_active: Vec<usize> = vec![byte as usize];
+        let mut layer_input_active: Vec<usize> = vec![token as usize];
 
         for l in 0..n_layers {
             let layer = &self.layers[l];
@@ -805,6 +851,11 @@ impl MultiLayerGatedSnn {
         logits
     }
 
+    /// Byte-level wrapper around `step_lm_token`.
+    pub fn step_lm_byte(&self, byte: u8, states: &mut [GatedState]) -> Vec<f32> {
+        self.step_lm_token(u32::from(byte), states)
+    }
+
     /// Stateless single-batch wrapper.
     pub fn forward_backward_batch(
         &mut self,
@@ -847,6 +898,45 @@ impl MultiLayerGatedSnn {
                 let cache = weights.forward_lm_bytes_stateful(inputs, state);
                 let loss =
                     weights.backward_lm_bytes_into(&cache, inputs, targets, &mut grads);
+                (loss, grads)
+            })
+            .collect();
+        self.zero_grad();
+        let mut total_loss = 0.0_f32;
+        for (loss, grads) in &results {
+            total_loss += loss;
+            self.grads.add(grads);
+        }
+        total_loss
+    }
+
+    /// Sprint 26: token-level rayon-parallel batch trainer. Each
+    /// batch slot's `inputs[b]` / `targets[b]` are token id slices.
+    ///
+    /// # Panics
+    /// Panics on length mismatch between `batch_inputs`,
+    /// `batch_targets`, and `states`.
+    pub fn forward_backward_batch_tokens_stateful(
+        &mut self,
+        batch_inputs: &[&[u32]],
+        batch_targets: &[&[u32]],
+        states: &mut [Vec<GatedState>],
+    ) -> f32 {
+        assert_eq!(batch_inputs.len(), batch_targets.len());
+        assert_eq!(batch_inputs.len(), states.len());
+        if batch_inputs.is_empty() {
+            return 0.0;
+        }
+        let weights = &*self;
+        let results: Vec<(f32, MultiLayerGatedGrads)> = batch_inputs
+            .par_iter()
+            .zip(batch_targets.par_iter())
+            .zip(states.par_iter_mut())
+            .map(|((inputs, targets), state)| {
+                let mut grads = weights.alloc_grads();
+                let cache = weights.forward_lm_tokens_stateful(inputs, state);
+                let loss =
+                    weights.backward_lm_tokens_into(&cache, inputs, targets, &mut grads);
                 (loss, grads)
             })
             .collect();

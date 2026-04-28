@@ -1847,8 +1847,11 @@ impl FusedGatePreKernel {
 // handles one (sample b, timestep t) softmax + d_logits + loss in
 // parallel. Targets come from a storage buffer (`targets[b*T + t]`).
 //
-// Constraint: O <= 256 (one thread per output). For VOCAB=256 byte LM
-// this is exact; the dispatch panics if O > 256.
+// Sprint 26: per-thread stride loop over output dim removes the
+// hard `O <= 256` cap. Each thread handles `ceil(O / 256)` outputs
+// across a stride of 256, then 256-way reductions over `sh_buf`
+// proceed as before. Works for any `n_output ≤ 65535` in practice
+// (limited by `MAX_OUTPUT` workgroup-shared scratch).
 const SOFTMAX_CE_WGSL: &str = "
 struct SCE {
     n_output: u32,
@@ -1879,13 +1882,16 @@ fn main(
     let base = bt_idx * p.n_output;
     let target_idx = targets[bt_idx];
 
-    var v: f32 = -3.4028235e38;
-    if (tid < p.n_output) {
-        v = logits[base + tid];
-        sh_buf[tid] = v;
-    } else {
-        sh_buf[tid] = -3.4028235e38;
+    // Phase 1: each thread folds its assigned outputs (stride 256)
+    // into a local max, then 256-way reduce in shared memory.
+    var local_max: f32 = -3.4028235e38;
+    var idx: u32 = tid;
+    loop {
+        if (idx >= p.n_output) { break; }
+        local_max = max(local_max, logits[base + idx]);
+        idx = idx + 256u;
     }
+    sh_buf[tid] = local_max;
     workgroupBarrier();
 
     var stride: u32 = 128u;
@@ -1902,13 +1908,15 @@ fn main(
     }
     workgroupBarrier();
 
-    var e: f32 = 0.0;
-    if (tid < p.n_output) {
-        e = exp(v - sh_max);
-        sh_buf[tid] = e;
-    } else {
-        sh_buf[tid] = 0.0;
+    // Phase 2: stride-loop sum over exp(logit - max).
+    var local_sum: f32 = 0.0;
+    idx = tid;
+    loop {
+        if (idx >= p.n_output) { break; }
+        local_sum = local_sum + exp(logits[base + idx] - sh_max);
+        idx = idx + 256u;
     }
+    sh_buf[tid] = local_sum;
     workgroupBarrier();
     stride = 128u;
     loop {
@@ -1924,13 +1932,18 @@ fn main(
     }
     workgroupBarrier();
 
-    if (tid < p.n_output) {
-        let prob = e / sh_sum;
+    // Phase 3: write d_logits = softmax - one_hot(target). Stride loop
+    // again so each thread covers ceil(n_output/256) outputs.
+    idx = tid;
+    loop {
+        if (idx >= p.n_output) { break; }
+        let prob = exp(logits[base + idx] - sh_max) / sh_sum;
         var d = prob;
-        if (tid == target_idx) {
+        if (idx == target_idx) {
             d = prob - 1.0;
         }
-        d_logits[base + tid] = d;
+        d_logits[base + idx] = d;
+        idx = idx + 256u;
     }
     if (tid == 0u) {
         let p_target = max(exp(logits[base + target_idx] - sh_max) / sh_sum, 1e-12);
@@ -1998,12 +2011,13 @@ impl SoftmaxCrossEntropyKernel {
 
     /// Sprint 19: one dispatch handles `B * T` softmaxes via a 2D grid
     /// of workgroups (`workgroup_id.x = b`, `workgroup_id.y = t`). Each
-    /// workgroup is 256 threads, one per output. `targets` is a storage
-    /// buffer of `u32` of length `>= B * T` (one byte index per
-    /// (sample, timestep)).
+    /// workgroup is 256 threads. Sprint 26 lifted the `n_output ≤ 256`
+    /// cap via per-thread stride loops, so this works for any
+    /// vocabulary size (BPE-tokenized models can use n_output up to
+    /// 65535 in practice).
     ///
     /// # Panics
-    /// Panics if `n_output > 256`.
+    /// Panics if `n_output == 0`.
     pub fn dispatch_into(
         &self,
         ctx: &GpuContext,
@@ -2016,10 +2030,7 @@ impl SoftmaxCrossEntropyKernel {
         n_timesteps: u32,
         batch_size: u32,
     ) {
-        assert!(
-            n_output <= 256,
-            "softmax_ce kernel hardcoded to workgroup_size(256); n_output={n_output} > 256",
-        );
+        assert!(n_output > 0, "n_output must be > 0");
         debug_assert!(logits.len >= (batch_size * n_timesteps * n_output) as usize);
         debug_assert!(d_logits.len >= (batch_size * n_timesteps * n_output) as usize);
         debug_assert!(loss_seq.len >= (batch_size * n_timesteps) as usize);

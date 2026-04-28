@@ -43,7 +43,17 @@ pub fn one_hot(byte: u8) -> Vec<f32> {
 /// distribution.
 pub fn sample_byte(logits: &[f32], temperature: f32, rng: &mut impl rand::Rng) -> u8 {
     debug_assert_eq!(logits.len(), VOCAB);
-    let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature.max(1e-6)).collect();
+    sample_token(logits, temperature, rng) as u8
+}
+
+/// Sprint 26: vocab-agnostic version of `sample_byte`. Returns a
+/// token id (u32) drawn from `softmax(logits/T)`. Works for byte-level
+/// (vocab=256) or BPE-tokenized models (vocab=4k, 8k, etc.).
+pub fn sample_token(logits: &[f32], temperature: f32, rng: &mut impl rand::Rng) -> u32 {
+    let n = logits.len();
+    debug_assert!(n > 0);
+    let inv_t = 1.0 / temperature.max(1e-6);
+    let scaled: Vec<f32> = logits.iter().map(|&v| v * inv_t).collect();
     let max = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = scaled.iter().map(|&v| (v - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
@@ -52,10 +62,10 @@ pub fn sample_byte(logits: &[f32], temperature: f32, rng: &mut impl rand::Rng) -
     for (i, &e) in exps.iter().enumerate() {
         acc += e;
         if r <= acc {
-            return i as u8;
+            return i as u32;
         }
     }
-    (VOCAB - 1) as u8
+    (n - 1) as u32
 }
 
 /// Average per-byte cross-entropy in **bits** ("bits per byte" / BPB).
