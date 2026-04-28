@@ -20,6 +20,8 @@ neuromodulace), žádný backprop.
 - Recurrent surrogate SNN s W_rec hidden→hidden + gradient clipping pro Sequential MNIST
 - Adam optimizer reusable přes oba surrogate stacks
 - Byte-level char-level LM (next-byte prediction, BPB metric, autoregressive generation)
+- Gated recurrent SNN (LSTM-style per-neuron forget gate, řeší vanishing gradient)
+- Mini-batched parallel BPTT pro gated cell (rayon přes batch dim, externalizovaný grad buffer)
 
 ## Spuštění
 
@@ -32,6 +34,8 @@ cargo run --release --example mnist_eval      # accuracy na test setu
 cargo run --release --example mnist_surrogate # surrogate-gradient BPTT (Sprint 8)
 cargo run --release --example seq_mnist        # recurrent surrogate, Sequential MNIST (Sprint 9)
 cargo run --release --example char_lm -- data/tiny.txt  # byte-level char LM (Sprint 10)
+cargo run --release --example char_lm_gated -- data/tiny.txt  # gated cell variant (Sprint 11)
+cargo run --release --example char_lm_gated_cz -- data/cesky.txt  # CZ char-LM (UTF-8)
 ```
 
 ## Dokumentace

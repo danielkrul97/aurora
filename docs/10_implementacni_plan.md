@@ -333,20 +333,95 @@
 
 ---
 
-## Sprint 11 — Decision point: scale, gated LIF, hybrid, nebo eficience
+## Sprint 11 — Gated LIF cell (LSTM-style forget gate)
+
+**Sprint 10 výsledek:** tiny-shakespeare 3.115 BPB v 3.5 minutách, slovní fragmenty v generaci. Pod bigram baseline (3.7), nad LSTM char-RNN baseline (1.5). Sprint 10/11 decision point → **B (gated LIF)**: kategorialní upgrade kapacity sítě.
+
+**Cíl:** Nahradit fixed `decay = exp(-dt/τ)` v recurrent SNN cell **per-neuron, input-dependent forget gate** `β_t = sigmoid(W_β_in @ x_t + W_β_rec @ h_spike_{t-1} + b_β)`. Membrane integrace se stane `h_v_pre = h_v_after_prev * β_t + ...`. Síť se naučí, kdy "pamatovat" (gate ≈ 1) a kdy "resetovat" (gate ≈ 0) per neuron, per timestep.
+
+**Princip plánování:**
+- **Nový typ vedle existujícího.** `GatedRecurrentSnn` paralelní k `RecurrentSurrogateSnn`, ne jeho rozšíření. Pure baseline zůstává jako reference pro benchmark; Aurora má teď "vanilla" a "gated" verzi recurrent stacku.
+- **Bias = 1.0 init.** Jozefowicz et al. 2015 LSTM-forget-gate-bias-1 trick: počáteční sigmoid(1.0) ≈ 0.73 znamená "remember by default", brání tomu aby gate okamžitě zničil hidden state.
+- **Sparse-by-default.** Stejné techniky jako Sprint 10: one-hot input (column read), binary spike (skip nulové sloupce). Gate má vlastní `W_gate_in` / `W_gate_rec` váhy se stejným sparse paternem.
+- **Žádný cell state separátní od membrány.** GRU-style simplifikace nad full-LSTM: jen forget gate, žádný input gate ani output gate. Output stále non-spiking lineární projekce hidden spikes (jako Sprint 10).
+
+**Deliverables:**
+- `src/snn_gated.rs` (~480 LOC) — `GatedRecurrentSnn`:
+  - 5 váhových matic: `W_in`, `W_rec`, `W_out`, `W_gate_in`, `W_gate_rec`
+  - 3 bias vektory: `b_h`, `b_o`, `b_gate` (init `1.0` pro `b_gate`)
+  - `forward_lm_bytes(&[u8]) -> GatedLmCache` se sparse path
+  - `backward_lm_bytes(&cache, &[u8], &[u8]) -> nats` s BPTT přes 4 paths (decay carryover přes gate, recurrent W_rec, recurrent W_gate_rec, output W_out)
+  - `step_lm_byte(byte, &mut state) -> logits` pro autoregressive generaci
+  - `clip_grads`, `step_adam`, `zero_grad` přes všech 8 parameter groups
+- `tests/gated_lm_smoke.rs` — 8-byte cycle. **Naměřeno: 0.92 BPB v 6 epochách** (vanilla měla 1.35 → gating zlepšil o 35 % na stejném tasku).
+- `examples/char_lm_gated.rs` — drop-in replacement pro `char_lm` s gated cell, stejné CLI args, stejný pretty output.
+
+**Exit kritérium:**
+- ✅ Smoke test < 1.5 BPB — naměřeno **0.92** (vs vanilla 1.35).
+- 🟡 tiny-shakespeare BPB ≤ 2.5 (vs vanilla 3.12) — k ověření uživatelem.
+
+**Co Sprint 11 záměrně NEŘEŠÍ:**
+- Full LSTM (input + output gate). Forget gate sám většinou stačí pro kratko-dobé memory tasks; full LSTM přidává komplexitu výměnou za marginal capacity gain.
+- Stateful BPTT přes chunk boundaries (carry-with-detach). Pokud Sprint 11 BPB stagnuje, Sprint 12 add-on.
+- Mini-batching. Sparse cesta nás drží v "OK rychlosti"; batch je optimalization pro Sprint 12+.
+
+**Otevřené otázky:**
+- Init scale `W_gate`: `0.1 × scale_main` znamená sigmoid input je dominován bias=1.0 → sigmoid(~1.0) ≈ 0.73 počáteční gate. Pokud gating se nedostatečně diferencuje per-neuron, zvýšit init scale.
+- Gate-gradient flow přes silně nasycený sigmoid: pokud gate je ≈ 0 nebo ≈ 1, derivative `g(1-g)` ≈ 0 → vanishing gradient. Surrogate gradient pro sigmoid jsme nezavedli (na rozdíl od Heaviside) — pokud je problém, lze.
+
+---
+
+## Sprint 12 — Scale-up + mini-batching (cesta z 2.71 BPB níž)
+
+**Sprint 11 výsledek:** tiny-shakespeare gated 2.705 BPB (vanilla 3.115 → −0.41 zlepšení), ale lehký overfitting po 1 epoše ukazuje strop kombinace 256 hidden + 1 MB corpus + bez regularizace. Sprint 12 řeší obojí: **A (scale-up: hidden 512, větší corpus) + C-batching (mini-batch parallel BPTT)**.
+
+**Co Sprint 12 ZÁMĚRNĚ NEŘEŠÍ:** GPU port. Plný GPU port (CUDA přes `cust` nebo wgpu compute shaders) je 1000+ LOC a vyžaduje paralelní parity testy proti CPU. Mixovat to s mini-batchingem v jednom sprintu = dva nezávislé risky najednou. **Odloženo na Sprint 13.**
+
+**Princip plánování:**
+- **Externalizovat gradienty.** Místo `grad_*` polí uvnitř `GatedRecurrentSnn` zavést `GatedGrads` struct vedle. Per-thread workers v batched trainingu mají vlastní `GatedGrads` (sdílí read-only weights), main thread sumuje. Standard PyTorch-style separace weights/grads.
+- **Rayon přes batch dim.** Forward + backward každého samplu nezávisle. Per-thread `GatedGrads` accumulators se sumují deterministicky do `self.grads` po dokončení paralelního pass.
+- **Hidden 512 a větší corpus** řeší overfitting strop. 4× víc params, ale paralelní batching to z části vykompenzuje (parallel speedup). Kombinace by měla dotlačit BPB pod 2.0.
+
+**Deliverables:**
+- `src/snn_gated.rs`:
+  - `GatedGrads` struct (8 grad bufferů) s `zeros`, `zero`, `add`, `l2_norm`, `scale`.
+  - Refactor: `grad_*` fields → single `grads: GatedGrads` field. `zero_grad`, `clip_grads`, `step_adam` čtou z `self.grads`.
+  - `backward_lm_bytes_into(&self, cache, inputs, targets, grads: &mut GatedGrads) -> f32` — read-only na self, zapisuje do externí grad bufferu. Public API.
+  - `backward_lm_bytes(&mut self, ...)` — thin wrapper přes `mem::take` zachovává zpětnou kompatibilitu.
+  - `forward_backward_batch(&mut self, batch_inputs: &[&[u8]], batch_targets: &[&[u8]]) -> f32` — rayon parallel batch, sums per-thread grads do `self.grads`.
+- `tests/gated_batch_parity.rs`:
+  - `batch_grads_match_serial_sum_within_fp_tolerance` — batch == serial sum (FP tolerance 1e-5)
+  - `batched_training_progresses` — Adam s batch reduces loss
+- `examples/char_lm_gated.rs` — refactored: `N_HIDDEN=512`, `BATCH_SIZE=16`, contiguous chunks z corpu (každý batch sample má vlastní hidden state).
+- `scripts/get_corpus.sh` — multi-corpus download: `tiny`, `shakespeare-complete`, `wikitext2`.
+
+**Exit kritérium:**
+- ✅ Batch parity test prochází (max FP diff < 1e-5)
+- ✅ Batched training redukuje loss
+- 🟡 tiny-shakespeare s hidden=512 + batch=16: BPB ≤ 2.0 (vs Sprint 11: 2.71) — k ověření uživatelem
+- 🟡 Sprint 12 wall-clock ≤ Sprint 11 wall-clock i přes 4× víc params (mini-batching kompenzuje)
+
+**Otevřené otázky:**
+- Stateful BPTT přes batch chunks (carry h_v_after / h_spike s detach mezi po sobě jdoucími chunks ve stejné batch sequence). Aktuálně reset = 0 mezi chunks. Lee 2020 carry-with-detach. Pokud BPB stagnuje, dobrý add-on.
+- Optimal batch size: 16 default, ale 32-64 by mohlo být rychlejší na multi-core CPU. CPU má 4-16 jader; batch > num_cores má klesající návratnost.
+- Adam state checkpoint: ne v Sprintu 12 scope. Pokud chceme resume training, Sprint 13 add-on.
+
+---
+
+## Sprint 13 — GPU port nebo větší corpus
 
 **Vstupy do rozhodnutí:**
-- Sprint 10 tiny-shakespeare BPB
-- Profilace: kde se tráví čas
-- Generated samples quality: jsou tam slovní fragmenty? Coherence v rámci řádky?
+- Sprint 12 tiny-shakespeare BPB
+- CPU profilace: kolik času ještě tráví ve forward/backward
+- Realistický odhad: jak velký corpus chceme trénovat (10 MB? 100 MB?)
 
 **Možné větve:**
-- **A: Větší corpus + delší trénink.** Scale-up na ~10 MB textu, hidden 512+, multi-day trénink. Test scaling laws na SNN.
-- **B: LSTM-gated LIF.** Forget gate adaptuje membrane decay per-neuron. Lee 2020 dosahuje s tímto MNIST 95 %, char-LM 1.5 BPB.
-- **C: Hybrid surrogate→STDP.** Pretrained char-LM, fine-tune lokální plasticitou na nová doména. Biological plausibility experiment.
-- **D: Efektivita.** Mini-batching (rayon přes batch), GPU port, Adam state-saving pro resume training.
+- **A: GPU port (CUDA přes `cust` nebo wgpu compute).** Cílem `≥10×` speedup nad current CPU multi-core. Velký engineering scope (~1500 LOC + parity testy).
+- **B: Stateful BPTT.** Carry hidden state s detach mezi chunks. Levný (~50 LOC), ale jen pomáhá pokud LM má long-range dependencies it can use.
+- **C: Větší corpus + delší trénink na CPU.** Pokud Sprint 12 ukáže BPB ≤ 2.0, scale-up na ~10 MB text + multi-hour CPU trénink může pokračovat bez GPU.
+- **D: Hybrid surrogate→STDP.** Biological plausibility experiment. Pokud LM stack je "good enough", zajímavý vědecký test.
 
-**Toto rozhodnutí padne až po Sprintu 10, ne dřív.**
+**Toto rozhodnutí padne až po Sprintu 12.**
 
 ---
 
