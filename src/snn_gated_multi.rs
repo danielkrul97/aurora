@@ -58,6 +58,16 @@ pub struct GatedLayer {
 }
 
 const DEFAULT_ALPHA: f32 = 4.0;
+/// Sprint 31: positive `b_h` init. With weights initialized small
+/// (He-style), random one-hot/spike inputs land the membrane potential
+/// near 0, far below θ=1.0 — the surrogate gradient is then ≈ 0 and
+/// the network can't bootstrap firing. With β≈0.73 and `b_h = c`, the
+/// equilibrium membrane is `c / (1−β) ≈ 3.7c`. Setting c=0.3 puts the
+/// equilibrium near θ=1.0, so neurons fire at moderate rate (~20–30 %)
+/// from step 0, surrogate grads flow, and recurrent dynamics don't
+/// immediately blow up. b_h = 0.5 was tried but produced membrane
+/// peaks > 40k from runaway recurrent integration.
+const DEFAULT_B_H_INIT: f32 = 0.3;
 
 impl GatedLayer {
     pub fn new<R: Rng>(n_in: usize, n_hidden: usize, rng: &mut R) -> Self {
@@ -92,7 +102,7 @@ impl GatedLayer {
             w_rec,
             w_gate_in,
             w_gate_rec,
-            b_h: vec![0.0; n_hidden],
+            b_h: vec![DEFAULT_B_H_INIT; n_hidden],
             b_gate: vec![1.0; n_hidden], // forget-gate-bias-1 trick
             alpha: DEFAULT_ALPHA,
         }
@@ -295,6 +305,36 @@ impl MultiLayerCache {
                 let total = (layer.h_spike.len() * n_h) as f32;
                 let count: f32 = layer.h_spike.iter().flatten().copied().sum();
                 if total > 0.0 { count / total } else { 0.0 }
+            })
+            .collect()
+    }
+
+    /// Sprint 31: per-layer (mean, max) of `h_v_pre`. Compared to
+    /// threshold θ, this tells you whether the membrane potential is
+    /// even reaching firing range — a dead layer fires 0 not because
+    /// the surrogate is broken but because v stays far below θ.
+    #[must_use]
+    pub fn membrane_stats(&self) -> Vec<(f32, f32)> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                if layer.h_v_pre.is_empty() {
+                    return (0.0, 0.0);
+                }
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                let mut peak = f32::NEG_INFINITY;
+                for row in &layer.h_v_pre {
+                    for &v in row {
+                        sum += v;
+                        if v > peak {
+                            peak = v;
+                        }
+                        count += 1;
+                    }
+                }
+                let mean = if count > 0 { sum / count as f32 } else { 0.0 };
+                (mean, peak)
             })
             .collect()
     }

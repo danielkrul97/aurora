@@ -105,35 +105,67 @@ Implementace Sprintu 30 odhalila zásadní fakt: **hidden vrstvy nikdy nefires**
 
 ---
 
-## Sprint 31 — Probudit hidden vrstvy + dotáhnout zbylé Sprint 30 items
+## Sprint 31 — Probudit hidden vrstvy ✓ DONE
 
-**Cíl:** Dotáhnout zbylé items z Sprintu 30 na všechny tréninkové cesty.
+**Výsledek:** První skutečný BPB krok dolů od baseline. Layers fire, gradients flow.
+
+**Co se udělalo:**
+
+1. **Positive `b_h` init** (`DEFAULT_B_H_INIT = 0.3`) — kritická změna. Přidá konstantní bias do membrane potential, takže neuron sedí na ~37 % cesty k thresholdu. Slabé inputy už pak postačí na firing, surrogate gradient je non-zero, gradient signal teče do `W_in` / `W_rec`.
+
+   Mikro-teorie: s β = sigmoid(b_gate=1) ≈ 0.73 a b_h = 0.3, equilibrium membrane v_eq = 0.3 / (1 − β) = 1.11, těsně nad θ=1. Naivní steady-state firing rate ≈ 1/3.
+
+2. **Membrane stats** v `MultiLayerCache::membrane_stats()` (mean, peak per layer) — diagnostika, která by pomohla najít runaway dříve. Aurora_train teď tiskne `v mean/peak [...]` v `epoch_diagnostics`.
+
+3. **Regression test** rozšířen: `cpu_byte_lm_converges_under_one_epoch` teď asserts `rates[l] > 0.001` per layer. Catches future regressions kde init/dynamic změna zase vrstvy umlčí.
+
+**Měřené delty (proti Sprint 30 baseline):**
+
+| Test | Před | Po | Delta |
+|---|---|---|---|
+| GPU aurora_train tiny_200k h=1024 vocab=4096, 1 ep | val BPB 2.768, rates [0.0, 0.0] | val BPB **2.684**, rates [0.35, 0.22] | **−3.0 %** + firing |
+| CPU regression byte 50K h=64, 1 ep | val BPB 4.83, rates not asserted | val BPB **4.68**, rates [0.50, 0.54] | **−3.1 %** + firing |
+| CPU regression BPE 50K h=64 vocab=384 | val BPB 4.05 | val BPB 4.07 | žádný regression |
+
+**Otevřené v Sprintu 31 (záměrně):**
+
+- **Membrane runaway** — peaks 7k–30k pozorovány. Nestala se NaN, ale numericky riziková pro delší tréninky / hlubší modely. Varianty fixu: rate l2 reg pull rate dolů, soft membrane clamp, snížit `b_gate` init pro silnější leak. Ponecháno jako Sprint 32 priority.
+- **GPU side α-gradient** — α na GPU stále jen čte CPU-evolved hodnotu. Sprint 32+.
+- **TET loss** — softmax_ce kernel surgery. Sprint 32+.
+- **Spike rate l2 reg** přes bias gradient. Sprint 32+.
+
+---
+
+## Sprint 32 — Stabilizace + dotáhnout zbylé Sprint 30 items
+
+**Cíl:** Membrane runaway pod kontrolu, plus zbylé items z Sprintu 30 na všechny tréninkové cesty.
 
 **Deliverables:**
 
-1. **TET loss.**
+1. **Spike-rate l2 reg na bias.** Hlavní páka pro krocení runaway peaks (7k–30k naměřené v Sprintu 31).
+   - CPU: per-layer rate spočítán v forward, přidán `2 × λ × (rate − target) / (B × T × N)` do `b_h` gradientu.
+   - GPU: rate counted v megakernelu (1 atomic per layer), přidáno k bias gradientu po backward.
+   - λ=0.01, target=0.1 jako startovní hodnoty.
+
+2. **TET loss.**
    - CPU `snn_loss::cross_entropy_with_grad` rozšířen o `tet_lambda: f32` (default 0.05). Při λ > 0 přidá `λ × MSE(softmax(z), onehot(y))` do loss; gradient `2 × p_i × (p_i − y_i)`.
    - GPU `softmax_ce` kernel: stejný add ze strany WGSL (push constant `tet_lambda`).
-   - Test: TET ≠ 0 dává odlišný gradient než CE alone, tréninkově konverguje k podobné/lepší BPB.
 
-2. **GPU side α-gradient.** Reduction kernel (`reduce_alpha_grad.wgsl`):
+3. **GPU side α-gradient.** Reduction kernel (`reduce_alpha_grad.wgsl`):
    - Vstup: `d_h_spike` packed (B × T × N), `h_v_pre` packed (stejný shape).
    - Per-thread compute `d_h_spike[i] × ∂surrogate/∂α` for `α_local`.
    - Workgroup-shared reduction → 1 atomic add do per-layer α-grad scalaru.
    - Adam step pro α buffer na GPU.
 
-3. **Spike-rate l2 reg na bias.**
-   - CPU: per-layer rate spočítán v forward, přidán `2 × λ × (rate − target) / (B × T × N)` do `b_h` gradientu.
-   - GPU: rate counted v megakernelu (1 atomic per layer), přidáno k bias gradientu po backward.
-
 **Exit kritéria:**
-- BPB delta měřitelný proti Sprint 30 baseline (na tiny_200k a enwik8_10m).
+- Membrane peaks pod 100 (vs současné 7k–30k).
 - Per-layer rates konvergují k cílovým 0.1 ± 0.05 do konce 1. epochy.
+- BPB stejný nebo lepší než Sprint 31 baseline (2.684 na tiny_200k h=1024 vocab=4096).
 - Žádná regression v gpu_parity testech.
 
 ---
 
-## Sprint 32+ — možné větve (rozhodneme po měření 30+31)
+## Sprint 33+ — možné větve (rozhodneme po měření 32)
 
 | Větev | Co odemyká | Effort | Zdroj |
 |---|---|---|---|

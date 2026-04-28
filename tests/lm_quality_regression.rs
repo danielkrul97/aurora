@@ -84,6 +84,22 @@ fn cpu_byte_lm_converges_under_one_epoch() {
         "byte-level LM stalled: val BPB {val_bpb:.3} ≥ 6.0 (random=8.0)"
     );
     assert!(val_bpb.is_finite(), "BPB is non-finite — backward broken");
+
+    // Sprint 31 regression: hidden layers must actually fire. Before
+    // the b_h positive-init fix, networks reached BPB 4.83 by learning
+    // only b_o constant prediction and never firing. Assert a stateful
+    // forward over val data shows non-trivial activity in every layer.
+    let mut states = net.fresh_states();
+    let probe = &val[..chunk.min(val.len())];
+    let cache = net.forward_lm_bytes_stateful(probe, &mut states);
+    let rates = cache.firing_rates();
+    eprintln!("cpu_byte_lm firing rates = {rates:?}");
+    for (l, &r) in rates.iter().enumerate() {
+        assert!(
+            r > 0.001,
+            "layer {l} silent (rate {r:.4}) — Sprint 31 wake-up regressed"
+        );
+    }
 }
 
 /// CPU + BPE regression. Same shape as the byte test, but the corpus
