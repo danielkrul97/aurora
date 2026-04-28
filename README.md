@@ -54,6 +54,11 @@ cargo run --release --features gpu --example char_lm_gated_gpu -- data/tiny.txt 
 cargo run --release --example char_lm_gated_multi -- data/tiny.txt 3 64 0.002 2 256  # multi-layer CPU (n_layers, hidden)
 cargo run --release --features gpu --example char_lm_gated_multi_gpu -- data/tiny.txt 3 64 0.002 256  # 2-layer GPU
 cargo bench  --features gpu --bench lm_gpu_speedup        # CPU vs GPU throughput
+
+bash scripts/get_corpus.sh tiny           # 1.1 MB tiny-shakespeare
+bash scripts/get_corpus.sh enwik8-10m     # 10 MB enwik8 subset (~1 h / 3 epochs)
+bash scripts/get_corpus.sh enwik8         # 100 MB enwik8 (Hutter Prize benchmark, ~10 h / 3 epochs)
+bash scripts/get_corpus.sh enwik9         # 1 GB enwik9 (heavy training, ~days)
 ```
 
 ## Dokumentace
