@@ -1,0 +1,588 @@
+#![cfg(feature = "gpu")]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines
+)]
+
+//! Sprint 28: Aurora's primary training example.
+//!
+//! Combines every speed + quality feature shipped so far:
+//! * GPU 2-layer megakernel (Sprint 25)
+//! * BPE tokenization (Sprint 26)
+//! * Token-level GPU forward/backward (Sprint 28)
+//! * Checkpointing — auto-saves weights at end of every epoch and
+//!   auto-resumes if a checkpoint with matching architecture exists.
+//!
+//! Designed for overnight runs on enwik8/enwik9. Use BPE for quality,
+//! GPU megakernel for speed, and checkpoints so you don't have to
+//! restart from scratch after a power blip or system update.
+//!
+//! Usage:
+//!   cargo run --release --features gpu --example aurora_train -- \
+//!     --corpus data/enwik8.txt \
+//!     --vocab 4096 \
+//!     --hidden 512 \
+//!     --epochs 8 \
+//!     --chunk 64 \
+//!     --lr 0.002 \
+//!     --checkpoint data/aurora.ckpt
+//!
+//! All flags optional; defaults shown above.
+
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use aurora::bpe::BpeTokenizer;
+use aurora::checkpoint::{self, Checkpoint};
+use aurora::gpu::snn_gated_gpu_multi::MultiLayerGatedSnnGpu;
+use aurora::gpu::GpuContext;
+use aurora::optimizer::AdamConfig;
+use aurora::snn_gated_multi::MultiLayerGatedSnn;
+use aurora::surrogate::SpikeFn;
+use aurora::text_io::{bits_per_byte, load_corpus, sample_token};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+
+const GRAD_CLIP: f32 = 1.0;
+const SAMPLE_LEN: usize = 200;
+const SAMPLE_TEMP: f32 = 0.8;
+const BATCH_SIZE: usize = 16;
+const N_LAYERS: usize = 2;
+
+#[derive(Debug, Clone)]
+struct Cli {
+    corpus: PathBuf,
+    vocab: usize,
+    hidden: usize,
+    epochs: usize,
+    chunk: usize,
+    lr: f32,
+    checkpoint: PathBuf,
+    bpe_path: Option<PathBuf>,
+}
+
+impl Cli {
+    fn parse() -> Result<Self, String> {
+        let mut corpus: PathBuf = "data/enwik8.txt".into();
+        let mut vocab: usize = 4096;
+        let mut hidden: usize = 512;
+        let mut epochs: usize = 8;
+        let mut chunk: usize = 64;
+        let mut lr: f32 = 0.002;
+        let mut checkpoint: Option<PathBuf> = None;
+        let mut bpe_path: Option<PathBuf> = None;
+
+        let args: Vec<String> = env::args().skip(1).collect();
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            let next = || {
+                args.get(i + 1)
+                    .ok_or_else(|| format!("missing value for {arg}"))
+            };
+            match arg.as_str() {
+                "--corpus" => {
+                    corpus = next()?.into();
+                    i += 2;
+                }
+                "--vocab" => {
+                    vocab = next()?.parse().map_err(|e| format!("--vocab: {e}"))?;
+                    i += 2;
+                }
+                "--hidden" => {
+                    hidden = next()?.parse().map_err(|e| format!("--hidden: {e}"))?;
+                    i += 2;
+                }
+                "--epochs" => {
+                    epochs = next()?.parse().map_err(|e| format!("--epochs: {e}"))?;
+                    i += 2;
+                }
+                "--chunk" => {
+                    chunk = next()?.parse().map_err(|e| format!("--chunk: {e}"))?;
+                    i += 2;
+                }
+                "--lr" => {
+                    lr = next()?.parse().map_err(|e| format!("--lr: {e}"))?;
+                    i += 2;
+                }
+                "--checkpoint" => {
+                    checkpoint = Some(next()?.into());
+                    i += 2;
+                }
+                "--bpe" => {
+                    bpe_path = Some(next()?.into());
+                    i += 2;
+                }
+                "-h" | "--help" => {
+                    return Err("see file header for usage".into());
+                }
+                other => return Err(format!("unknown flag {other}")),
+            }
+        }
+
+        let checkpoint = checkpoint.unwrap_or_else(|| {
+            let stem = corpus
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("corpus");
+            PathBuf::from(format!("data/{stem}_h{hidden}_v{vocab}.ckpt"))
+        });
+
+        Ok(Self {
+            corpus,
+            vocab,
+            hidden,
+            epochs,
+            chunk,
+            lr,
+            checkpoint,
+            bpe_path,
+        })
+    }
+}
+
+fn main() -> ExitCode {
+    let cli = match Cli::parse() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("usage error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if cli.hidden > 512 {
+        eprintln!("hidden must be ≤ 512 (Sprint 25 megakernel constraint)");
+        return ExitCode::FAILURE;
+    }
+
+    let corpus = match load_corpus(&cli.corpus) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to read {}: {e}", cli.corpus.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let bpe_path = cli.bpe_path.clone().unwrap_or_else(|| {
+        let stem = cli
+            .corpus
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("corpus");
+        PathBuf::from(format!("data/{stem}_{}.bpe", cli.vocab))
+    });
+    let bpe = match load_or_train_bpe(&corpus, cli.vocab, &bpe_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("BPE error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let actual_vocab = bpe.vocab_size();
+
+    let t0 = Instant::now();
+    let tokens = bpe.encode(&corpus);
+    let encode_s = t0.elapsed().as_secs_f64();
+    let comp = (corpus.len() as f32) / (tokens.len() as f32);
+
+    let n_train = (tokens.len() * 9) / 10;
+    let train_toks = &tokens[..n_train];
+    let val_toks = &tokens[n_train..];
+
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("GPU init failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let info = ctx.adapter_info();
+
+    let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+    let (net_init, start_epoch) =
+        load_or_init_net(&cli.checkpoint, actual_vocab, cli.hidden, &mut rng);
+    let resumed = start_epoch > 0;
+    let mut net_gpu = MultiLayerGatedSnnGpu::from_cpu(&net_init, ctx);
+    drop(net_init);
+
+    let adam = AdamConfig {
+        lr: cli.lr,
+        ..AdamConfig::default()
+    };
+
+    print_header(
+        &cli,
+        corpus.len(),
+        tokens.len(),
+        actual_vocab,
+        n_train,
+        val_toks.len(),
+        encode_s,
+        start_epoch,
+        resumed,
+        &info,
+    );
+
+    let total_start = Instant::now();
+    let mut best_val = f32::INFINITY;
+    let h = cli.hidden;
+    type StateTuple = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+    for epoch in start_epoch..cli.epochs as u32 {
+        let epoch_start = Instant::now();
+        epoch_open(epoch);
+
+        let stream_len = train_toks.len() / BATCH_SIZE;
+        let n_chunks_per_stream = stream_len.saturating_sub(1) / cli.chunk;
+        let report_every = (n_chunks_per_stream / 50).max(1);
+        let mut total_nats = 0.0_f32;
+        let mut total_tokens = 0_usize;
+        let mut states: Vec<StateTuple> = (0..BATCH_SIZE)
+            .map(|_| (vec![0.0; h], vec![0.0; h], vec![0.0; h], vec![0.0; h]))
+            .collect();
+        let mut inputs_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
+        let mut targets_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
+
+        for chunk_idx in 0..n_chunks_per_stream {
+            inputs_owned.clear();
+            targets_owned.clear();
+            for b in 0..BATCH_SIZE {
+                let stream_start = b * stream_len;
+                let p = stream_start + chunk_idx * cli.chunk;
+                inputs_owned.push(&train_toks[p..p + cli.chunk]);
+                targets_owned.push(&train_toks[p + 1..p + cli.chunk + 1]);
+            }
+            net_gpu.zero_grad_gpu();
+            let loss = net_gpu.forward_backward_batch_gpu_multi_fused_tokens(
+                &inputs_owned,
+                &targets_owned,
+                &mut states,
+            );
+            net_gpu.clip_grads_gpu(GRAD_CLIP);
+            net_gpu.step_adam_gpu(&adam);
+            total_nats += loss;
+            total_tokens += cli.chunk * BATCH_SIZE;
+
+            if (chunk_idx + 1).is_multiple_of(report_every) {
+                let frac = (chunk_idx + 1) as f64 / n_chunks_per_stream as f64;
+                let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
+                epoch_progress(frac, bpb, epoch_start.elapsed().as_secs_f64());
+            }
+        }
+
+        let train_bpb =
+            bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
+        let net_snapshot = net_gpu.to_cpu();
+        let val_bpb = evaluate(&net_snapshot, val_toks, cli.chunk, comp);
+        if val_bpb < best_val {
+            best_val = val_bpb;
+        }
+        epoch_done(train_bpb, val_bpb, epoch_start.elapsed().as_secs_f64());
+
+        if let Err(e) = checkpoint::save(&cli.checkpoint, &net_snapshot, epoch + 1) {
+            eprintln!("⚠ checkpoint save failed: {e}");
+        } else {
+            println!(
+                "{}",
+                line(&format!(" checkpoint saved → {}", cli.checkpoint.display()))
+            );
+        }
+        epoch_close();
+
+        let seed_tokens: Vec<u32> = val_toks.iter().take(16).copied().collect();
+        let sample_tokens = generate(
+            &net_snapshot,
+            &seed_tokens,
+            SAMPLE_LEN,
+            SAMPLE_TEMP,
+            actual_vocab,
+            &mut rng,
+        );
+        let seed_bytes = bpe.decode(&seed_tokens);
+        let sample_bytes = bpe.decode(&sample_tokens);
+        sample_block(&seed_bytes, &sample_bytes);
+    }
+
+    let val_bytes_est = corpus.len().saturating_sub(n_train * corpus.len() / tokens.len());
+    print_footer(best_val, total_start.elapsed().as_secs_f64(), val_bytes_est);
+    ExitCode::SUCCESS
+}
+
+fn load_or_train_bpe(
+    corpus: &[u8],
+    vocab: usize,
+    bpe_path: &Path,
+) -> Result<BpeTokenizer, Box<dyn std::error::Error>> {
+    if bpe_path.exists() {
+        println!("loading BPE from {}", bpe_path.display());
+        let tok = BpeTokenizer::load(bpe_path)?;
+        if tok.vocab_size() != vocab {
+            println!(
+                "  cached BPE vocab is {} (requested {}) — using cached",
+                tok.vocab_size(),
+                vocab
+            );
+        }
+        Ok(tok)
+    } else {
+        println!(
+            "no cached BPE at {}; training fresh on corpus…",
+            bpe_path.display()
+        );
+        let t0 = Instant::now();
+        let tok = BpeTokenizer::train(corpus, vocab);
+        println!(
+            "  trained {} merges in {:.1}s",
+            tok.merges().len(),
+            t0.elapsed().as_secs_f64()
+        );
+        if let Err(e) = tok.save(bpe_path) {
+            eprintln!("  ⚠ BPE save failed (continuing): {e}");
+        } else {
+            println!("  saved → {}", bpe_path.display());
+        }
+        Ok(tok)
+    }
+}
+
+fn load_or_init_net(
+    path: &Path,
+    vocab: usize,
+    hidden: usize,
+    rng: &mut StdRng,
+) -> (MultiLayerGatedSnn, u32) {
+    if path.exists() {
+        match checkpoint::load(path) {
+            Ok(Checkpoint { net, epoch }) => {
+                let arch_ok = net.n_input == vocab
+                    && net.n_output == vocab
+                    && net.layers.len() == N_LAYERS
+                    && net.layers.iter().all(|l| l.n_hidden == hidden);
+                if arch_ok {
+                    println!(
+                        "resumed from {} (completed epochs: {epoch})",
+                        path.display()
+                    );
+                    return (net, epoch);
+                }
+                eprintln!(
+                    "checkpoint at {} has different architecture; starting fresh",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("checkpoint load failed: {e}; starting fresh");
+            }
+        }
+    }
+    let net = MultiLayerGatedSnn::new(
+        vocab,
+        &[hidden; N_LAYERS],
+        vocab,
+        SpikeFn::default(),
+        rng,
+    );
+    (net, 0)
+}
+
+fn evaluate(net: &MultiLayerGatedSnn, val_toks: &[u32], chunk: usize, comp: f32) -> f32 {
+    if val_toks.len() < chunk + 1 {
+        return f32::INFINITY;
+    }
+    let mut total_nats = 0.0_f32;
+    let mut total_tokens = 0_usize;
+    let mut pos = 0;
+    while pos + chunk < val_toks.len() {
+        let inputs = &val_toks[pos..pos + chunk];
+        let targets = &val_toks[pos + 1..pos + chunk + 1];
+        let cache = net.forward_lm_tokens(inputs);
+        for (logits_t, &target) in cache.logits.iter().zip(targets.iter()) {
+            let max = logits_t.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let log_sum_exp =
+                max + logits_t.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
+            total_nats += log_sum_exp - logits_t[target as usize];
+        }
+        total_tokens += chunk;
+        pos += chunk;
+    }
+    bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize)
+}
+
+fn generate(
+    net: &MultiLayerGatedSnn,
+    seed: &[u32],
+    n: usize,
+    temperature: f32,
+    vocab: usize,
+    rng: &mut impl rand::Rng,
+) -> Vec<u32> {
+    let mut states = net.fresh_states();
+    for &t in seed {
+        let _ = net.step_lm_token(t, &mut states);
+    }
+    let mut last = *seed.last().unwrap_or(&0);
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let logits = net.step_lm_token(last, &mut states);
+        last = sample_token(&logits, temperature, rng);
+        if (last as usize) >= vocab {
+            last = (vocab - 1) as u32;
+        }
+        out.push(last);
+    }
+    out
+}
+
+const BOX_WIDTH: usize = 60;
+
+#[allow(clippy::too_many_arguments)]
+fn print_header(
+    cli: &Cli,
+    corpus_bytes: usize,
+    n_tokens: usize,
+    vocab: usize,
+    n_train: usize,
+    n_val: usize,
+    encode_s: f64,
+    start_epoch: u32,
+    resumed: bool,
+    adapter: &wgpu::AdapterInfo,
+) {
+    let bar_h = "═".repeat(BOX_WIDTH);
+    println!("╔{bar_h}╗");
+    println!("{}", center("Aurora · 2-layer gated SNN · BPE · GPU"));
+    println!("╠{bar_h}╣");
+    println!(
+        "{}",
+        kv("gpu", &format!("{} ({:?})", adapter.name, adapter.backend))
+    );
+    println!(
+        "{}",
+        kv(
+            "corpus",
+            &format!("{} ({corpus_bytes} bytes)", cli.corpus.display())
+        )
+    );
+    println!(
+        "{}",
+        kv(
+            "tokens",
+            &format!(
+                "{n_tokens} (vocab {vocab}, {:.2}× comp, encode {encode_s:.1}s)",
+                (corpus_bytes as f32) / (n_tokens as f32)
+            )
+        )
+    );
+    println!(
+        "{}",
+        kv("split", &format!("{n_train} train / {n_val} val toks"))
+    );
+    let arch = format!(
+        "{vocab} → ({hidden} × {N_LAYERS} layers) → {vocab}",
+        hidden = cli.hidden
+    );
+    println!("{}", kv("architecture", &arch));
+    println!("{}", kv("chunk (BPTT toks)", &format!("{}", cli.chunk)));
+    println!(
+        "{}",
+        kv(
+            "optimizer",
+            &format!("Adam lr={}, grad clip {GRAD_CLIP}, batch {BATCH_SIZE}", cli.lr)
+        )
+    );
+    println!(
+        "{}",
+        kv(
+            "epochs",
+            &format!("{start_epoch} → {} ({})", cli.epochs, if resumed { "resumed" } else { "fresh" })
+        )
+    );
+    println!("{}", kv("checkpoint", &cli.checkpoint.display().to_string()));
+    println!("╚{bar_h}╝");
+}
+
+fn print_footer(best_val: f32, elapsed_s: f64, val_bytes_est: usize) {
+    let bar_h = "═".repeat(BOX_WIDTH);
+    println!("\n╔{bar_h}╗");
+    println!("{}", center("summary"));
+    println!("╠{bar_h}╣");
+    println!("{}", kv("best val bpb", &format!("{best_val:.3}")));
+    println!("{}", kv("val bytes (approx)", &format!("{val_bytes_est}")));
+    println!("{}", kv("uniform baseline", "8.000 bpb (256-class random)"));
+    println!(
+        "{}",
+        kv(
+            "elapsed",
+            &format!("{elapsed_s:.1} s ({:.1} min)", elapsed_s / 60.0)
+        )
+    );
+    println!("╚{bar_h}╝");
+}
+
+fn epoch_open(epoch: u32) {
+    let label = format!(" epoch {epoch} ");
+    let dashes = BOX_WIDTH.saturating_sub(label.chars().count());
+    println!("\n┌{label}{}┐", "─".repeat(dashes));
+}
+fn epoch_close() {
+    println!("└{}┘", "─".repeat(BOX_WIDTH));
+}
+fn epoch_progress(frac: f64, bpb: f32, elapsed: f64) {
+    let bar = render_bar(frac, 16);
+    let body = format!(
+        " {bar} {:>5.1}%  bpb {:>5.3}  ({:>5.1}s)",
+        frac * 100.0,
+        bpb,
+        elapsed
+    );
+    println!("{}", line(&body));
+}
+fn epoch_done(train: f32, val: f32, elapsed: f64) {
+    let body = format!(
+        " epoch done — train bpb {train:>5.3}  val bpb {val:>5.3}  ({elapsed:>5.1}s)"
+    );
+    println!("{}", line(&body));
+}
+fn sample_block(seed: &[u8], generated: &[u8]) {
+    let bar_h = "─".repeat(BOX_WIDTH);
+    println!("┌{bar_h}┐");
+    println!("{}", line(" sample (seed in [], generated continues):"));
+    println!("{}", line(""));
+    let seed_str = String::from_utf8_lossy(seed).replace('\n', "↵");
+    let gen_str = String::from_utf8_lossy(generated).replace('\n', "↵");
+    let combined = format!("[{seed_str}]{gen_str}");
+    for chunk in combined.as_bytes().chunks(BOX_WIDTH - 2) {
+        let s = String::from_utf8_lossy(chunk);
+        println!("{}", line(&format!(" {s}")));
+    }
+    println!("└{bar_h}┘");
+}
+fn line(body: &str) -> String {
+    let pad = BOX_WIDTH.saturating_sub(body.chars().count());
+    format!("│{body}{}│", " ".repeat(pad))
+}
+fn kv(key: &str, value: &str) -> String {
+    let body = format!("  {key:<22} : {value}");
+    let pad = BOX_WIDTH.saturating_sub(body.chars().count());
+    format!("║{body}{}║", " ".repeat(pad))
+}
+fn center(text: &str) -> String {
+    let width = BOX_WIDTH;
+    let len = text.chars().count();
+    let left = width.saturating_sub(len) / 2;
+    let right = width.saturating_sub(len + left);
+    format!("║{}{text}{}║", " ".repeat(left), " ".repeat(right))
+}
+fn render_bar(frac: f64, width: usize) -> String {
+    let filled = ((frac * width as f64).round() as usize).min(width);
+    let mut s = String::with_capacity(width + 2);
+    s.push('[');
+    for i in 0..width {
+        s.push(if i < filled { '█' } else { '·' });
+    }
+    s.push(']');
+    s
+}

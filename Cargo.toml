@@ -41,9 +41,5 @@ harness = false
 required-features = ["gpu"]
 
 [[example]]
-name = "char_lm_gated_gpu"
-required-features = ["gpu"]
-
-[[example]]
-name = "char_lm_gated_multi_gpu"
+name = "aurora_train"
 required-features = ["gpu"]

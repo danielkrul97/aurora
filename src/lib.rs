@@ -5,6 +5,7 @@
 
 pub mod attention;
 pub mod bpe;
+pub mod checkpoint;
 pub mod dendrite;
 pub mod eligibility;
 pub mod encoding;

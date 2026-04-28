@@ -556,22 +556,18 @@ impl MultiLayerGatedSnnGpu {
         net
     }
 
-    fn upload_batch_io(&self, inputs: &[&[u8]], targets: &[&[u8]]) {
+    fn upload_batch_io_tokens(&self, inputs: &[&[u32]], targets: &[&[u32]]) {
         let stride = self.fb.capacity_t;
         let total = self.fb.capacity_b * stride;
         let mut input_buf = vec![0_u32; total];
         let mut target_buf = vec![0_u32; total];
         for (b, ins) in inputs.iter().enumerate() {
             let off = b * stride;
-            for (t, &byte) in ins.iter().enumerate() {
-                input_buf[off + t] = u32::from(byte);
-            }
+            input_buf[off..off + ins.len()].copy_from_slice(ins);
         }
         for (b, ts) in targets.iter().enumerate() {
             let off = b * stride;
-            for (t, &byte) in ts.iter().enumerate() {
-                target_buf[off + t] = u32::from(byte);
-            }
+            target_buf[off..off + ts.len()].copy_from_slice(ts);
         }
         self.ctx.queue.write_buffer(&self.fb.input_bytes_buf.inner, 0, bytemuck::cast_slice(&input_buf));
         self.ctx.queue.write_buffer(&self.fb.target_bytes_buf.inner, 0, bytemuck::cast_slice(&target_buf));
@@ -604,6 +600,28 @@ impl MultiLayerGatedSnnGpu {
         targets: &[&[u8]],
         states: &mut [(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)],
     ) -> f32 {
+        let in_u32: Vec<Vec<u32>> = inputs
+            .iter()
+            .map(|s| s.iter().map(|&b| u32::from(b)).collect())
+            .collect();
+        let tg_u32: Vec<Vec<u32>> = targets
+            .iter()
+            .map(|s| s.iter().map(|&b| u32::from(b)).collect())
+            .collect();
+        let in_refs: Vec<&[u32]> = in_u32.iter().map(Vec::as_slice).collect();
+        let tg_refs: Vec<&[u32]> = tg_u32.iter().map(Vec::as_slice).collect();
+        self.forward_backward_batch_gpu_multi_fused_tokens(&in_refs, &tg_refs, states)
+    }
+
+    /// Sprint 28: token-level variant. Same as the byte version but
+    /// inputs/targets are arbitrary `u32` token IDs (`< n_input`).
+    /// Required for BPE training on the GPU stack.
+    pub fn forward_backward_batch_gpu_multi_fused_tokens(
+        &mut self,
+        inputs: &[&[u32]],
+        targets: &[&[u32]],
+        states: &mut [(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)],
+    ) -> f32 {
         assert_eq!(inputs.len(), targets.len());
         assert_eq!(inputs.len(), states.len());
         let batch_size = inputs.len();
@@ -620,22 +638,17 @@ impl MultiLayerGatedSnnGpu {
         }
         self.ensure_fb_capacity(t_steps, batch_size);
 
-        // States are owned Vec<f32>, clone for upload (small).
         let owned_states: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = states
             .iter()
             .map(|(a, b, c, d)| (a.clone(), b.clone(), c.clone(), d.clone()))
             .collect();
         self.upload_batch_initial_state(&owned_states);
-        self.upload_batch_io(inputs, targets);
+        self.upload_batch_io_tokens(inputs, targets);
 
-        // Forward megakernel.
         self.gpu_forward(t_steps, batch_size);
-        // Softmax + d_logits.
         let total_loss = self.compute_d_logits_gpu(batch_size, t_steps);
-        // Batch-fused backward (per layer per timestep, all B in parallel).
         self.gpu_backward(t_steps, batch_size);
 
-        // Read back final state per layer.
         let n = self.n_hidden as usize;
         let h_v_after_full = self.fb.h_v_after_packed.download(&self.ctx);
         let h_spike_full = self.fb.h_spike_packed.download(&self.ctx);
