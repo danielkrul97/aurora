@@ -27,7 +27,7 @@ const N_HIDDEN: usize = 256;
 const GRAD_CLIP: f32 = 1.0;
 const SAMPLE_LEN: usize = 200;
 const SAMPLE_TEMP: f32 = 0.8;
-const BATCH_SIZE: usize = 4;
+const BATCH_SIZE: usize = 16;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();

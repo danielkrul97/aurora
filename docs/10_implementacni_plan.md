@@ -755,7 +755,268 @@ Sprint 18 zlepšuje per-step CPU dispatch overhead (hidden ≤ 256 wins) ale ob�
 
 ---
 
-## Sprint 20 a dál — možné větve (decision point po 19)
+## Sprint 20 — backward batch fusion
+
+**Cíl:** Sprint 19 batchoval forward + softmax_ce na úrovni workgroups, ale backward se stále spouštěl sekvenčně B× (jeden iterátor přes T per sample). Při větším batch (B=16) to znamená 16× víc dispatchů v backwardu — dispatch overhead exploduje. Sprint 20 batchuje i backward: per timestep jediný dispatch každého kernelu pokrývá všechny B samples paralelně. Per-element kernely (transpose, cell_back) běží 2D `(h_chunks, B)`; akumulátorové kernely (outer, column, vector_add) redukují přes batch dim v každém threadu při zápisu do shared weight grads.
+
+**Princip plánování:**
+- **Per-element kernely**: 2D dispatch `(h_chunks, B, 1)`. Vlákno `(h, b)` čte/píše svou per-sample slice scratch a packed cache bufferů.
+- **Akumulátorové kernely**: per-thread loop přes `b in 0..B`, akumulace do shared weight grad bez atomics (každé vlákno zapisuje do unikátního slotu W[r, c]).
+- **Per-step scratch buffery zvětšené na `[B*N]`** (d_h_v_pre, d_gate_pre, d_h_v_after_carry_a/b, d_h_spike_recurrent, d_h_spike_from_out). `d_cell_packed` je `[3 * B * N]` v slot-major layoutu (`[slot][b][h]`) → 3 single copy_buffer_to_buffer extrahují celý batch per slot.
+- **`gpu_backward_sample` zrušen, `gpu_backward_batched(t_steps, batch_size)` pokrývá single-sample (B=1) i multi-sample (B=4-16) pomocí stejné cesty.
+
+**Deliverables (~600 LOC):**
+- `src/gpu/kernels.rs`:
+  - `dense_matvec_transpose`: + `v_batch_stride`, `out_batch_stride`, `batch_size`. 2D dispatch.
+  - `gated_cell_backward`: + `cache_stride_no_init`, `cache_stride_init`. Slot-major packed_out (slot stride = `B*N` derived from `num_workgroups.y * n_hidden`).
+  - `outer_product_accum`: + `a_batch_stride`, `b_batch_stride`, `batch_size`. Vlákno `(r, c)` redukuje přes batch.
+  - `column_accum`: + `byte_buf` storage binding (4. binding), per-thread loop přes `bi`. Čte byte z `byte_buf[bi * t_capacity + t_idx]`.
+  - `vector_add`: + `d_batch_stride`, `batch_size`. Per-thread reduction přes batch.
+- `src/gpu/snn_gated_gpu.rs`:
+  - `FbScratch`: backward scratch buffery zvětšené na `[B*N]` (d_h_v_pre, d_gate_pre, d_h_v_after_carry_a/b, d_h_spike_recurrent, d_h_spike_from_out, d_cell_packed na `3*B*N`).
+  - `gpu_backward_batched(t_steps, batch_size)` nahrazuje `gpu_backward_sample`. Per timestep dispatchuje každý kernel jednou s batch dim.
+  - `forward_backward_batch_gpu_fused` volá `gpu_backward_batched` jednou (místo `for b in 0..B { gpu_backward_sample(...) }`).
+  - `forward_backward_lm_bytes_gpu` (single-sample) prochází stejnou batched path s `batch_size = 1`.
+- `examples/char_lm_gated_gpu.rs`: `BATCH_SIZE` zvýšen z 4 na 16 (umožněno Sprint 20).
+
+**Exit kritérium:**
+- ✅ Cargo test (gpu feature) — 32/32 prochází (5 GPU + 27 CPU). Clippy clean s i bez gpu feature.
+- ✅ Batch parity test (`batch_fused_matches_sequential_per_sample`) prochází beze změny: `forward_backward_batch_gpu_fused` (B=4, T=12, hidden=32) matchuje 4× single-sample sekvenčně. Max grad diff < 5e-3.
+- ✅ Smoke test: BATCH=4 hidden=256 chunk=32 1ep 5KB:
+  - Pre-Sprint-16: 23.2 s
+  - Sprint 19: 2.0 s
+  - Sprint 20: 2.1 s (batch loop overhead v kernelech offsetuje dispatch redukci při B=4)
+- ✅ **Real win**: BATCH=16 chunk=64 50KB 1ep: **4.4 s** vs BATCH=4 stejný setup: 14.9 s = **3.4× speedup**. Sprint 20 odemyká vyšší batch (Sprint 19 by měl 16× víc backward dispatchů).
+
+**Co Sprint 20 NEŘEŠÍ:**
+- **Single-sample regrese.** Bench (B=1) je o ~30 % pomalejší než Sprint 19 (B=1 path). Důvod: kernely teď mají vždy batch loop (i pro B=1) + push constant struct vyrostl. Pro reálný training s B≥4 je to vedlejší.
+- **Sparse spike GPU path** — pořád dense matvec.
+- **Velké hidden (≥1024)** — workgroup_size(64) stride loop přes velký N je memory-bound.
+
+**Sprint 21+ followups:**
+- **Bench update na batch.** Současný `lm_gpu_speedup` měří B=1 — Sprint 20 win se neukáže. Přidat varianty B=4/16.
+- **Single-sample fast path.** Pokud B=1 je častý use case, zachovat původní non-batched cestu pro B=1 jako optimalizaci (lze detekovat v dispatch_into a vynechat batch loop).
+- **Sparse spike GPU compaction** — eliminace dense matvec při ~5 Hz spike rate.
+- **f16 mixed precision** — další 2× při tensor cores.
+- **Multi-layer gated SNN** — depth scaling (Sprint plan side branch).
+
+---
+
+## Sprint 21 — sparse spike compaction ve forward megakernelu
+
+**Cíl:** Replikovat CPU `active_indices` trick v GPU forward megakernelu. Místo dense matvec `out[h] = sum_c W[h,c] * spike[c]` (čte všechny W[h,c] i když spike=0) se postaví workgroup-shared seznam aktivních neuronů a inner loop iteruje jen přes ně. Při ~5 % firing rate to znamená 20× méně memory čtení pro W_rec, W_gate_rec, W_out matvecs uvnitř megakernelu.
+
+**Princip plánování:**
+- **Workgroup-shared compaction.** Atomic counter `sh_n_active: atomic<u32>` + array `sh_active_indices: array<u32, MAX_HIDDEN>` (4 KB při MAX_HIDDEN=1024). Helper `build_active_indices(tid, n)` resetuje counter, pak per-thread stride loop přes `sh_h_spike` — neaktivní indexy ignoruje, aktivní zapíše atomic-add'em a `sh_active_indices[idx] = c`.
+- **Frekvence kompakce: 1× per timestep.** Po Phase 2 (která načte čerstvý h_spike[t] do sh_h_spike), kompakce platí pro Phase 3 (W_out matvec) i pro Phase 1 příští iterace (W_rec, W_gate_rec). Plus jedna inicial kompakce pro t=0's Phase 1 (z initial_h_spike).
+- **Spike-as-1.0 simplifikace.** Spike je binární `select(0, 1, ...)` — když je v `active_indices`, jeho hodnota je 1. Inner matvec tedy nemusí číst `sh_h_spike[c]` ani násobit, jen sečte `W[h, c]` přímo.
+- **Backward sparse je Sprint 22+.** Sprint 21 řeší jen forward. Backward kernely zůstávají dense (čtou všechna `c`).
+
+**Deliverables (~80 LOC WGSL změn):**
+- `src/gpu/forward_mega.rs`:
+  - + `var<workgroup> sh_active_indices: array<u32, MAX_HIDDEN>;`
+  - + `var<workgroup> sh_n_active: atomic<u32>;`
+  - + `fn build_active_indices(tid: u32, n: u32)` — atomic-counter compaction
+  - W_rec / W_gate_rec inner loop: `for k in 0..n_active { let c = sh_active_indices[k]; h_rec += w_rec[h2*n+c]; gate_rec += w_gate_rec[h2*n+c]; }` (vypadl `* s_prev` protože spike == 1)
+  - W_out inner loop: stejná substituce
+  - Initial compaction po loadu initial state, in-loop compaction po Phase 2
+
+**Exit kritérium:**
+- ✅ Cargo test (gpu feature) — 32/32 prochází BEZ úpravy parity tolerancí (forward 1e-3, backward 5e-3). Atomic-add ordering nezpůsobil viditelnou FP-order divergenci, protože spike values jsou všechny 1.0 (sčítací sum je deterministický bez ohledu na pořadí).
+- ✅ Clippy clean s i bez gpu feature.
+- ✅ Smoke test (50KB tiny-shakespeare, hidden=256, chunk=64, batch=16, 1 epoch):
+  - Sprint 20: 4.4 s
+  - Sprint 21: **3.9 s** (1.13× nad Sprint 20)
+- 🟡 Bench (B=1, single sample):
+  - hidden=512: 8.0 → 9.8 chunks/s (+22 %, sparse pomáhá s rostoucím N).
+  - hidden≤256: dispatch overhead dominuje, marginal gain.
+
+**Co Sprint 21 NEŘEŠÍ:**
+- **Backward sparse.** Sprint 22+ téma. Backward outer products čtou h_spike (sparse), takže analogická substituce by pomohla.
+- **Realistický spike rate.** Bench používá random init kde firing rate ≠ 5 %. Reálný trénink (low spike rate) by měl ukázat vyšší speedup.
+- **f16 mixed precision** — další 2× při tensor cores (na GTX 1650 nepodporováno).
+
+**Sprint 22+ followups:**
+- **Backward sparse.** Pre-buildnout `active_indices_packed[(t+1) * MAX_HIDDEN]` v megakernelu (zápis do globální paměti), backward kernely (`outer_product_accum`) je čtou. Bind groups potřebují další buffer.
+- **Bench update**: měřit sparse vs dense při různých firing rates a hidden sizes.
+- **Multi-layer gated SNN** — depth scaling (vertical sprint).
+- **Real corpus trénink + měření.** Dosud jsme měřili jen smoke. Pustit Czech corpus B=16 chunk=64 hidden=256 a změřit BPB konvergenci proti CPU.
+
+---
+
+## Sprint 22 — sparse skip v `outer_product_accum`
+
+**Cíl:** Sprint 21 portoval sparse spike do forward megakernelu. Sprint 22 dělá analogickou (jednodušší) sparsity v backwardu: všechny tři `outer_product_accum` invokace v `gpu_backward_batched` mají na pravé straně `h_spike` nebo `h_spike_prev` — binární 0/1 pole s ~5 % aktivních. Inner loop kernelu přečte `b[bi, c]`, a když je 0, přeskočí jak load `a[bi, r]`, tak FMA. Univerzálně užitečné: sparse vstup → memory bandwidth saved; dense vstup → check je v podstatě zdarma.
+
+**Princip plánování:**
+- **Tří-řádková změna ve WGSL.** Před akumulací: `let bv = b[...]; if (bv != 0.0) { acc += a[...] * bv; }`. Žádné nové bindings, žádné nové push constants, žádný nový kernel.
+- **Žádná globální `active_indices` v backwardu.** Sprint 21 staví compaction v workgroup-shared memory uvnitř megakernelu — ale ta žije jen po dobu kernelu. Pro backward by to vyžadovalo zapsat do globální paměti (nový bind, větší FbScratch). Branchy skip je jednodušší a v praxi téměř stejně efektivní.
+- **GPU warp divergence overhead je marginal.** I když se warp musí provést predikovaně oba kódy, load `a[...]` je předikovaně zruší, takže paměťový bandwidth je ušetřen per-thread.
+
+**Deliverables (~5 LOC WGSL změn):**
+- `src/gpu/kernels.rs` `OUTER_PRODUCT_ACCUM_WGSL`:
+  - Inner batch loop:
+    ```wgsl
+    let bv = b[bi * p.b_batch_stride + p.b_offset + c];
+    if (bv != 0.0) {
+        acc = acc + a[bi * p.a_batch_stride + p.a_offset + r] * bv;
+    }
+    ```
+  - Předtím: `acc = acc + a[...] * b[...]` (vždycky).
+
+**Exit kritérium:**
+- ✅ Cargo test (gpu feature) — 32/32 prochází BEZ úpravy parity tolerancí. Skip přes `bv == 0.0` produkuje totožný výsledek jako dense (násobení 0 = 0, sčítání 0 = noop).
+- ✅ Clippy clean.
+- ✅ **Smoke test** (50KB tiny-shakespeare, hidden=256, chunk=64, batch=16, 1 epoch):
+  - Sprint 21: 3.9 s
+  - Sprint 22: **3.3 s** (1.18× nad Sprint 21)
+- ✅ **Bench (B=1) napříč hidden sizes:**
+  - hidden=128: 13.7 → **16.7** chunks/s (+22 %)
+  - hidden=256: 12.6 → **15.3** (+21 %)
+  - hidden=512: 9.8 → **12.3** (+26 %)
+  - **Univerzální ~22 % gain** — sparse skip pomáhá každému rozměru protože `h_spike` je vždy ~5 % nonzero.
+
+**Co Sprint 22 NEŘEŠÍ:**
+- **Forward W_in / W_gate_in column_accum.** Vstup `d_h_v_pre` / `d_gate_pre` jsou dense gradienty (po surrogate gradient mostly nonzero ~10-30 %), takže analogický skip by pomohl jen marginálně.
+- **Persistentní global `active_indices`.** Pro budoucí forward+backward kombinaci by se vyplatilo, ale Sprint 22 to nepotřebuje.
+- **Skip v dense_matvec_transpose.** Vstupy (d_logits, scratch) jsou dense.
+
+**Cumulative GPU vs CPU progression (B=1, hidden=512):**
+- Sprint 18 megakernel: 11.0 chunks/s
+- Sprint 19 forward batch fusion (B=1 path): 11.0
+- Sprint 20 backward batch fusion (B=1 regrese): 8.0
+- Sprint 21 forward sparse: 9.8
+- **Sprint 22 backward outer sparse: 12.3 chunks/s** (poprvé nad Sprint 18 baseline)
+
+CPU referenční hodnota: 117 chunks/s. GPU stále **9.5× pomalejší** při B=1 hidden=512 — dispatch overhead a SIMD-friendly CPU cesta jsou tvrdé. Real win při batch ≥ 4 (Sprint 19/20 paralelizace).
+
+**Sprint 23+ followups:**
+- **Multi-layer gated SNN** — depth scaling (přidat `n_layers`, retězit forward/backward).
+- **Real corpus benchmark** — pustit `cargo run --release --features gpu --example char_lm_gated_gpu -- data/tiny.txt` a srovnat wall-clock + BPB s CPU verzí.
+- **f16 mixed precision** — 2× memory bandwidth (limited by absence of tensor cores na GTX 1650).
+- **Dynamic batch fast path** — single-sample bench je ~30 % pomalejší než pre-Sprint-20 zase kvůli batch loopu v kernelech. Volitelná specialized B=1 path.
+
+---
+
+## Sprint 23 — multi-layer gated SNN (CPU)
+
+**Cíl:** Aurora dosud měla jen 1 hidden vrstvu (`GatedRecurrentSnn`). Reálná LLM kapacita vyžaduje hloubku. Sprint 23 přidává `MultiLayerGatedSnn` s konfigurovatelným počtem vrstev (`Vec<GatedLayer>`). Layer 0 čte byte input (sparse one-hot column read), layer L>0 čte spike output of layer L-1 (multi-hot, sparse přes aktivních ~5 % neuronů). Jediný `W_out` na vrcholu mapuje top-layer spike output na logits. CPU only — GPU stays single-layer (Sprint 24+ work).
+
+**Princip plánování:**
+- **Co-existence s `GatedRecurrentSnn`.** Nový typ `MultiLayerGatedSnn` v separátním modulu, single-layer struct beze změn → GPU fušuje s ním stále kompatibilně.
+- **`GatedLayer` bez output projection.** Každá vrstva má jen recurrence + gate (w_in, w_rec, w_gate_in, w_gate_rec, b_h, b_gate). Output projection pouze na vrcholu.
+- **Sparse cesta unifikovaně.** Forward i backward používají active_indices přes všechny vrstvy: layer 0 input je `[byte]` (1 element), layer L>0 input je `active_indices_of_h_{L-1}_spike`. Stejný kód path.
+- **BPTT cross-layer.** Backward při step t prochází vrstvy odshora dolů: top layer dostane gradient z output (W_out.T @ d_logits), každá vrstva prochází gradient skrz svůj input do předchozí vrstvy přes W_in.T + W_gate_in.T.
+
+**Deliverables (~750 LOC):**
+- `src/snn_gated_multi.rs`:
+  - `GatedLayer` — single layer's weights bez W_out
+  - `LayerGrads`, `MultiLayerGatedGrads` — per-layer + top-level
+  - `LayerCache`, `MultiLayerCache` — per-timestep state per layer
+  - `MultiLayerGatedSnn::new(n_input, hidden_dims, n_output, ...)` — `hidden_dims: &[usize]` jeden per layer
+  - `forward_lm_bytes_stateful` — chains layers per timestep
+  - `backward_lm_bytes_into` — top-down BPTT s cross-layer credit assignment
+  - `step_adam`, `clip_grads`, `zero_grad`, `fresh_states`
+- `src/lib.rs`: `pub mod snn_gated_multi;`
+- `tests/multi_layer_gated_smoke.rs`:
+  - `multi_layer_n1_compresses_repeating_corpus` — 1-layer must compress 8-byte cycle below 4.0 BPB
+  - `multi_layer_n2_compresses_repeating_corpus` — 2-layer must reduce loss ≥ 15 % over 6 epochs
+
+**Exit kritérium:**
+- ✅ Cargo test (CPU only) — 29/29 prochází (27 pre-existing + 2 nové).
+- ✅ Cargo test (gpu feature) — 34/34 prochází.
+- ✅ Clippy clean s i bez gpu feature.
+- ✅ Multi-layer smoke (n=1 i n=2) konverguje na 8-byte cycle pod uniform baseline.
+
+**Co Sprint 23 NEŘEŠÍ:**
+- **GPU multi-layer.** `GatedRecurrentSnnGpu` zůstává single-layer. Pro multi-layer GPU port (Sprint 24+) by se forward megakernel + backward kernely musely přepsat na variabilní `n_layers` smyčku.
+- **Multi-layer example pro reálný corpus.** `examples/char_lm_gated_multi.rs` není dodán (volitelná Sprint 24 práce).
+- **Per-layer hidden dims optimalizace.** Sprint 23 podporuje různé hidden per layer (`hidden_dims: &[usize]`) ale nejsou benchmark studie co je ideální.
+
+**Sprint 24+ followups:**
+- **GPU multi-layer port.** Forward megakernel rozšířit o outer layer loop. Backward kernely volat n_layers× per timestep (bez zásadní WGSL změny pokud se per-layer cache buffery rozšíří o `layer_idx` dim).
+- **CPU example `char_lm_gated_multi.rs`** — `--n-layers` flag pro reálný corpus trénink.
+- **Real corpus benchmark** — multi-layer vs single-layer BPB konvergence na tiny-shakespeare / cesky.txt.
+- **Hybrid SNN+attention** — dále k LLM (long-range dependencies).
+
+---
+
+## Sprint 24 — multi-layer streaming inference + paralelní trainer + example
+
+**Cíl:** Sprint 23 dodal architekturu `MultiLayerGatedSnn` (forward + backward + Adam), ale chyběly použitelné API pro reálný trénink. Sprint 24 doplňuje `step_lm_byte` (autoregressive single-byte sampling), `forward_backward_batch_stateful` (rayon-paralelní batch trénink přes per-batch-slot per-layer states) a nový `examples/char_lm_gated_multi.rs` s konfigurovatelnými `--n-layers` a `--hidden-per-layer` argumenty.
+
+**Princip plánování:**
+- **Streaming inference symetricky se single-layer.** `step_lm_byte(byte, &mut [GatedState])` dělá totéž co single-layer `GatedRecurrentSnn::step_lm_byte` ale s polem stavů (jeden per layer); aktivně zachová sparsity (`active_indices` přes layer 0 byte i layer L>0 spike output).
+- **Rayon paralelizace přes batch dim.** Mirror single-layer `forward_backward_batch_stateful` — každý worker má vlastní `MultiLayerGatedGrads` accumulator, deterministický sum do `self.grads` po dokončení.
+- **Example mirror char_lm_gated.** Stejné CLI argumenty + 2 navíc (`n_layers`, `hidden_per_layer`). Pretty box output zůstává.
+
+**Deliverables (~450 LOC):**
+- `src/snn_gated_multi.rs`:
+  - `pub fn step_lm_byte(&self, byte: u8, &mut [GatedState]) -> Vec<f32>` — chains layers per step, sparse-byte and sparse-spike paths
+  - `pub fn forward_backward_batch_stateful(&mut self, &[&[u8]], &[&[u8]], &mut [Vec<GatedState>]) -> f32` — rayon-paralelní training, sum-into-self.grads
+  - `pub fn forward_backward_batch(&mut self, ...)` — stateless wrapper (zero state)
+- `examples/char_lm_gated_multi.rs` — CLI + box output + sample generation, hidden_per_layer constant per vrstva (uniformní hloubka)
+
+**Exit kritérium:**
+- ✅ Cargo test (CPU only) — 29/29 prochází.
+- ✅ Cargo test (gpu feature) — 34/34 prochází.
+- ✅ Clippy clean s i bez gpu feature.
+- ✅ Smoke test (5KB tiny-shakespeare, 2-layer hidden=64, chunk=32, batch=16, 5 epochs):
+  - train BPB 7.96 → **5.04** (uniform 8.0)
+  - val BPB 5.09
+  - elapsed 0.2 s
+  - Generation produkuje space-like fragmenty po 5 epochách
+
+**Co Sprint 24 NEŘEŠÍ:**
+- **GPU multi-layer port.** GatedRecurrentSnnGpu zůstává single-layer.
+- **Heterogenní hidden_dims.** Example používá uniform layers; lib API podporuje `&[usize]` per vrstva, ale CLI to neodhaluje.
+- **Multi-layer parity test vs reference implementation.** Sprint 23 testy ověřují konvergenci, ne přesnou matematiku per kernel.
+
+**Sprint 25+ followups:**
+- **GPU multi-layer port** (forward megakernel outer layer loop, backward iterate per-layer kernely).
+- **Multi-layer benchmark** na full tiny-shakespeare/cesky.txt — porovnat 1-layer vs 2-layer vs 4-layer BPB konvergenci.
+- **Hidden_dims pyramid** — hluboká struktura jako [256, 128, 64] pro LM hierarchii.
+- **f16 mixed precision GPU** — limited bez tensor cores ale 2× memory bandwidth save.
+- **Hybrid architecture** — SNN + transformer attention?
+
+---
+
+## Sprint 25 — GPU multi-layer port (2-layer, uniform hidden)
+
+**Cíl:** Sprint 23-24 dodal CPU multi-layer SNN, ale GPU stack zůstával single-layer. Sprint 25 portuje 2-layer multi-layer cestu na GPU. Forward megakernel chains 2 gated cells in-shader (1 dispatch per chunk); backward dispatchuje existující single-layer kernely (transpose, cell_back, outer, column, vector_add) per-layer per-timestep s correct offsets do packed cache. Cross-layer credit (gradient z layer 1 do layer 0) se počítá přes `W_in_1.T @ d_h_v_pre_l1 + W_gate_in_1.T @ d_gate_pre_l1`. Podporuje pouze 2 vrstvy a uniform `n_hidden` ≤ 512 — generic n_layers a heterogeneous hidden_dims jsou Sprint 26+ scope.
+
+**Princip plánování:**
+- **Single-megakernel approach.** Místo dvou separátních forward kernelů (`forward_mega_layer0` + `forward_mega_h2h`) je jediný `forward_mega_2layer` který chains obě vrstvy uvnitř shader loop. Workgroup-shared memory drží per-layer h_spike/h_v_after a active_indices. Memory budget: `4 × 512 × 4 = 8 KB` (state) + `2 × 512 × 4 = 4 KB` (active_indices) = 12 KB, pod 16 KB limit.
+- **Co-existence s single-layer GPU stack.** `MultiLayerGatedSnnGpu` je samostatný typ vedle `GatedRecurrentSnnGpu` — žádný breaking change pro existující kód.
+- **Backward sequenčně per-layer per-timestep.** Top-down (layer 1 first, pak 0) protože gradient z output layer-1 produkuje d_h_spike_below = input layer-0's d_h_spike_from_above. Existující batch-fused single-layer kernely (Sprint 20) se reuse beze změny.
+
+**Deliverables (~1100 LOC):**
+- `src/gpu/forward_mega_2layer.rs` — WGSL kernel + dispatcher (~280 LOC). 3 bind groups (l0 weights, l1 weights + top, i/o). Workgroup-shared compaction per-layer.
+- `src/gpu/snn_gated_gpu_multi.rs` — `MultiLayerGatedSnnGpu` mirror struct (~840 LOC). FbScratch s [B × L × T × N] layout pro packed cache. Per-layer scratch (d_h_spike_from_above, d_h_v_after_carry_a/b, d_h_spike_recurrent, d_cell_packed, d_h_v_pre, d_gate_pre — všechno `[2]` arrays per layer).
+- `src/gpu/mod.rs`: `pub mod forward_mega_2layer; pub mod snn_gated_gpu_multi;`.
+- `tests/gpu_parity.rs`: + `multi_layer_gpu_matches_cpu_within_tolerance` — B=2, T=8, hidden=32, full forward+backward parity (max grad diff < 5e-2 napříč 14 parameter groups).
+
+**Exit kritérium:**
+- ✅ Cargo test (gpu feature) — 35/35 prochází (5 single-layer GPU + 2 multi-layer CPU + 27 CPU + 1 nové).
+- ✅ Cargo test (CPU only) — 29/29 prochází.
+- ✅ Clippy clean s i bez gpu feature.
+- ✅ Multi-layer parity test: GPU forward+backward (B=2 T=8 n_hidden=32 n_layers=2) matchuje CPU `MultiLayerGatedSnn` na všech 14 grad bufferech (per-layer 6 + top 2). Loss diff < 5e-2.
+
+**Co Sprint 25 NEŘEŠÍ:**
+- **Generic `n_layers`.** Pouze 2 vrstvy hardcoded. Sprint 26+ refactor by přidal outer layer loop ve WGSL + backward s layer_idx push constant.
+- **Heterogeneous `hidden_dims`.** Všechny vrstvy musí mít stejný `n_hidden`. Umožnilo by to packed weight buffery.
+- **Velký `n_hidden`.** WGSL workgroup-shared array je `MAX_HIDDEN=512`. Pro hidden=1024 by se nevešlo do 16 KB workgroup memory; bylo by potřeba global memory backing.
+- **CPU example pro 2-layer GPU.** Vytvoření nového `examples/char_lm_gated_multi_gpu.rs` je Sprint 26 add-on.
+
+**Sprint 26+ followups:**
+- **Generic `n_layers` GPU support.** Forward megakernel přepsat s outer layer loop driven by `n_layers` push constant. Workgroup memory managed dynamicky (max-layer-size compile-time const). Backward kernely s `layer_idx`.
+- **CPU example `char_lm_gated_multi_gpu.rs`** — `--n-layers` flag, paralelní GPU trénink hlubokého modelu na real corpus.
+- **Heterogeneous hidden_dims** (pyramid architecture).
+- **Real corpus benchmark** — multi-layer GPU vs CPU vs single-layer GPU porovnání BPB + wall-clock na tiny-shakespeare a cesky.txt.
+
+---
+
+## Sprint 26 a dál — možné větve (decision point po 25)
 
 **Vstupy do rozhodnutí:**
 - Sprint 13 GPU speedup

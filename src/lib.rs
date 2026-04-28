@@ -21,6 +21,7 @@ pub mod readout;
 pub mod scheduler;
 pub mod snn_dense;
 pub mod snn_gated;
+pub mod snn_gated_multi;
 pub mod snn_loss;
 pub mod snn_recurrent;
 pub mod stdp;

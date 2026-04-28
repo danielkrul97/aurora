@@ -43,3 +43,7 @@ required-features = ["gpu"]
 [[example]]
 name = "char_lm_gated_gpu"
 required-features = ["gpu"]
+
+[[example]]
+name = "char_lm_gated_multi_gpu"
+required-features = ["gpu"]

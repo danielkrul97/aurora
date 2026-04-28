@@ -495,12 +495,21 @@ impl GatedCellStepKernel {
 // Sprint 15: backward + Adam kernels.
 // =====================================================================
 
+// Sprint 20: 2D dispatch `(cols/64, B, 1)`. Each thread `(c, b)`
+// computes `out[b * out_batch_stride + c] = sum_r W[r,c]
+//   * v[b * v_batch_stride + v_offset + r]`. `accumulate` lets
+// successive calls add to the same `out` slot (used for the
+// `W_rec.T @ d_h_v_pre + W_gate_rec.T @ d_gate_pre` fan-in).
 const DENSE_MATVEC_TRANSPOSE_WGSL: &str = "
 struct DMT {
     rows: u32,
     cols: u32,
     accumulate: u32,
     v_offset: u32,
+    v_batch_stride: u32,
+    out_batch_stride: u32,
+    batch_size: u32,
+    _pad: u32,
 };
 
 @group(0) @binding(0) var<storage, read>       w: array<f32>;
@@ -509,19 +518,21 @@ struct DMT {
 var<push_constant>             p: DMT;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_id) wgid: vec3<u32>) {
     let c = gid.x;
-    if (c >= p.cols) {
+    let b = wgid.y;
+    if (c >= p.cols || b >= p.batch_size) {
         return;
     }
     var acc: f32 = 0.0;
     for (var r: u32 = 0u; r < p.rows; r = r + 1u) {
-        acc = acc + w[r * p.cols + c] * v[p.v_offset + r];
+        acc = acc + w[r * p.cols + c] * v[b * p.v_batch_stride + p.v_offset + r];
     }
+    let out_idx = b * p.out_batch_stride + c;
     if (p.accumulate == 1u) {
-        out[c] = out[c] + acc;
+        out[out_idx] = out[out_idx] + acc;
     } else {
-        out[c] = acc;
+        out[out_idx] = acc;
     }
 }
 ";
@@ -533,6 +544,10 @@ struct DenseMatvecTransposeParams {
     cols: u32,
     accumulate: u32,
     v_offset: u32,
+    v_batch_stride: u32,
+    out_batch_stride: u32,
+    batch_size: u32,
+    _pad: u32,
 }
 
 pub struct DenseMatvecTransposeKernel {
@@ -582,9 +597,10 @@ impl DenseMatvecTransposeKernel {
         }
     }
 
-    /// `out[c] = (acc ? out[c] : 0) + sum_r w[r,c] * v[v_offset + r]`.
-    /// `w` shape `[rows, cols]`, `v` is at least `v_offset+rows` long
-    /// (Sprint 18: lets v point into a packed `[T*rows]` buffer).
+    /// Sprint 20 batch-fused `out = W^T @ v` where each sample's
+    /// `out[b, c] = sum_r W[r, c] * v[b * v_batch_stride + v_offset
+    ///                                  + r]`. Dispatched as
+    /// `(cols/64, batch_size, 1)` workgroups.
     pub fn dispatch_into(
         &self,
         ctx: &GpuContext,
@@ -596,16 +612,24 @@ impl DenseMatvecTransposeKernel {
         cols: u32,
         accumulate: bool,
         v_offset: u32,
+        v_batch_stride: u32,
+        out_batch_stride: u32,
+        batch_size: u32,
     ) {
         debug_assert_eq!(w.len, (rows * cols) as usize);
-        debug_assert!(v.len >= (v_offset + rows) as usize);
-        debug_assert_eq!(out.len, cols as usize);
+        let max_b = batch_size.saturating_sub(1);
+        debug_assert!(v.len >= (max_b * v_batch_stride + v_offset + rows) as usize);
+        debug_assert!(out.len >= (max_b * out_batch_stride + cols) as usize);
 
         let p = DenseMatvecTransposeParams {
             rows,
             cols,
             accumulate: u32::from(accumulate),
             v_offset,
+            v_batch_stride,
+            out_batch_stride,
+            batch_size,
+            _pad: 0,
         };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora dense_matvec_transpose bind"),
@@ -633,12 +657,21 @@ impl DenseMatvecTransposeKernel {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind, &[]);
             pass.set_push_constants(0, bytemuck::bytes_of(&p));
-            let workgroups = cols.div_ceil(64);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            let workgroups_x = cols.div_ceil(64);
+            pass.dispatch_workgroups(workgroups_x, batch_size.max(1), 1);
         }
     }
 }
 
+// Sprint 20 batched: 2D dispatch `(h_chunks, B, 1)`. Each thread
+// `(h, b)` reads its sample's slice of the packed forward cache and
+// scratch buffers, writes to `packed_out` at `[slot][b][h]` layout
+// where slot_stride = B * N (caller passes `slot_stride`).
+//
+// Strides: `cache_stride_no_init = T*N` (h_v_pre, gate),
+// `cache_stride_init = (T+1)*N` (h_v_after_prev). Per-sample base for
+// scratch buffers (d_h_spike_out, d_h_spike_rec, d_h_v_after_carry,
+// d_h_v_after_prev/pre/gate) is `b * N`.
 const GATED_CELL_BACKWARD_WGSL: &str = "
 struct GCB {
     n_hidden: u32,
@@ -647,8 +680,8 @@ struct GCB {
     h_v_pre_offset: u32,
     h_v_after_prev_offset: u32,
     gate_offset: u32,
-    _pad0: u32,
-    _pad1: u32,
+    cache_stride_no_init: u32,
+    cache_stride_init: u32,
 };
 
 @group(0) @binding(0) var<storage, read>       d_h_spike_out: array<f32>;
@@ -666,20 +699,31 @@ fn surrogate(v_minus_theta: f32, alpha: f32) -> f32 {
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
     let h = gid.x;
+    let b = wgid.y;
     if (h >= p.n_hidden) { return; }
     let n = p.n_hidden;
-    let d_spike = d_h_spike_out[h] + d_h_spike_rec[h];
-    let s_grad = surrogate(h_v_pre[p.h_v_pre_offset + h] - p.threshold, p.alpha);
-    let d_v_pre = d_spike * s_grad + d_h_v_after_carry_in[h];
-    let g = gate[p.gate_offset + h];
-    let d_gate_h = d_v_pre * h_v_after_prev[p.h_v_after_prev_offset + h];
+    let scratch_base = b * n;
+    let slot_stride = nwg.y * n;  // = batch_size * n
+    let h_v_pre_idx = b * p.cache_stride_no_init + p.h_v_pre_offset + h;
+    let h_v_after_prev_idx = b * p.cache_stride_init + p.h_v_after_prev_offset + h;
+    let gate_idx = b * p.cache_stride_no_init + p.gate_offset + h;
+
+    let d_spike = d_h_spike_out[scratch_base + h] + d_h_spike_rec[scratch_base + h];
+    let s_grad = surrogate(h_v_pre[h_v_pre_idx] - p.threshold, p.alpha);
+    let d_v_pre = d_spike * s_grad + d_h_v_after_carry_in[scratch_base + h];
+    let g = gate[gate_idx];
+    let d_gate_h = d_v_pre * h_v_after_prev[h_v_after_prev_idx];
     let d_gate_pre = d_gate_h * g * (1.0 - g);
     let d_v_after_out = d_v_pre * g;
-    packed_out[h]         = d_v_pre;
-    packed_out[n + h]     = d_gate_pre;
-    packed_out[2u*n + h]  = d_v_after_out;
+    packed_out[0u * slot_stride + scratch_base + h] = d_v_pre;
+    packed_out[1u * slot_stride + scratch_base + h] = d_gate_pre;
+    packed_out[2u * slot_stride + scratch_base + h] = d_v_after_out;
 }
 ";
 
@@ -692,8 +736,8 @@ struct GatedCellBackwardParams {
     h_v_pre_offset: u32,
     h_v_after_prev_offset: u32,
     gate_offset: u32,
-    _pad0: u32,
-    _pad1: u32,
+    cache_stride_no_init: u32,
+    cache_stride_init: u32,
 }
 
 pub struct GatedCellBackwardKernel {
@@ -747,8 +791,15 @@ impl GatedCellBackwardKernel {
         }
     }
 
-    /// `packed_out` is `3 * n_hidden` floats:
-    /// `[d_h_v_pre, d_gate_pre, d_h_v_after_carry_out]`.
+    /// Sprint 20 batch-fused fused per-element backward. Dispatched
+    /// `(h_chunks, batch_size, 1)`. `packed_out` is sized `[3 * B *
+    /// n_hidden]` in slot-major layout: slot 0 = d_h_v_pre, slot 1 =
+    /// d_gate_pre, slot 2 = d_h_v_after_carry_out, each containing
+    /// per-sample blocks of size `n_hidden`.
+    ///
+    /// `cache_stride_no_init` is per-sample stride into `h_v_pre` /
+    /// `gate` (= `T * N`), `cache_stride_init` is per-sample stride
+    /// into `h_v_after_prev` (= `(T+1) * N`).
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_into(
         &self,
@@ -767,6 +818,9 @@ impl GatedCellBackwardKernel {
         h_v_pre_offset: u32,
         h_v_after_prev_offset: u32,
         gate_offset: u32,
+        cache_stride_no_init: u32,
+        cache_stride_init: u32,
+        batch_size: u32,
     ) {
         let p = GatedCellBackwardParams {
             n_hidden,
@@ -775,8 +829,8 @@ impl GatedCellBackwardKernel {
             h_v_pre_offset,
             h_v_after_prev_offset,
             gate_offset,
-            _pad0: 0,
-            _pad1: 0,
+            cache_stride_no_init,
+            cache_stride_init,
         };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora gated_cell_backward bind"),
@@ -820,18 +874,32 @@ impl GatedCellBackwardKernel {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind, &[]);
             pass.set_push_constants(0, bytemuck::bytes_of(&p));
-            let workgroups = n_hidden.div_ceil(64);
-            pass.dispatch_workgroups(workgroups, 1, 1);
+            let workgroups_x = n_hidden.div_ceil(64);
+            pass.dispatch_workgroups(workgroups_x, batch_size.max(1), 1);
         }
     }
 }
 
+// Sprint 20: each thread `(r, c)` reduces over batch dim in-thread.
+// `M[r, c] += sum_bi a[bi * a_batch_stride + a_offset + r]
+//                  * b[bi * b_batch_stride + p.b_offset + c]`.
+//
+// Sprint 22: skip the inner add when `b[bi, c] == 0`. The right
+// operand in all three backward outer-product calls is h_spike or
+// h_spike_prev (binary 0/1, ~5% nonzero in steady-state SNNs), so
+// the check saves both a load of `a` and the FMA most of the time.
+// The check is universally beneficial in our backward usage; for
+// cases where `b` is dense the check is essentially free.
 const OUTER_PRODUCT_ACCUM_WGSL: &str = "
 struct OPA {
     rows: u32,
     cols: u32,
     a_offset: u32,
     b_offset: u32,
+    a_batch_stride: u32,
+    b_batch_stride: u32,
+    batch_size: u32,
+    _pad: u32,
 };
 
 @group(0) @binding(0) var<storage, read>       a: array<f32>;
@@ -845,7 +913,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.y;
     if (r >= p.rows || c >= p.cols) { return; }
     let idx = r * p.cols + c;
-    m[idx] = m[idx] + a[p.a_offset + r] * b[p.b_offset + c];
+    var acc: f32 = 0.0;
+    for (var bi: u32 = 0u; bi < p.batch_size; bi = bi + 1u) {
+        let bv = b[bi * p.b_batch_stride + p.b_offset + c];
+        if (bv != 0.0) {
+            acc = acc + a[bi * p.a_batch_stride + p.a_offset + r] * bv;
+        }
+    }
+    m[idx] = m[idx] + acc;
 }
 ";
 
@@ -856,6 +931,10 @@ struct OuterProductAccumParams {
     cols: u32,
     a_offset: u32,
     b_offset: u32,
+    a_batch_stride: u32,
+    b_batch_stride: u32,
+    batch_size: u32,
+    _pad: u32,
 }
 
 pub struct OuterProductAccumKernel {
@@ -905,9 +984,11 @@ impl OuterProductAccumKernel {
         }
     }
 
-    /// `m[r,c] += a[a_offset + r] * b[b_offset + c]`. `m` shape
-    /// `[rows, cols]`. Offsets allow `a` and `b` to point into
-    /// packed `[T*rows]` / `[T*cols]` buffers (Sprint 18).
+    /// Sprint 20 batch-fused outer-product accumulation:
+    /// `m[r, c] += sum_bi a[bi * a_batch_stride + a_offset + r]
+    ///                  * b[bi * b_batch_stride + b_offset + c]`.
+    /// Each thread reduces over the batch dim (no atomics needed).
+    /// For single-sample callers, pass `(batch_size=1, *_batch_stride=0)`.
     pub fn dispatch_into(
         &self,
         ctx: &GpuContext,
@@ -919,9 +1000,13 @@ impl OuterProductAccumKernel {
         cols: u32,
         a_offset: u32,
         b_offset: u32,
+        a_batch_stride: u32,
+        b_batch_stride: u32,
+        batch_size: u32,
     ) {
-        debug_assert!(a.len >= (a_offset + rows) as usize);
-        debug_assert!(b.len >= (b_offset + cols) as usize);
+        let max_bi = batch_size.saturating_sub(1);
+        debug_assert!(a.len >= (max_bi * a_batch_stride + a_offset + rows) as usize);
+        debug_assert!(b.len >= (max_bi * b_batch_stride + b_offset + cols) as usize);
         debug_assert_eq!(m.len, (rows * cols) as usize);
 
         let p = OuterProductAccumParams {
@@ -929,6 +1014,10 @@ impl OuterProductAccumKernel {
             cols,
             a_offset,
             b_offset,
+            a_batch_stride,
+            b_batch_stride,
+            batch_size,
+            _pad: 0,
         };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora outer_product_accum bind"),
@@ -963,24 +1052,38 @@ impl OuterProductAccumKernel {
     }
 }
 
+// Sprint 20: each thread `r` loops over the batch dim. For each
+// sample `bi`, the byte at this timestep is read from `byte_buf` at
+// `bi * t_capacity + t_idx`; weight column at that byte gets
+// `d[bi * d_batch_stride + r]` added. Different `r` threads write to
+// different addresses; within a thread, the loop is sequential so
+// duplicate bytes accumulate correctly.
 const COLUMN_ACCUM_WGSL: &str = "
 struct CA {
     rows: u32,
     n_input: u32,
-    byte_idx: u32,
-    _pad: u32,
+    t_capacity: u32,
+    t_idx: u32,
+    d_batch_stride: u32,
+    batch_size: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 @group(0) @binding(0) var<storage, read>       d: array<f32>;
 @group(0) @binding(1) var<storage, read_write> w: array<f32>;
+@group(0) @binding(2) var<storage, read>       byte_buf: array<u32>;
 var<push_constant>             p: CA;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r = gid.x;
     if (r >= p.rows) { return; }
-    let idx = r * p.n_input + p.byte_idx;
-    w[idx] = w[idx] + d[r];
+    for (var bi: u32 = 0u; bi < p.batch_size; bi = bi + 1u) {
+        let byte_idx = byte_buf[bi * p.t_capacity + p.t_idx];
+        let idx = r * p.n_input + byte_idx;
+        w[idx] = w[idx] + d[bi * p.d_batch_stride + r];
+    }
 }
 ";
 
@@ -989,8 +1092,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 struct ColumnAccumParams {
     rows: u32,
     n_input: u32,
-    byte_idx: u32,
-    _pad: u32,
+    t_capacity: u32,
+    t_idx: u32,
+    d_batch_stride: u32,
+    batch_size: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 pub struct ColumnAccumKernel {
@@ -1014,6 +1121,7 @@ impl ColumnAccumKernel {
                 entries: &[
                     storage_entry(0, true),
                     storage_entry(1, false),
+                    storage_entry(2, true),
                 ],
             });
         let pl = ctx
@@ -1039,25 +1147,38 @@ impl ColumnAccumKernel {
         }
     }
 
-    /// `w[r * n_input + byte_idx] += d[r]`.
+    /// Sprint 20 batch-fused column accumulator:
+    /// for each sample `bi` and each row `r`, adds
+    /// `d[bi * d_batch_stride + r]` into `w[r * n_input +
+    /// byte_buf[bi * t_capacity + t_idx]]`. Different rows hit
+    /// different rows of `w`; within a thread the batch loop is
+    /// sequential so duplicate bytes accumulate.
     pub fn dispatch_into(
         &self,
         ctx: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
         d: &GpuBuffer,
         w: &GpuBuffer,
+        byte_buf: &GpuBuffer,
         rows: u32,
         n_input: u32,
-        byte_idx: u32,
+        t_capacity: u32,
+        t_idx: u32,
+        d_batch_stride: u32,
+        batch_size: u32,
     ) {
-        debug_assert_eq!(d.len, rows as usize);
+        debug_assert!(d.len >= (batch_size.saturating_sub(1) * d_batch_stride + rows) as usize);
         debug_assert_eq!(w.len, (rows * n_input) as usize);
 
         let p = ColumnAccumParams {
             rows,
             n_input,
-            byte_idx,
-            _pad: 0,
+            t_capacity,
+            t_idx,
+            d_batch_stride,
+            batch_size,
+            _pad0: 0,
+            _pad1: 0,
         };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora column_accum bind"),
@@ -1070,6 +1191,10 @@ impl ColumnAccumKernel {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: w.inner.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: byte_buf.inner.as_entire_binding(),
                 },
             ],
         });
@@ -1087,8 +1212,17 @@ impl ColumnAccumKernel {
     }
 }
 
+// Sprint 20: each thread `i` reduces over the batch dim by looping
+// `b in 0..batch_size`. `d_batch_stride` is the per-sample stride into
+// `d` (e.g. `T*O` for d_logits, `N` for scratch buffers).
+// `b[i] += sum_b d[b * d_batch_stride + d_offset + i]`.
 const VECTOR_ADD_WGSL: &str = "
-struct VA { len: u32, d_offset: u32, _pad0: u32, _pad1: u32 };
+struct VA {
+    len: u32,
+    d_offset: u32,
+    d_batch_stride: u32,
+    batch_size: u32,
+};
 
 @group(0) @binding(0) var<storage, read>       d: array<f32>;
 @group(0) @binding(1) var<storage, read_write> b: array<f32>;
@@ -1098,7 +1232,11 @@ var<push_constant>             p: VA;
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.len) { return; }
-    b[i] = b[i] + d[p.d_offset + i];
+    var acc: f32 = 0.0;
+    for (var bi: u32 = 0u; bi < p.batch_size; bi = bi + 1u) {
+        acc = acc + d[bi * p.d_batch_stride + p.d_offset + i];
+    }
+    b[i] = b[i] + acc;
 }
 ";
 
@@ -1107,8 +1245,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 struct VectorAddParams {
     len: u32,
     d_offset: u32,
-    _pad1: u32,
-    _pad2: u32,
+    d_batch_stride: u32,
+    batch_size: u32,
 }
 
 pub struct VectorAddKernel {
@@ -1157,18 +1295,30 @@ impl VectorAddKernel {
         }
     }
 
-    /// `b[i] += d[d_offset + i]`. Used for bias-grad accumulation
-    /// (`b_h`, `b_o`, `b_gate`). `d_offset` lets `d` point into a
-    /// packed `[T*len]` buffer (Sprint 18); pass 0 for scratch input.
-    pub fn dispatch_into(&self, ctx: &GpuContext, encoder: &mut wgpu::CommandEncoder, d: &GpuBuffer, b: &GpuBuffer, len: u32, d_offset: u32) {
+    /// `b[i] += sum_bi d[bi * d_batch_stride + d_offset + i]` for
+    /// `bi in 0..batch_size`. Sprint 20 batch-fused bias-grad accum:
+    /// each thread reduces across the batch dim in-place (no atomics).
+    /// For single-sample `(batch_size=1, d_batch_stride=0)` reduces to
+    /// the original `b[i] += d[d_offset + i]`.
+    pub fn dispatch_into(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        d: &GpuBuffer,
+        b: &GpuBuffer,
+        len: u32,
+        d_offset: u32,
+        d_batch_stride: u32,
+        batch_size: u32,
+    ) {
         debug_assert!(d.len >= (d_offset + len) as usize);
         debug_assert_eq!(b.len, len as usize);
 
         let p = VectorAddParams {
             len,
             d_offset,
-            _pad1: 0,
-            _pad2: 0,
+            d_batch_stride,
+            batch_size,
         };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora vector_add bind"),

@@ -29,8 +29,10 @@
 pub mod buffers;
 pub mod context;
 pub mod forward_mega;
+pub mod forward_mega_2layer;
 pub mod kernels;
 pub mod snn_gated_gpu;
+pub mod snn_gated_gpu_multi;
 
 pub use context::GpuContext;
 pub use snn_gated_gpu::GatedRecurrentSnnGpu;

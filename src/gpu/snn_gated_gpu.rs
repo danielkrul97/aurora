@@ -173,13 +173,13 @@ impl FbScratch {
             loss_seq: GpuBuffer::zeros(ctx, "loss_seq", b * t),
             input_bytes_buf: GpuBuffer::zeros(ctx, "input_bytes", b * t),
             target_bytes_buf: GpuBuffer::zeros(ctx, "target_bytes", b * t),
-            d_h_spike_from_out: GpuBuffer::zeros(ctx, "d_h_spike_from_out", n_hidden),
-            d_h_spike_recurrent: GpuBuffer::zeros(ctx, "d_h_spike_recurrent", n_hidden),
-            d_h_v_after_carry_a: GpuBuffer::zeros(ctx, "d_h_v_after_carry_a", n_hidden),
-            d_h_v_after_carry_b: GpuBuffer::zeros(ctx, "d_h_v_after_carry_b", n_hidden),
-            d_cell_packed: GpuBuffer::zeros(ctx, "d_cell_packed", 3 * n_hidden),
-            d_h_v_pre: GpuBuffer::zeros(ctx, "d_h_v_pre", n_hidden),
-            d_gate_pre: GpuBuffer::zeros(ctx, "d_gate_pre", n_hidden),
+            d_h_spike_from_out: GpuBuffer::zeros(ctx, "d_h_spike_from_out", b * n_hidden),
+            d_h_spike_recurrent: GpuBuffer::zeros(ctx, "d_h_spike_recurrent", b * n_hidden),
+            d_h_v_after_carry_a: GpuBuffer::zeros(ctx, "d_h_v_after_carry_a", b * n_hidden),
+            d_h_v_after_carry_b: GpuBuffer::zeros(ctx, "d_h_v_after_carry_b", b * n_hidden),
+            d_cell_packed: GpuBuffer::zeros(ctx, "d_cell_packed", 3 * b * n_hidden),
+            d_h_v_pre: GpuBuffer::zeros(ctx, "d_h_v_pre", b * n_hidden),
+            d_gate_pre: GpuBuffer::zeros(ctx, "d_gate_pre", b * n_hidden),
             initial_h_v_after: GpuBuffer::zeros(ctx, "initial_h_v_after", b * n_hidden),
             initial_h_spike: GpuBuffer::zeros(ctx, "initial_h_spike", b * n_hidden),
         }
@@ -214,6 +214,17 @@ impl FbScratch {
         if new_b != self.capacity_b {
             self.initial_h_v_after = GpuBuffer::zeros(ctx, "initial_h_v_after", new_b * n);
             self.initial_h_spike = GpuBuffer::zeros(ctx, "initial_h_spike", new_b * n);
+            self.d_h_spike_from_out =
+                GpuBuffer::zeros(ctx, "d_h_spike_from_out", new_b * n);
+            self.d_h_spike_recurrent =
+                GpuBuffer::zeros(ctx, "d_h_spike_recurrent", new_b * n);
+            self.d_h_v_after_carry_a =
+                GpuBuffer::zeros(ctx, "d_h_v_after_carry_a", new_b * n);
+            self.d_h_v_after_carry_b =
+                GpuBuffer::zeros(ctx, "d_h_v_after_carry_b", new_b * n);
+            self.d_cell_packed = GpuBuffer::zeros(ctx, "d_cell_packed", 3 * new_b * n);
+            self.d_h_v_pre = GpuBuffer::zeros(ctx, "d_h_v_pre", new_b * n);
+            self.d_gate_pre = GpuBuffer::zeros(ctx, "d_gate_pre", new_b * n);
         }
         self.capacity_t = new_t;
         self.capacity_b = new_b;
@@ -608,10 +619,11 @@ impl GatedRecurrentSnnGpu {
         let targets_owned: Vec<&[u8]> = vec![target_bytes];
         self.upload_batch_io(&inputs_owned, &targets_owned);
 
-        // Forward (B=1), then softmax_ce (B=1, T), then backward (b=0).
+        // Forward (B=1), then softmax_ce (B=1, T), then batched
+        // backward (Sprint 20: B=1 still goes through the fused path).
         self.gpu_forward_batched(t_steps, 1);
         let total_loss = self.compute_d_logits_gpu_batched(1, t_steps);
-        self.gpu_backward_sample(input_bytes, 0);
+        self.gpu_backward_batched(t_steps, 1);
 
         // Read final hidden state back to caller-owned buffers from
         // b=0 slice (slot `t_steps` of the per-sample (T+1)*N region).
@@ -724,11 +736,9 @@ impl GatedRecurrentSnnGpu {
         self.gpu_forward_batched(t_steps, batch_size);
         // Softmax + CE + d_logits: 1 dispatch covers all (B, T).
         let total_loss = self.compute_d_logits_gpu_batched(batch_size, t_steps);
-        // Backward: sequential per sample (each call uses sample-base
-        // offsets so they share the packed cache).
-        for (b, inp) in inputs.iter().enumerate() {
-            self.gpu_backward_sample(inp, b as u32);
-        }
+        // Sprint 20: batch-fused backward — one dispatch per kernel
+        // covers all B samples in parallel (per timestep).
+        self.gpu_backward_batched(t_steps, batch_size);
 
         // Read final hidden state of each sample at slot t_steps in
         // its own (T+1)*N slice, write back to caller-owned states.
@@ -1030,44 +1040,46 @@ impl GatedRecurrentSnnGpu {
         losses.iter().take(used).sum()
     }
 
-    /// Sprint 19: backward for a single sample `b` from the batched
-    /// packed cache. All offsets include the per-sample base
-    /// (`b * T * N` etc.) so different samples can run sequentially
-    /// while sharing the same packed forward cache. Backward stays
-    /// per-sample — Sprint 19 only batches forward + softmax.
-    fn gpu_backward_sample(&mut self, input_bytes: &[u8], b_idx: u32) {
+    /// Sprint 20: fully batch-fused backward. Per timestep, ONE
+    /// dispatch of each backward kernel covers all `B` samples in
+    /// parallel. Per-element kernels (transpose, cell_back) use 2D
+    /// dispatch `(h_chunks, B, 1)`; accumulator kernels (outer,
+    /// column, vector_add) reduce across the batch dim in-thread
+    /// when writing into shared weight grads.
+    ///
+    /// `t_capacity` (= `self.fb.capacity_t`) is the per-sample stride
+    /// in the packed cache buffers. `batch_size = self.fb.capacity_b`.
+    /// First `inputs[b]` of each sample is read for the timestep's
+    /// byte index; targets are NOT used here (already consumed by
+    /// `compute_d_logits_gpu_batched`).
+    fn gpu_backward_batched(&mut self, t_steps: usize, batch_size: usize) {
         let h = self.n_hidden;
         let i_dim = self.n_input;
         let o = self.n_output;
-        let t_steps = input_bytes.len();
+        let b32 = batch_size as u32;
         let t_steps_u = t_steps as u32;
-        let off_b_n = b_idx * t_steps_u * h;
-        let off_b_n_init = b_idx * (t_steps_u + 1) * h;
-        let off_b_o = b_idx * t_steps_u * o;
+        let t_capacity = self.fb.capacity_t as u32;
+        let cache_stride_no_init = t_steps_u * h;
+        let cache_stride_init = (t_steps_u + 1) * h;
+        let cache_stride_out = t_steps_u * o;
         let mut encoder = self
             .ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("aurora gpu_backward"),
+                label: Some("aurora gpu_backward_batched"),
             });
 
-        // Init carryover buffers to zero.
         self.zero.dispatch_into(&self.ctx, &mut encoder, &self.fb.d_h_v_after_carry_a);
         self.zero.dispatch_into(&self.ctx, &mut encoder, &self.fb.d_h_v_after_carry_b);
         self.zero.dispatch_into(&self.ctx, &mut encoder, &self.fb.d_h_spike_recurrent);
 
         for t in (0..t_steps).rev() {
-            let byte_t = u32::from(input_bytes[t]);
             let t32 = t as u32;
-            // Per-sample offsets: combine sample base with timestep.
-            let off_t_n = off_b_n + t32 * h;
-            let off_t1_n = off_b_n_init + (t32 + 1) * h;
-            let off_t_o = off_b_o + t32 * o;
-            // h_v_after_prev / h_spike_prev = slot t in the (T+1)
-            // per-sample slice.
-            let off_prev_n = off_b_n_init + t32 * h;
+            let off_t_n = t32 * h;
+            let off_t1_n = (t32 + 1) * h;
+            let off_t_o = t32 * o;
 
-            // d_h_spike_from_out = W_out^T @ d_logits[t]
+            // d_h_spike_from_out[b, h] = (W_out^T @ d_logits[b, t])[h]
             self.transpose.dispatch_into(
                 &self.ctx,
                 &mut encoder,
@@ -1078,31 +1090,18 @@ impl GatedRecurrentSnnGpu {
                 h,
                 false,
                 off_t_o,
+                cache_stride_out,
+                h,
+                b32,
             );
 
-            // Carry-in: even t reads `_a`, odd reads `_b` (mirrors how
-            // the iteration BEFORE this one — t+1 — wrote out_carry to
-            // the OPPOSITE slot). Since we initialized both to zero,
-            // the very first iteration (t = T-1) reads zero either way.
             let (carry_in, carry_out): (&GpuBuffer, &GpuBuffer) = if t.is_multiple_of(2) {
-                (
-                    &self.fb.d_h_v_after_carry_a,
-                    &self.fb.d_h_v_after_carry_b,
-                )
+                (&self.fb.d_h_v_after_carry_a, &self.fb.d_h_v_after_carry_b)
             } else {
-                (
-                    &self.fb.d_h_v_after_carry_b,
-                    &self.fb.d_h_v_after_carry_a,
-                )
+                (&self.fb.d_h_v_after_carry_b, &self.fb.d_h_v_after_carry_a)
             };
 
-            // Fused per-element backward. Cache offsets (Sprint 18+19):
-            //   h_v_pre[t]:        h_v_pre_packed at sample b's slot t
-            //                      (T*N stride, off_t_n).
-            //   h_v_after_prev:    h_v_after_packed at sample b's slot t
-            //                      ((T+1)*N stride, off_prev_n).
-            //   gate[t]:           gate_packed at sample b's slot t
-            //                      (T*N stride, off_t_n).
+            // Per-element fused backward across all (h, b).
             self.cell_back.dispatch_into(
                 &self.ctx,
                 &mut encoder,
@@ -1117,15 +1116,40 @@ impl GatedRecurrentSnnGpu {
                 self.threshold,
                 self.alpha,
                 off_t_n,
-                off_prev_n,
                 off_t_n,
+                off_t_n,
+                cache_stride_no_init,
+                cache_stride_init,
+                b32,
             );
-            Self::copy_packed_slot_into(&mut encoder, &self.fb.d_cell_packed, &self.fb.d_h_v_pre, 0, h);
-            Self::copy_packed_slot_into(&mut encoder, &self.fb.d_cell_packed, &self.fb.d_gate_pre, 1, h);
-            Self::copy_packed_slot_into(&mut encoder, &self.fb.d_cell_packed, carry_out, 2, h);
+            // Slot layout in d_cell_packed: [slot][b][h] where slot
+            // stride = B * N. Single copies extract each slot's full
+            // batch worth of data.
+            let slot_size = b32 * h;
+            Self::copy_packed_slot_into(
+                &mut encoder,
+                &self.fb.d_cell_packed,
+                &self.fb.d_h_v_pre,
+                0,
+                slot_size,
+            );
+            Self::copy_packed_slot_into(
+                &mut encoder,
+                &self.fb.d_cell_packed,
+                &self.fb.d_gate_pre,
+                1,
+                slot_size,
+            );
+            Self::copy_packed_slot_into(
+                &mut encoder,
+                &self.fb.d_cell_packed,
+                carry_out,
+                2,
+                slot_size,
+            );
 
-            // Bias gradients.
-            // b_o += d_logits[t]: input is packed, offset t*O.
+            // Bias gradients accumulate across batch.
+            // b_o += sum_b d_logits[b, t]
             self.vector_add.dispatch_into(
                 &self.ctx,
                 &mut encoder,
@@ -1133,8 +1157,10 @@ impl GatedRecurrentSnnGpu {
                 &self.grads.b_o,
                 o,
                 off_t_o,
+                cache_stride_out,
+                b32,
             );
-            // b_h += d_h_v_pre (scratch, no offset).
+            // b_h += sum_b d_h_v_pre[b]
             self.vector_add.dispatch_into(
                 &self.ctx,
                 &mut encoder,
@@ -1142,6 +1168,8 @@ impl GatedRecurrentSnnGpu {
                 &self.grads.b_h,
                 h,
                 0,
+                h,
+                b32,
             );
             self.vector_add.dispatch_into(
                 &self.ctx,
@@ -1150,10 +1178,12 @@ impl GatedRecurrentSnnGpu {
                 &self.grads.b_gate,
                 h,
                 0,
+                h,
+                b32,
             );
 
-            // W_out grad: outer product d_logits[t] ⊗ h_spike[t].
-            // h_spike[t] lives at slot t+1 in h_spike_packed.
+            // W_out grad: M += sum_b d_logits[b, t] ⊗ h_spike[b, t]
+            // h_spike[t] is at slot t+1 of (T+1)*N per-sample slice.
             self.outer.dispatch_into(
                 &self.ctx,
                 &mut encoder,
@@ -1164,11 +1194,12 @@ impl GatedRecurrentSnnGpu {
                 h,
                 off_t_o,
                 off_t1_n,
+                cache_stride_out,
+                cache_stride_init,
+                b32,
             );
 
-            // W_rec / W_gate_rec grads: outer product d_h_v_pre ⊗
-            // h_spike_prev. h_spike_prev = sample b's slot t in (T+1)*N
-            // packed buffer (initial when t=0, h_spike[t-1] otherwise).
+            // W_rec / W_gate_rec: sum_b d_h_v_pre ⊗ h_spike_prev (slot t).
             self.outer.dispatch_into(
                 &self.ctx,
                 &mut encoder,
@@ -1178,7 +1209,10 @@ impl GatedRecurrentSnnGpu {
                 h,
                 h,
                 0,
-                off_prev_n,
+                off_t_n,
+                h,
+                cache_stride_init,
+                b32,
             );
             self.outer.dispatch_into(
                 &self.ctx,
@@ -1189,31 +1223,44 @@ impl GatedRecurrentSnnGpu {
                 h,
                 h,
                 0,
-                off_prev_n,
+                off_t_n,
+                h,
+                cache_stride_init,
+                b32,
             );
 
-            // W_in / W_gate_in grads: column-add at byte_t.
+            // W_in / W_gate_in: column-add at this timestep's byte
+            // for each sample. Kernel reads byte_idx[b * t_capacity +
+            // t] from input_bytes_buf.
             self.column.dispatch_into(
                 &self.ctx,
                 &mut encoder,
                 &self.fb.d_h_v_pre,
                 &self.grads.w_in,
+                &self.fb.input_bytes_buf,
                 h,
                 i_dim,
-                byte_t,
+                t_capacity,
+                t32,
+                h,
+                b32,
             );
             self.column.dispatch_into(
                 &self.ctx,
                 &mut encoder,
                 &self.fb.d_gate_pre,
                 &self.grads.w_gate_in,
+                &self.fb.input_bytes_buf,
                 h,
                 i_dim,
-                byte_t,
+                t_capacity,
+                t32,
+                h,
+                b32,
             );
 
-            // Write new d_h_spike_recurrent (consumed in next iteration's
-            // cell_back dispatch). Inputs are scratch → offset 0.
+            // d_h_spike_recurrent[b] = W_rec^T @ d_h_v_pre[b]
+            //                        + W_gate_rec^T @ d_gate_pre[b]
             self.transpose.dispatch_into(
                 &self.ctx,
                 &mut encoder,
@@ -1224,6 +1271,9 @@ impl GatedRecurrentSnnGpu {
                 h,
                 false,
                 0,
+                h,
+                h,
+                b32,
             );
             self.transpose.dispatch_into(
                 &self.ctx,
@@ -1235,6 +1285,9 @@ impl GatedRecurrentSnnGpu {
                 h,
                 true,
                 0,
+                h,
+                h,
+                b32,
             );
         }
         self.ctx.queue.submit(Some(encoder.finish()));

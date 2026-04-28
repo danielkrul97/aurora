@@ -9,9 +9,11 @@
 
 use aurora::gpu::buffers::GpuBuffer;
 use aurora::gpu::kernels::SparseMatvecOneHotKernel;
+use aurora::gpu::snn_gated_gpu_multi::MultiLayerGatedSnnGpu;
 use aurora::gpu::{GatedRecurrentSnnGpu, GpuContext};
 use aurora::optimizer::AdamConfig;
 use aurora::snn_gated::GatedRecurrentSnn;
+use aurora::snn_gated_multi::MultiLayerGatedSnn;
 use aurora::surrogate::SpikeFn;
 use aurora::text_io::VOCAB;
 use rand::rngs::StdRng;
@@ -316,5 +318,119 @@ fn batch_fused_matches_sequential_per_sample() {
             assert!((states_a[b].0[i] - states_b[b].0[i]).abs() < 1e-3);
             assert!((states_a[b].1[i] - states_b[b].1[i]).abs() < 1e-3);
         }
+    }
+}
+
+#[test]
+fn multi_layer_gpu_matches_cpu_within_tolerance() {
+    let ctx = match GpuContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("GPU not available, skipping: {e}");
+            return;
+        }
+    };
+
+    let n_hidden = 32_usize;
+    let batch_size = 2_usize;
+    let t_steps = 8_usize;
+    let mut rng = StdRng::seed_from_u64(0xBEAD);
+    let mut net_cpu = MultiLayerGatedSnn::new(
+        VOCAB,
+        &[n_hidden, n_hidden],
+        VOCAB,
+        SpikeFn::default(),
+        &mut rng,
+    );
+
+    // Build random input/target streams (B sequences of length T).
+    let mut byte_rng = StdRng::seed_from_u64(0xFADE);
+    let inputs: Vec<Vec<u8>> = (0..batch_size)
+        .map(|_| (0..t_steps).map(|_| byte_rng.random::<u8>()).collect())
+        .collect();
+    let targets: Vec<Vec<u8>> = (0..batch_size)
+        .map(|_| (0..t_steps).map(|_| byte_rng.random::<u8>()).collect())
+        .collect();
+    let inputs_refs: Vec<&[u8]> = inputs.iter().map(|v| v.as_slice()).collect();
+    let targets_refs: Vec<&[u8]> = targets.iter().map(|v| v.as_slice()).collect();
+
+    // CPU multi-layer reference: forward + backward into fresh grads.
+    let mut cpu_states: Vec<Vec<aurora::snn_gated::GatedState>> =
+        (0..batch_size).map(|_| net_cpu.fresh_states()).collect();
+    net_cpu.zero_grad();
+    let cpu_loss = net_cpu.forward_backward_batch_stateful(
+        &inputs_refs,
+        &targets_refs,
+        &mut cpu_states,
+    );
+    let cpu_grads = net_cpu.grads().clone();
+
+    // GPU multi-layer.
+    let mut net_gpu = MultiLayerGatedSnnGpu::from_cpu(&net_cpu, ctx);
+    net_gpu.zero_grad_gpu();
+    // States: per batch slot, (l0_v, l0_s, l1_v, l1_s) all zero initial.
+    type GpuState4 = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+    let mut gpu_states: Vec<GpuState4> = (0..batch_size)
+        .map(|_| {
+            (
+                vec![0.0_f32; n_hidden],
+                vec![0.0_f32; n_hidden],
+                vec![0.0_f32; n_hidden],
+                vec![0.0_f32; n_hidden],
+            )
+        })
+        .collect();
+    let gpu_loss = net_gpu.forward_backward_batch_gpu_multi_fused(
+        &inputs_refs,
+        &targets_refs,
+        &mut gpu_states,
+    );
+    let gpu_grads = net_gpu.download_grads();
+
+    let loss_diff = (cpu_loss - gpu_loss).abs();
+    eprintln!("multi-layer loss: cpu={cpu_loss} gpu={gpu_loss} diff={loss_diff}");
+    assert!(
+        loss_diff < 5e-2,
+        "loss diff > 5e-2: cpu={cpu_loss} gpu={gpu_loss}"
+    );
+
+    // Compare per-layer + top-level grads.
+    let layer_groups: [&str; 6] = [
+        "w_in", "w_rec", "w_gate_in", "w_gate_rec", "b_h", "b_gate",
+    ];
+    for (l, lg_cpu) in cpu_grads.layers.iter().enumerate() {
+        let lg_gpu = &gpu_grads.layers[l];
+        for (idx, name) in layer_groups.iter().enumerate() {
+            let (a, b) = match idx {
+                0 => (&lg_cpu.w_in, &lg_gpu.w_in),
+                1 => (&lg_cpu.w_rec, &lg_gpu.w_rec),
+                2 => (&lg_cpu.w_gate_in, &lg_gpu.w_gate_in),
+                3 => (&lg_cpu.w_gate_rec, &lg_gpu.w_gate_rec),
+                4 => (&lg_cpu.b_h, &lg_gpu.b_h),
+                5 => (&lg_cpu.b_gate, &lg_gpu.b_gate),
+                _ => unreachable!(),
+            };
+            let mut max_diff = 0.0_f32;
+            for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
+                let d = (av - bv).abs();
+                if d > max_diff {
+                    max_diff = d;
+                }
+                assert!(
+                    d < 5e-2,
+                    "layer {l} {name} grad diff at {i}: cpu={av} gpu={bv} d={d}"
+                );
+            }
+            eprintln!("layer {l} {name}: max diff {max_diff:.2e}");
+        }
+    }
+    // Top-level w_out + b_o.
+    for (i, (av, bv)) in cpu_grads.w_out.iter().zip(gpu_grads.w_out.iter()).enumerate() {
+        let d = (av - bv).abs();
+        assert!(d < 5e-2, "w_out diff at {i}: cpu={av} gpu={bv} d={d}");
+    }
+    for (i, (av, bv)) in cpu_grads.b_o.iter().zip(gpu_grads.b_o.iter()).enumerate() {
+        let d = (av - bv).abs();
+        assert!(d < 5e-2, "b_o diff at {i}: cpu={av} gpu={bv} d={d}");
     }
 }

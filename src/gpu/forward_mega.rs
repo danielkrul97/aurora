@@ -67,9 +67,33 @@ var<push_constant> p: ForwardParams;
 const MAX_HIDDEN: u32 = 1024u;
 var<workgroup> sh_h_spike: array<f32, MAX_HIDDEN>;
 var<workgroup> sh_h_v_after: array<f32, MAX_HIDDEN>;
+// Sprint 21: workgroup-shared compaction of `sh_h_spike` so the
+// W_rec / W_gate_rec / W_out matvecs only read weight columns for
+// neurons that actually fired (~5% in steady-state SNNs). Atomic
+// counter is reset before each compaction; per-thread stride loop
+// scans `sh_h_spike` and appends each non-zero index.
+var<workgroup> sh_active_indices: array<u32, MAX_HIDDEN>;
+var<workgroup> sh_n_active: atomic<u32>;
 
 fn sigmoid(x: f32) -> f32 {
     return 1.0 / (1.0 + exp(-x));
+}
+
+fn build_active_indices(tid: u32, n: u32) {
+    if (tid == 0u) {
+        atomicStore(&sh_n_active, 0u);
+    }
+    workgroupBarrier();
+    var c: u32 = tid;
+    loop {
+        if (c >= n) { break; }
+        if (sh_h_spike[c] != 0.0) {
+            let idx = atomicAdd(&sh_n_active, 1u);
+            sh_active_indices[idx] = c;
+        }
+        c = c + 64u;
+    }
+    workgroupBarrier();
 }
 
 // Sprint 19: dispatched with `(B, 1, 1)` workgroups; each workgroup
@@ -115,19 +139,28 @@ fn main(
     }
     workgroupBarrier();
 
+    // Initial compaction: active_indices reflects sh_h_spike (= initial
+    // state, mostly zero). Used by t=0's Phase 1 matvecs.
+    build_active_indices(tid, n);
+
     for (var t: u32 = 0u; t < t_steps; t = t + 1u) {
         let byte = input_bytes[input_off + t];
         let next_slot = (t + 1u) * n;
 
+        let n_act = atomicLoad(&sh_n_active);
         var h2: u32 = tid;
         loop {
             if (h2 >= n) { break; }
             var h_rec: f32 = 0.0;
             var gate_rec: f32 = 0.0;
-            for (var c: u32 = 0u; c < n; c = c + 1u) {
-                let s_prev = sh_h_spike[c];
-                h_rec = h_rec + w_rec[h2 * n + c] * s_prev;
-                gate_rec = gate_rec + w_gate_rec[h2 * n + c] * s_prev;
+            // Sprint 21 sparse: iterate only over neurons that fired
+            // last timestep. Spike value is 1.0 by construction (binary
+            // select(0,1, ...) in last iter), so the multiplication
+            // factor is dropped — read W column directly.
+            for (var k: u32 = 0u; k < n_act; k = k + 1u) {
+                let c = sh_active_indices[k];
+                h_rec = h_rec + w_rec[h2 * n + c];
+                gate_rec = gate_rec + w_gate_rec[h2 * n + c];
             }
             let h_in_val = w_in[h2 * i_dim + byte];
             let gate_in = w_gate_in[h2 * i_dim + byte];
@@ -155,12 +188,18 @@ fn main(
         }
         workgroupBarrier();
 
+        // Compaction over h_spike[t] (just-loaded sh_h_spike). Used by
+        // Phase 3 W_out matvec AND by next iteration's Phase 1.
+        build_active_indices(tid, n);
+
+        let n_act_out = atomicLoad(&sh_n_active);
         var oi: u32 = tid;
         loop {
             if (oi >= o_dim) { break; }
             var logit: f32 = b_o[oi];
-            for (var c: u32 = 0u; c < n; c = c + 1u) {
-                logit = logit + w_out[oi * n + c] * sh_h_spike[c];
+            for (var k: u32 = 0u; k < n_act_out; k = k + 1u) {
+                let c = sh_active_indices[k];
+                logit = logit + w_out[oi * n + c];
             }
             logits_packed[logits_off + t * o_dim + oi] = logit;
             oi = oi + 64u;
