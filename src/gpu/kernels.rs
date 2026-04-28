@@ -2100,51 +2100,38 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 // `h_spike_packed` layout: per sample `b`, per layer `l`, per
 // `slot` ∈ 0..=T (slot 0 is initial state — skip it via `initial_skip`).
 // We sum spikes over (B × T × N) for a given layer.
+// Sprint 33: per-neuron spike-rate reduce. Each thread sums one
+// neuron's spike count across (batch, timesteps) — slot 0 (= initial
+// state) is skipped. Output is `count_per_neuron[output_offset + i]`
+// for `i in 0..n_hidden`.
 const SPIKE_RATE_REDUCE_WGSL: &str = "
 struct SR {
     layer_offset: u32,         // per-sample offset for this layer's slice
-    sample_stride: u32,        // bytes... wait, elements: total per-sample stride across all layers
-    slice_len: u32,            // (T+1) * N  for this layer
-    initial_skip: u32,         // = N (we don't count slot 0 = initial state)
+    sample_stride: u32,        // total per-sample stride across all layers
+    n_hidden: u32,
+    t_steps: u32,              // = T (number of real timesteps; we skip slot 0)
     batch_size: u32,
-    layer_idx: u32,
+    output_offset: u32,        // where per-neuron sums get written
     _p0: u32,
     _p1: u32,
 };
 
 @group(0) @binding(0) var<storage, read> h_spike: array<f32>;
-@group(0) @binding(1) var<storage, read_write> count_out: array<f32>;
+@group(0) @binding(1) var<storage, read_write> count_per_neuron: array<f32>;
 var<push_constant> p: SR;
 
-var<workgroup> sh: array<f32, 256>;
-
 @compute @workgroup_size(256)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
-    let tid = lid.x;
-    var local: f32 = 0.0;
-    let total = p.batch_size * p.slice_len;
-    var i: u32 = tid;
-    loop {
-        if (i >= total) { break; }
-        let b = i / p.slice_len;
-        let elem = i % p.slice_len;
-        if (elem >= p.initial_skip) {
-            let idx = b * p.sample_stride + p.layer_offset + elem;
-            local = local + h_spike[idx];
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= p.n_hidden) { return; }
+    var sum: f32 = 0.0;
+    for (var b: u32 = 0u; b < p.batch_size; b = b + 1u) {
+        let base = b * p.sample_stride + p.layer_offset;
+        for (var t: u32 = 1u; t <= p.t_steps; t = t + 1u) {
+            sum = sum + h_spike[base + t * p.n_hidden + i];
         }
-        i = i + 256u;
     }
-    sh[tid] = local;
-    workgroupBarrier();
-
-    var s: u32 = 128u;
-    loop {
-        if (s == 0u) { break; }
-        if (tid < s) { sh[tid] = sh[tid] + sh[tid + s]; }
-        workgroupBarrier();
-        s = s / 2u;
-    }
-    if (tid == 0u) { count_out[p.layer_idx] = sh[0]; }
+    count_per_neuron[p.output_offset + i] = sum;
 }
 ";
 
@@ -2153,10 +2140,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 struct SpikeRateReduceParams {
     layer_offset: u32,
     sample_stride: u32,
-    slice_len: u32,
-    initial_skip: u32,
+    n_hidden: u32,
+    t_steps: u32,
     batch_size: u32,
-    layer_idx: u32,
+    output_offset: u32,
     _p0: u32,
     _p1: u32,
 }
@@ -2215,18 +2202,18 @@ impl SpikeRateReduceKernel {
         count_out: &GpuBuffer,
         layer_offset: u32,
         sample_stride: u32,
-        slice_len: u32,
-        initial_skip: u32,
+        n_hidden: u32,
+        t_steps: u32,
         batch_size: u32,
-        layer_idx: u32,
+        output_offset: u32,
     ) {
         let p = SpikeRateReduceParams {
             layer_offset,
             sample_stride,
-            slice_len,
-            initial_skip,
+            n_hidden,
+            t_steps,
             batch_size,
-            layer_idx,
+            output_offset,
             _p0: 0,
             _p1: 0,
         };
@@ -2251,17 +2238,17 @@ impl SpikeRateReduceKernel {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
-        pass.dispatch_workgroups(1, 1, 1);
+        pass.dispatch_workgroups(n_hidden.div_ceil(256), 1, 1);
     }
 }
 
-// Adds a constant rate-regularization correction to every entry of a
-// bias gradient buffer:
-//   `b_h_grad[i] += 2 * lambda * (count[layer_idx] / total - target)`
+// Sprint 33: per-neuron rate-regularization correction. Each `b_h_grad[i]`
+// gets `+= 2 * lambda * (count[count_offset + i] * inv_total - target_rate)`.
+// `inv_total = 1 / (B × T)` so that per-neuron rate is in [0, 1].
 const RATE_REG_BIAS_WGSL: &str = "
 struct RR {
     n_hidden: u32,
-    layer_idx: u32,
+    count_offset: u32,
     inv_total: f32,
     lambda: f32,
     target_rate: f32,
@@ -2278,7 +2265,7 @@ var<push_constant> p: RR;
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.n_hidden) { return; }
-    let rate = count[p.layer_idx] * p.inv_total;
+    let rate = count[p.count_offset + i] * p.inv_total;
     let correction = 2.0 * p.lambda * (rate - p.target_rate);
     b_h_grad[i] = b_h_grad[i] + correction;
 }
@@ -2288,7 +2275,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct RateRegBiasParams {
     n_hidden: u32,
-    layer_idx: u32,
+    count_offset: u32,
     inv_total: f32,
     lambda: f32,
     target_rate: f32,
@@ -2350,14 +2337,14 @@ impl RateRegBiasKernel {
         count: &GpuBuffer,
         b_h_grad: &GpuBuffer,
         n_hidden: u32,
-        layer_idx: u32,
+        count_offset: u32,
         total_elems: f32,
         lambda: f32,
         target_rate: f32,
     ) {
         let p = RateRegBiasParams {
             n_hidden,
-            layer_idx,
+            count_offset,
             inv_total: 1.0 / total_elems,
             lambda,
             target_rate,

@@ -175,20 +175,39 @@ Per-layer rate reg correction je konstantní napříč vrstvou (`2λ × diff` p�
 
 ---
 
-## Sprint 33 — Tuning rate reg + zbylé Sprint 30 items
+## Sprint 33 — Per-neuron rate reg ✓ DONE
 
-**Cíl:** Reálně využít rate reg (smarter formulation) + dotáhnout zbylé items.
+**Cíl:** Vyřešit Sprint 32's "Adam absorbuje signal" problém přechodem na per-neuron correction místo per-layer scalar.
 
-**Priority deliverables:**
+**Hotovo:**
 
-1. **Per-neuron rate reg** — místo per-layer scalar correction použít per-neuron rate, per-neuron correction. Implementace:
-   - Reduce kernel mění output shape: `[n_hidden]` per layer místo `[1]`. Per-neuron sum přes (B, T).
-   - Bias add kernel reads per-neuron rate, applies `2λ × (rate_i − target)` per neuron.
-   - Tohle dá modelu možnost potlačit přemíru-firing neurony zvlášť aniž by tlačil dolů celou vrstvu.
+1. **Per-neuron rate reg** (CPU + GPU). Každý neuron počítá vlastní rate a dostává vlastní correction:
+   - CPU: `rate_i = (1/T) × Σ_t cache.layers[l].h_spike[t][i]` per neuron, `b_h_grad[l][i] += 2λ × (rate_i − target)`.
+   - GPU `SpikeRateReduceKernel` přepsán: output shape `[n_layers × n_hidden]` (per-neuron sum across batch+time), thread-per-neuron parallelism.
+   - GPU `RateRegBiasKernel` přepsán: čte `count[count_offset + i]`, `inv_total = 1/(B×T)`.
 
-2. **TET loss** (CPU + GPU).
+2. **Default λ ladění:** zůstává 0.01 — nedrobí firing na malé regression suite, dává viditelný (nedramaticky) efekt na aurora_train. Vyšší λ (0.05) zlepší tuning rate ale zabije firing na 50K corpus regression (BPB 7.39 vs threshold 6.0). Production callery můžou λ přepsat: `net.rate_reg.lambda = X`.
 
-3. **GPU side α-gradient** (reduction kernel + Adam step na α buffer).
+**Měřené delty proti Sprint 32 baseline:**
+
+| Test | Sprint 32 | Sprint 33 | Delta |
+|---|---|---|---|
+| GPU aurora_train tiny_200k 1 ep | val BPB 2.684, peaks 9.6k/32k | val BPB **2.682**, peaks 7.7k/30k | −0.001 BPB, peaks −20 % |
+| CPU regression byte 50K | val BPB 4.68, rates [0.50, 0.54] | val BPB 5.04, rates [0.45, 0.49] | rate reg už má signal (rates kompresí), drobná BPB regrese |
+| GPU parity 6/6 | ✓ | ✓ | žádná regrese |
+
+**Klíčová matematická poznámka:**
+
+Per-layer scalar correction se v Adamu chová jako *layer-wide bias decay* (všechny neurony stejně), což moment normalization v podstatě zruší. Per-neuron correction je *per-parameter signal* který Adam normalizuje na ~unit-magnitude per parameter — stejně jako jakákoliv jiná složka gradientu. **Mathematically the same scale, but per-neuron actually flows.**
+
+**Otevřené (Sprint 34+):**
+- TET loss (`softmax_ce` kernel surgery — CPU + GPU).
+- GPU side α-gradient (reduction kernel + Adam pro α buffer).
+- λ scheduling — adaptivní λ podle current rate distribution. Mohlo by automatizovat trade-off.
+
+---
+
+## Sprint 34+ — Pokračování
 
 ---
 

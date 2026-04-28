@@ -167,8 +167,9 @@ struct FbScratch {
     initial_h_v_after: GpuBuffer,
     initial_h_spike: GpuBuffer,
 
-    /// Sprint 32: 2-element scratch (one per layer) holding spike sums
-    /// from the rate-reduce kernel. Reused per chunk.
+    /// Sprint 33: per-neuron spike-count scratch — `[n_layers × n_hidden]`
+    /// contiguous so a single buffer holds both layers' counts (writes
+    /// indexed by `output_offset = layer_idx × n_hidden`).
     spike_count: GpuBuffer,
 }
 
@@ -227,7 +228,7 @@ impl FbScratch {
             ],
             initial_h_v_after: GpuBuffer::zeros(ctx, "initial_h_v_after", b * l * n_hidden),
             initial_h_spike: GpuBuffer::zeros(ctx, "initial_h_spike", b * l * n_hidden),
-            spike_count: GpuBuffer::zeros(ctx, "spike_count", l),
+            spike_count: GpuBuffer::zeros(ctx, "spike_count", l * n_hidden),
         }
     }
 
@@ -707,10 +708,9 @@ impl MultiLayerGatedSnnGpu {
     fn apply_rate_reg(&mut self, t_steps: usize, batch_size: usize) {
         let n = self.n_hidden as usize;
         let l = 2_usize;
-        let slice_len = (t_steps + 1) * n; // includes the initial slot
+        let slice_len = (t_steps + 1) * n; // (T+1) × N for one layer per sample
         let sample_stride = l * slice_len;
-        let initial_skip = n; // first N elements are the t=0 initial state
-        let total_elems = (batch_size * t_steps * n) as f32;
+        let total_elems = (batch_size * t_steps) as f32; // per-neuron rate denominator
         let mut encoder = self
             .ctx
             .device
@@ -719,6 +719,7 @@ impl MultiLayerGatedSnnGpu {
             });
         for layer_idx in 0..2u32 {
             let layer_offset = layer_idx as usize * slice_len;
+            let output_offset = layer_idx * self.n_hidden;
             self.spike_rate_reduce.dispatch_into(
                 &self.ctx,
                 &mut encoder,
@@ -726,10 +727,10 @@ impl MultiLayerGatedSnnGpu {
                 &self.fb.spike_count,
                 layer_offset as u32,
                 sample_stride as u32,
-                slice_len as u32,
-                initial_skip as u32,
+                self.n_hidden,
+                t_steps as u32,
                 batch_size as u32,
-                layer_idx,
+                output_offset,
             );
             let b_h_grad = if layer_idx == 0 {
                 &self.grads.b_h_0
@@ -742,7 +743,7 @@ impl MultiLayerGatedSnnGpu {
                 &self.fb.spike_count,
                 b_h_grad,
                 self.n_hidden,
-                layer_idx,
+                output_offset,
                 total_elems,
                 self.rate_reg.lambda,
                 self.rate_reg.target,

@@ -383,14 +383,15 @@ pub struct RateReg {
 
 impl Default for RateReg {
     fn default() -> Self {
-        // target=0.1 is the firing rate that keeps the active-indices
-        // compaction comfortably sparse. λ=0.01 is a gentle default —
-        // doesn't kill firing on small/short tests, doesn't dominate
-        // CE gradients. For overnight runs where membrane runaway
-        // matters more, callers can crank λ on the network directly.
-        // Adam's moment normalization mostly absorbs the constant
-        // bias correction, so seeing a measurable rate shift requires
-        // either much higher λ or many epochs.
+        // target=0.1 keeps the active-indices compaction sparse.
+        // Sprint 33 per-neuron formulation gives Adam a per-parameter
+        // signal that *isn't* cancelled by moment normalization, so
+        // even at λ=0.01 a measurable shift in the rate distribution
+        // accumulates over a typical epoch (2k+ chunks).
+        // Stronger λ (0.03–0.05) shifts rates faster but kills firing
+        // on the short-corpus CPU regression path; the right value
+        // for production is corpus-dependent and exposed on the
+        // network for callers to override.
         Self {
             target: 0.1,
             lambda: 0.01,
@@ -888,24 +889,24 @@ impl MultiLayerGatedSnn {
             }
         }
 
-        // Sprint 32 spike-rate l2 regularization. Push b_h toward
-        // settings that produce a target firing rate. Decoupled from
-        // the surrogate path on purpose — prevents the runaway
-        // membrane integration observed in Sprint 31 (peaks > 30 k)
-        // even when the surrogate is saturated.
+        // Sprint 33 per-neuron spike-rate l2 regularization. Each
+        // neuron gets a correction proportional to its own firing rate
+        // vs. the target — a per-layer scalar correction (Sprint 32)
+        // got absorbed by Adam's moment normalization because all
+        // neurons of the layer were nudged identically. Per-neuron
+        // gives the optimizer a usable signal: over-firing neurons
+        // get pushed down, silent ones get pushed up, the layer-mean
+        // can stay where the CE gradient wants it.
         let RateReg { target, lambda } = self.rate_reg;
         if lambda > 0.0 && t_steps > 0 {
+            let inv_t = 1.0 / t_steps as f32;
             for (l, layer_cache) in cache.layers.iter().enumerate() {
                 let n_h = self.layers[l].n_hidden;
-                let total = (t_steps * n_h) as f32;
-                if total == 0.0 {
-                    continue;
-                }
-                let count: f32 = layer_cache.h_spike.iter().flatten().copied().sum();
-                let rate = count / total;
-                let correction = 2.0 * lambda * (rate - target);
-                for bh in &mut grads.layers[l].b_h {
-                    *bh += correction;
+                for i in 0..n_h {
+                    let rate_i: f32 =
+                        layer_cache.h_spike.iter().map(|row| row[i]).sum::<f32>() * inv_t;
+                    let correction = 2.0 * lambda * (rate_i - target);
+                    grads.layers[l].b_h[i] += correction;
                 }
             }
         }
