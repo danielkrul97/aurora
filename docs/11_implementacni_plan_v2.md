@@ -240,7 +240,48 @@ Per-layer scalar correction se v Adamu chová jako *layer-wide bias decay* (vše
 
 ---
 
-## Sprint 35+ — Pokračování
+## Sprint 35 — SDSA modul (CPU) ✓ DONE (modul, integrace = Sprint 36)
+
+**Cíl:** Implementovat Spike-Driven Self-Attention (Yao et al. 2023, arXiv:2307.01694) jako stand-alone modul s ověřenou matematikou. Replace softmax+matmul over Q/K/V se linear attention nad binary spike Q/K/V — fits Aurora's stateful-between-chunks design (attn accumulator carry like `h_v_after`).
+
+**Hotovo:**
+
+1. **`src/sdsa.rs`** — `SdsaCell { layer_norm, w_q, w_k, w_v, spike_fn }`. Forward + backward:
+   ```text
+   h_norm     = LayerNorm(h_spike)
+   Q          = step(W_q · h_norm − θ)
+   K          = step(W_k · h_norm − θ)
+   V          = step(W_v · h_norm − θ)
+   attn_t     = attn_{t−1} + K_t ⊙ V_t           ← linear, not quadratic
+   sdsa_out_t = Q_t ⊙ attn_t
+   y_t        = h_spike_t + sdsa_out_t           ← residual
+   ```
+   - `SdsaCache` ukládá `attn_states` per timestep + `final_attn_state` pro carry mezi chunky.
+   - `SdsaGrads` + `SdsaAdam` připraveny pro Adam step.
+
+2. **Reuse Sprintu 27 building blocks:** `LayerNorm`, `LinearProj` z `src/attention.rs`. Žádná duplikace kódu.
+
+3. **`tests/sdsa_smoke.rs`** — 4 testy:
+   - forward dává finite output, attn_state monotonně neklesá (K⊙V ≥ 0)
+   - backward dává finite gradients
+   - attn_state správně carry-on mezi sekvenčními voláními
+   - když `Q == 0` (forced via `w_q.fill(0)`), `y == h_spike` exactly (residual fallback)
+
+**Záměrně neudělané v Sprintu 35** (Sprint 36 priorita):
+- Wiring do `MultiLayerGatedSnn::forward_lm_tokens_stateful` + `backward_lm_tokens_into` (vyžaduje úpravu `GatedState` o `attn_state` field, hoisting logits computation out of t-loop, dense W_out matvec když SDSA on).
+- Adam coupling pro SDSA params (gradient propagace už hotová, jen nepřipojeno k optimizeru).
+- Checkpoint format v3 s SDSA params.
+- GPU port (Sprint 37+ — vyžaduje 4 nové kernely: linearize attn, residual add, sdsa backward, plus existing layer_norm/linear pre-existing forward kernels).
+
+**Pozn. ke "spike forward + surrogate backward":** SDSA forward používá heaviside (step) pro binarizaci Q/K/V. Backward používá fast-sigmoid surrogate. Z principu surrogate-gradient SNN tréninku **analytical gradient ≠ true derivative** — finite-difference test by selhal. Testy proto verifikují konzistenci (finite outputs, monotone accumulator, residual fallback) místo strict numerical match.
+
+**Reálný cíl po integraci:**
+
+SpikGPT (RWKV-style spiking, 46M params) hits BPC 1.26 na enwik8. Aurora s SDSA + recurrent gated cell + 1024 hidden by realistic mohlo dosáhnout 1.30–1.40 BPB v overnight běhu. To je jediná architektura která může citlivě posunout BPB plato; všechny ostatní fixy (bod 30–34) byly inkrementální.
+
+---
+
+## Sprint 36+ — Pokračování
 
 ---
 

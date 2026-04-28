@@ -22,6 +22,7 @@ pub mod neuron;
 pub mod optimizer;
 pub mod readout;
 pub mod scheduler;
+pub mod sdsa;
 pub mod snn_dense;
 pub mod snn_gated;
 pub mod snn_gated_multi;
