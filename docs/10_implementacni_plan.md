@@ -292,20 +292,61 @@
 
 ---
 
-## Sprint 10 — Decision point: scale, hybrid, nebo efektivita
+## Sprint 10 — Char-level language model (cesta k LLM)
+
+**Sprint 9 výsledek:** Seq-MNIST 71.8 % s Adamem (vs 37 % SGD). Recurrence funkční, vanilla baseline na úrovni literatury. Per Sprint 9/10 decision point + dlouhodobý cíl projektu (CLAUDE.md: "custom LLM") **volíme větev A: char-level LM** — první konkrétní krok od MNIST-style klasifikace ke generativnímu modelu nad text.
+
+**Cíl:** Postavit byte-level LM trained next-byte prediction na recurrent SNN. Měřit bits-per-byte (BPB) jako standardní metric. Validovat, že stack vůbec dokáže reduce BPB pod uniform random (8.0).
+
+**Princip plánování:**
+- **Byte-level (256 vocab), žádný tokenizer.** Eliminuje vocabulary engineering, výsledky comparable s canonical char-RNN benchmarks.
+- **Non-spiking lineární output.** SNN LM literatura (Lee 2020) standardně používá `logits = W_out @ h_spike + b_o` bez output spike fn — output spikes by byly noisy sampling z true distribution. Forward přes hidden zůstává spiking.
+- **Per-step cross-entropy loss + truncated BPTT.** Train na chunks (default 64 bytes), full per-step gradient, žádná state persistence mezi chunks pro train (zjednodušuje implementaci).
+- **State persistence pro inference.** `step_lm()` API drží `SnnState` přes volání pro autoregressive sampling.
+
+**Deliverables:**
+- `src/text_io.rs` — byte-level utility: `load_corpus`, `one_hot`, `sample_byte` s temperature, `bits_per_byte`. ~70 LOC.
+- `RecurrentSurrogateSnn` rozšíření (~210 LOC navíc):
+  - `LmCache { h_v_pre, h_v_after, h_spike, logits }` (logits per timestep, ne spike counts).
+  - `forward_lm(input_seq) -> LmCache` — non-spiking output projection.
+  - `backward_lm(cache, input, targets) -> nats` — per-step CE loss s gradient flow přes hidden surrogate + W_rec.
+  - `SnnState { h_v_after, o_v_after, h_spike }` + `fresh_state()`.
+  - `step_lm(input, &mut state) -> logits` — streaming inference pro generaci.
+  - `step(input, &mut state)` — alternativa pro classification streaming.
+- `tests/char_lm_smoke.rs` — predikovatelný 8-byte cycle × 64 = 512 bytes corpus. Cíl: BPB < 4.0 (uniform 8.0). **Naměřeno: 1.35 BPB za 6 epoch.**
+- `examples/char_lm.rs` — full pipeline na uživatelem-poskytnutý corpus (default `data/tiny.txt`). 90/10 train/val split, per-epoch sample generation s temperature, pretty box output. Hint pro tiny-shakespeare download.
+
+**Exit kritérium:**
+- ✅ Smoke test BPB < 4.0 — naměřeno **1.35** v 6 epoch.
+- 🟡 Tiny-shakespeare BPB ≤ 3.0 (canonical char-RNN s LSTM dosahuje 1.5; vanilla recurrent SNN 2.5-3.5 je realistický cíl) — k ověření uživatelem.
+
+**Co Sprint 10 záměrně NEŘEŠÍ:**
+- LSTM-style gating (Lee 2020) — pokud BPB nad 3.0, Sprint 11 add-on.
+- Stateful BPTT přes chunk boundaries (carry hidden state s `detach`) — možné Sprint 11 zlepšení pro long-range dependencies.
+- Mini-batching — single-sample forward/backward, scaling až bude potřeba.
+- Sub-byte / BPE tokenization — kompromituje "language-agnostic" výhodu byte-level. Ne na agendě.
+
+**Otevřené otázky:**
+- Reset hidden state mezi chunks vs. carry-with-detach. Aktuálně reset (jednodušší). Carry by zachytil multi-chunk kontext, ale BPTT zůstává truncated na chunk length. Lee 2020 carry-with-detach.
+- Output decay vs. žádné decay. Aktuálně žádné (čistá projekce). Decay by hrál roli jen pokud loss není per-step.
+- Generation determinism: temperature 0.0 = greedy, ale recurrent SNN má spike randomness ze hidden — generation není deterministická i při T=0.
+
+---
+
+## Sprint 11 — Decision point: scale, gated LIF, hybrid, nebo eficience
 
 **Vstupy do rozhodnutí:**
-- Sprint 9 Seq-MNIST výsledek
-- Profilace: kde se tráví čas, paměť per neuron, kolik neuronů můžeme uživit
-- Realistické zhodnocení: jaká je cesta od Seq-MNIST k char-level LM
+- Sprint 10 tiny-shakespeare BPB
+- Profilace: kde se tráví čas
+- Generated samples quality: jsou tam slovní fragmenty? Coherence v rámci řádky?
 
 **Možné větve:**
-- **A: Char-level LM.** Vlastní tokenizer (byte-level), tiny corpus (~1 MB Wikipedia), recurrent SNN learns next-char prediction. První signál, jestli SNN umí language modeling.
-- **B: Hybrid surrogate→STDP.** Aurora má teď konkrétně: backbone trained surrogate, fine-tune online STDP na new classes. Test biological plausibility "two-phase learning" hypotézy.
-- **C: Permuted Seq-MNIST + Copy task.** Tvrdší recurrence benchmarks. Validate před scale-up.
-- **D: Efektivita.** Rayon batch BPTT, GPU port (cust crate), Adam optimizer.
+- **A: Větší corpus + delší trénink.** Scale-up na ~10 MB textu, hidden 512+, multi-day trénink. Test scaling laws na SNN.
+- **B: LSTM-gated LIF.** Forget gate adaptuje membrane decay per-neuron. Lee 2020 dosahuje s tímto MNIST 95 %, char-LM 1.5 BPB.
+- **C: Hybrid surrogate→STDP.** Pretrained char-LM, fine-tune lokální plasticitou na nová doména. Biological plausibility experiment.
+- **D: Efektivita.** Mini-batching (rayon přes batch), GPU port, Adam state-saving pro resume training.
 
-**Toto rozhodnutí padne až po Sprintu 9, ne dřív.**
+**Toto rozhodnutí padne až po Sprintu 10, ne dřív.**
 
 ---
 

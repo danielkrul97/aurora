@@ -18,6 +18,8 @@ neuromodulace), žádný backprop.
 - Per-neuron modulátory pro per-output reward attribution
 - Surrogate gradient SNN s hand-coded BPTT (alternativní learning path k STDP)
 - Recurrent surrogate SNN s W_rec hidden→hidden + gradient clipping pro Sequential MNIST
+- Adam optimizer reusable přes oba surrogate stacks
+- Byte-level char-level LM (next-byte prediction, BPB metric, autoregressive generation)
 
 ## Spuštění
 
@@ -29,6 +31,7 @@ cargo run --release --example mnist_train     # supervised R-STDP training (Spri
 cargo run --release --example mnist_eval      # accuracy na test setu
 cargo run --release --example mnist_surrogate # surrogate-gradient BPTT (Sprint 8)
 cargo run --release --example seq_mnist        # recurrent surrogate, Sequential MNIST (Sprint 9)
+cargo run --release --example char_lm -- data/tiny.txt  # byte-level char LM (Sprint 10)
 ```
 
 ## Dokumentace
