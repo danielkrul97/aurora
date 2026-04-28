@@ -23,5 +23,6 @@ pub mod snn_recurrent;
 pub mod stdp;
 pub mod surrogate;
 pub mod synapse;
+pub mod text_io;
 pub mod topology;
 pub mod types;
