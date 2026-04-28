@@ -11,8 +11,9 @@
 
 use aurora::eligibility::EligibilityParams;
 use aurora::encoding::encode_image_rate;
+use aurora::homeostasis::{HomeoParams, Homeostasis};
 use aurora::network::Network;
-use aurora::neuromodulator::{Modulator, ModulatorParams};
+use aurora::neuromodulator::ModulatorParams;
 use aurora::readout::predict_class;
 use aurora::stdp::StdpParams;
 use aurora::topology::{add_lateral_inhibition, build_feedforward};
@@ -70,6 +71,22 @@ fn build_wta_net(rng: &mut impl Rng) -> (Network, Vec<NeuronId>, Vec<NeuronId>) 
         build_feedforward(&[N_INPUTS, N_HIDDEN, N_CLASSES], (0.003, 0.008), 0.001, rng);
     add_lateral_inhibition(&mut net, &layers[1], 0.050, 0.001);
     add_lateral_inhibition(&mut net, &layers[2], 0.150, 0.001);
+    let homeo_params = HomeoParams {
+        tau: 1.0,
+        target_rate: 5.0,
+        eta: 0.005,
+    };
+    for &h in &layers[1] {
+        net.neurons[h.0].enable_homeostasis(Homeostasis::new(homeo_params));
+    }
+    let mod_params = ModulatorParams {
+        decay_tau: 0.100,
+        baseline: 0.0,
+    };
+    net.modulator = Some(aurora::neuromodulator::Modulator::new(mod_params));
+    for &out in &layers[2] {
+        net.enable_neuron_modulator(out, mod_params);
+    }
     net.stdp_params = StdpParams {
         a_plus: 0.01,
         a_minus: 0.0,
@@ -80,10 +97,6 @@ fn build_wta_net(rng: &mut impl Rng) -> (Network, Vec<NeuronId>, Vec<NeuronId>) 
         tau: 0.200,
         learning_rate: 1.0,
     });
-    net.modulator = Some(Modulator::new(ModulatorParams {
-        decay_tau: 0.100,
-        baseline: 0.0,
-    }));
     net.weight_clamp = Some((0.0, 0.025));
     let inputs = layers[0].clone();
     let outputs = layers[2].clone();
@@ -152,6 +165,7 @@ fn wta_pipeline_smoke() {
             let img = make_sample(class, &mut rng);
             let _ = present_sample(&mut net, &img, &inputs, Some((&outputs, class)), &mut rng);
             net.reward(1.0);
+            net.reward_neuron(outputs[class], 1.0);
             settle(&mut net);
         }
     }

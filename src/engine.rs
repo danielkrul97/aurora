@@ -154,7 +154,7 @@ impl EventNetwork {
         for k in 0..n_in {
             let syn_idx = self.incoming[i][k];
             let dw = self.synapses[syn_idx].on_post_spike(spike.t, &self.stdp_params);
-            self.synapses[syn_idx].weight += dw;
+            self.synapses[syn_idx].apply_stdp_delta(dw, false);
         }
 
         let n_out = self.outgoing[i].len();
@@ -162,7 +162,7 @@ impl EventNetwork {
             let syn_idx = self.outgoing[i][k];
             let syn = &mut self.synapses[syn_idx];
             let dw = syn.on_pre_spike(spike.t, &self.stdp_params);
-            syn.weight += dw;
+            syn.apply_stdp_delta(dw, false);
             let deliver_at = spike.t + syn.delay;
             let target_neuron = syn.post_neuron;
             let target_dendrite = syn.post_dendrite;

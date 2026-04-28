@@ -1,13 +1,14 @@
-//! Rate coding: pixel intensity in [0,1] maps to a Poisson spike train
-//! whose mean rate is `intensity · max_rate_hz`. Output spike times are
-//! relative to the start of the encoding window.
+//! Rate coding helpers.
+//!
+//! `encode_image_rate` returns Poisson spike-time lists per pixel for the
+//! event-driven engine. `rate_encode_bernoulli` returns a per-timestep
+//! Bernoulli mask for the surrogate-gradient SNN — different output shape,
+//! kept separate on purpose.
 
 use rand::Rng;
 
 use crate::types::Time;
 
-/// Generate Poisson spike times in `[0, duration)` with mean rate `rate_hz`.
-/// Returns an empty vec if `rate_hz <= 0`.
 pub fn poisson_spike_train(rate_hz: f64, duration: Time, rng: &mut impl Rng) -> Vec<Time> {
     let mut out = Vec::new();
     if rate_hz <= 0.0 {
@@ -25,8 +26,6 @@ pub fn poisson_spike_train(rate_hz: f64, duration: Time, rng: &mut impl Rng) -> 
     out
 }
 
-/// Per-pixel Poisson encoding. Returns `Vec<Vec<Time>>` indexed by pixel,
-/// where each inner vec is the spike times for that input neuron.
 pub fn encode_image_rate(
     image: &[f64],
     duration: Time,
@@ -36,5 +35,27 @@ pub fn encode_image_rate(
     image
         .iter()
         .map(|&p| poisson_spike_train(p.clamp(0.0, 1.0) * max_rate_hz, duration, rng))
+        .collect()
+}
+
+pub fn rate_encode_bernoulli(
+    image: &[f32],
+    t_steps: usize,
+    max_rate: f32,
+    rng: &mut impl Rng,
+) -> Vec<Vec<f32>> {
+    (0..t_steps)
+        .map(|_| {
+            image
+                .iter()
+                .map(|&p| {
+                    if rng.random::<f32>() < p * max_rate {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        })
         .collect()
 }

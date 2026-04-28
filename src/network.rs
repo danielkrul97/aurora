@@ -1,9 +1,8 @@
-//! Discrete-time network: pending synaptic deliveries inject charge into
-//! their target compartment, neurons tick, STDP updates fire on every spike.
+//! Discrete-time network.
 //!
-//! Two-factor mode (default): STDP delta is applied directly to `weight`.
-//! Three-factor mode (when both `eligibility_params` and `modulator` are
-//! `Some`): STDP delta accumulates in `synapse.eligibility`; per-step,
+//! Two-factor mode: STDP delta applies directly to `weight`.
+//! Three-factor mode (`eligibility_params` + a modulator are `Some`):
+//! STDP accumulates into `synapse.eligibility`; each step
 //! `weight += η · M · e · dt` and `e` decays exponentially.
 
 use rayon::prelude::*;
@@ -35,22 +34,21 @@ pub struct Network {
     pub stdp_params: StdpParams,
     pub eligibility_params: Option<EligibilityParams>,
     pub modulator: Option<Modulator>,
-    /// When true, dendrite-targeted synapses route post-STDP through the
-    /// dendrite's own spikes (not the soma). Breaks the credit-assignment
-    /// symmetry that otherwise blocks R-STDP from learning XOR-like tasks.
+    /// When set for a post-neuron, synapses targeting it commit weight
+    /// against this modulator instead of the global one — per-output
+    /// reward attribution for R-STDP credit assignment.
+    pub per_neuron_modulators: Vec<Option<Modulator>>,
+    /// Routes post-STDP through dendrite spikes (not soma). Breaks the
+    /// credit-assignment symmetry that blocks R-STDP from XOR-like tasks.
     pub dendrite_local_stdp: bool,
-    /// Inclusive `(min, max)` clamp applied to plastic synapse weights
-    /// after every commit. Stops Hebbian runaway. Non-plastic synapses
-    /// (e.g., lateral inhibition with hand-set strong weights) are exempt.
+    /// Inclusive `(min, max)` clamp on plastic weights after every commit.
+    /// Non-plastic synapses (e.g., lateral inhibition) are exempt.
     pub weight_clamp: Option<(Weight, Weight)>,
     pub now: Time,
     pending: Vec<Pending>,
     outgoing: Vec<Vec<usize>>,
     incoming: Vec<Vec<usize>>,
     external_input: Vec<Volts>,
-    /// Time the eligibility values were last brought up-to-date. Steps
-    /// where modulator is silent and no STDP fires don't touch synapses;
-    /// the deferred decay is applied lazily on the next flush.
     t_last_eligibility_flush: Time,
 }
 
@@ -66,6 +64,7 @@ impl Network {
         self.outgoing.push(Vec::new());
         self.incoming.push(Vec::new());
         self.external_input.push(0.0);
+        self.per_neuron_modulators.push(None);
         id
     }
 
@@ -117,15 +116,33 @@ impl Network {
     }
 
     /// # Panics
+    /// Panics if `neuron` is out of bounds.
+    pub fn enable_neuron_modulator(
+        &mut self,
+        neuron: NeuronId,
+        params: crate::neuromodulator::ModulatorParams,
+    ) {
+        self.per_neuron_modulators[neuron.0] = Some(Modulator::new(params));
+    }
+
+    /// No-op when `neuron` has no per-neuron modulator installed.
+    ///
+    /// # Panics
+    /// Panics if `neuron` is out of bounds.
+    pub fn reward_neuron(&mut self, neuron: NeuronId, amount: f64) {
+        if let Some(ref mut m) = self.per_neuron_modulators[neuron.0] {
+            m.reward(self.now, amount);
+        }
+    }
+
+    /// # Panics
     /// Panics if `syn` is out of bounds.
     pub fn set_plastic(&mut self, syn: SynapseId, plastic: bool) {
         self.synapses[syn.0].plastic = plastic;
     }
 
-    /// Bring all synapse `eligibility` values up to `self.now` so that
-    /// readers (tests, diagnostics) see the value the simulation would
-    /// produce after the lazy-decay batch fires. Cheap no-op if already
-    /// current. Three-factor mode only; otherwise does nothing.
+    /// Bring eligibility values up to `self.now` for diagnostic reads —
+    /// the lazy-decay batch is otherwise deferred to the next active step.
     pub fn flush_eligibility_to_now(&mut self) {
         if let Some(e_params) = self.eligibility_params {
             self.flush_eligibility(e_params.tau);
@@ -161,6 +178,9 @@ impl Network {
         if let Some(ref mut m) = self.modulator {
             m.evolve_to(self.now);
         }
+        for m in self.per_neuron_modulators.iter_mut().flatten() {
+            m.evolve_to(self.now);
+        }
 
         let now = self.now;
         let mut write = 0;
@@ -190,7 +210,9 @@ impl Network {
             }
         }
 
-        let three_factor = self.eligibility_params.is_some() && self.modulator.is_some();
+        let any_per_neuron_modulator = self.per_neuron_modulators.iter().any(Option::is_some);
+        let three_factor = self.eligibility_params.is_some()
+            && (self.modulator.is_some() || any_per_neuron_modulator);
         let dendrite_local = self.dendrite_local_stdp;
         let stdp_modifies_eligibility =
             three_factor && (!spikes.is_empty() || (dendrite_local && !dendrite_spikes.is_empty()));
@@ -237,11 +259,41 @@ impl Network {
             }
         }
 
-        if let (Some(e_params), Some(m)) = (self.eligibility_params, self.modulator) {
-            let m_active = m.value.abs() > M_EPSILON;
-            let weight_factor = e_params.learning_rate * m.value * dt;
-            let per_step_decay = (-dt / e_params.tau).exp();
+        if let Some(e_params) = self.eligibility_params {
+            if !three_factor {
+                return spikes;
+            }
+            let global_m = self.modulator.as_ref().map(|m| m.value);
+            let per_neuron = &self.per_neuron_modulators[..];
+            let m_for = |post_idx: usize| -> f64 {
+                per_neuron[post_idx]
+                    .as_ref()
+                    .map(|m| m.value)
+                    .or(global_m)
+                    .unwrap_or(0.0)
+            };
+            let global_active = global_m.is_some_and(|v| v.abs() > M_EPSILON);
+            let any_per_neuron_active = per_neuron
+                .iter()
+                .any(|slot| slot.as_ref().is_some_and(|m| m.value.abs() > M_EPSILON));
+            let m_active = global_active || any_per_neuron_active;
 
+            if !stdp_modifies_eligibility && !m_active {
+                return spikes;
+            }
+
+            let lr = e_params.learning_rate;
+            let per_step_decay = (-dt / e_params.tau).exp();
+            let flush_factor = if stdp_modifies_eligibility {
+                1.0
+            } else {
+                let dt_stale = self.now - self.t_last_eligibility_flush;
+                if dt_stale > 0.0 {
+                    (-dt_stale / e_params.tau).exp()
+                } else {
+                    1.0
+                }
+            };
             let par = self.synapses.len() >= PAR_THRESHOLD;
             let clamp = self.weight_clamp;
             let apply_clamp = |w: &mut Weight, plastic: bool| {
@@ -251,47 +303,30 @@ impl Network {
                     }
                 }
             };
-            if stdp_modifies_eligibility {
-                if m_active {
-                    let f = |syn: &mut Synapse| {
-                        syn.weight += weight_factor * syn.eligibility;
-                        apply_clamp(&mut syn.weight, syn.plastic);
-                        syn.eligibility *= per_step_decay;
-                    };
-                    if par {
-                        self.synapses.par_iter_mut().for_each(f);
-                    } else {
-                        self.synapses.iter_mut().for_each(f);
-                    }
-                } else {
-                    let f = |syn: &mut Synapse| syn.eligibility *= per_step_decay;
-                    if par {
-                        self.synapses.par_iter_mut().for_each(f);
-                    } else {
-                        self.synapses.iter_mut().for_each(f);
-                    }
-                }
-                self.t_last_eligibility_flush = self.now + dt;
-            } else if m_active {
-                let dt_stale = self.now - self.t_last_eligibility_flush;
-                let flush_factor = if dt_stale > 0.0 {
-                    (-dt_stale / e_params.tau).exp()
-                } else {
-                    1.0
-                };
-                let f = |syn: &mut Synapse| {
+            if m_active {
+                let commit = |syn: &mut Synapse| {
                     syn.eligibility *= flush_factor;
-                    syn.weight += weight_factor * syn.eligibility;
-                    apply_clamp(&mut syn.weight, syn.plastic);
+                    let m_val = m_for(syn.post_neuron.0);
+                    if m_val.abs() > M_EPSILON {
+                        syn.weight += lr * m_val * dt * syn.eligibility;
+                        apply_clamp(&mut syn.weight, syn.plastic);
+                    }
                     syn.eligibility *= per_step_decay;
                 };
                 if par {
-                    self.synapses.par_iter_mut().for_each(f);
+                    self.synapses.par_iter_mut().for_each(commit);
                 } else {
-                    self.synapses.iter_mut().for_each(f);
+                    self.synapses.iter_mut().for_each(commit);
                 }
-                self.t_last_eligibility_flush = self.now + dt;
+            } else {
+                let decay_only = |syn: &mut Synapse| syn.eligibility *= per_step_decay;
+                if par {
+                    self.synapses.par_iter_mut().for_each(decay_only);
+                } else {
+                    self.synapses.iter_mut().for_each(decay_only);
+                }
             }
+            self.t_last_eligibility_flush = self.now + dt;
         }
 
         spikes

@@ -15,7 +15,7 @@ use aurora::encoding::encode_image_rate;
 use aurora::mnist;
 use aurora::network::Network;
 use aurora::readout::predict_class;
-use aurora::topology::build_feedforward;
+use aurora::topology::{add_lateral_inhibition, build_feedforward};
 use aurora::types::{NeuronId, Spike};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -55,6 +55,8 @@ fn main() -> ExitCode {
         0.001,
         &mut rng,
     );
+    add_lateral_inhibition(&mut net, &layers[1], 0.040, 0.001);
+    add_lateral_inhibition(&mut net, &layers[2], 0.150, 0.001);
     if let Err(e) = load_weights(&mut net, "data/aurora_mnist_weights.bin") {
         eprintln!("failed to load weights: {e}");
         eprintln!("run `cargo run --release --example mnist_train` first");
@@ -165,21 +167,36 @@ fn mean_weight(net: &Network, target_layer: &[NeuronId]) -> f64 {
 fn load_weights<P: AsRef<Path>>(net: &mut Network, path: P) -> std::io::Result<()> {
     let mut r = BufReader::new(File::open(path)?);
     let mut buf4 = [0u8; 4];
+    let mut buf8 = [0u8; 8];
     r.read_exact(&mut buf4)?;
-    let count = u32::from_le_bytes(buf4) as usize;
-    if count != net.synapses.len() {
+    let syn_count = u32::from_le_bytes(buf4) as usize;
+    if syn_count != net.synapses.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "weight file has {count} synapses, network expects {}",
+                "weight file has {syn_count} synapses, network expects {}",
                 net.synapses.len()
             ),
         ));
     }
-    let mut buf8 = [0u8; 8];
     for s in &mut net.synapses {
         r.read_exact(&mut buf8)?;
         s.weight = f64::from_le_bytes(buf8);
+    }
+    r.read_exact(&mut buf4)?;
+    let neuron_count = u32::from_le_bytes(buf4) as usize;
+    if neuron_count != net.neurons.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "weight file has {neuron_count} neurons, network expects {}",
+                net.neurons.len()
+            ),
+        ));
+    }
+    for n in &mut net.neurons {
+        r.read_exact(&mut buf8)?;
+        n.soma.params.v_threshold = f64::from_le_bytes(buf8);
     }
     Ok(())
 }

@@ -15,6 +15,9 @@ neuromodulace), žádný backprop.
 - MNIST pipeline (encoding, topology builder, readout, IDX loader, train/eval examples)
 - WTA primitivy: weight clamp, all-to-all lateral inhibition helper, plastic flag per synapse
 - Lazy eligibility commit + rayon paralelizace pro discrete `Network::step`
+- Per-neuron modulátory pro per-output reward attribution
+- Surrogate gradient SNN s hand-coded BPTT (alternativní learning path k STDP)
+- Recurrent surrogate SNN s W_rec hidden→hidden + gradient clipping pro Sequential MNIST
 
 ## Spuštění
 
@@ -22,8 +25,10 @@ neuromodulace), žádný backprop.
 cargo test                                    # všech 14 integračních testů
 cargo bench --bench sparsity_scaling          # event vs. discrete throughput
 bash scripts/get_mnist.sh                     # stáhne MNIST do data/mnist/
-cargo run --release --example mnist_train     # supervised R-STDP training
+cargo run --release --example mnist_train     # supervised R-STDP training (Sprints 5-7)
 cargo run --release --example mnist_eval      # accuracy na test setu
+cargo run --release --example mnist_surrogate # surrogate-gradient BPTT (Sprint 8)
+cargo run --release --example seq_mnist        # recurrent surrogate, Sequential MNIST (Sprint 9)
 ```
 
 ## Dokumentace

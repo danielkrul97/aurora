@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use aurora::eligibility::EligibilityParams;
 use aurora::encoding::encode_image_rate;
+use aurora::homeostasis::{HomeoParams, Homeostasis};
 use aurora::mnist;
 use aurora::network::Network;
 use aurora::neuromodulator::{Modulator, ModulatorParams};
@@ -39,7 +40,7 @@ const TEACHER_PULSE: f64 = 0.040;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let n_train: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(500);
-    let n_epochs: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let n_epochs: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     let train_images = match mnist::load_images("data/mnist/train-images-idx3-ubyte") {
         Ok(v) => v,
@@ -71,6 +72,22 @@ fn main() -> ExitCode {
     );
     add_lateral_inhibition(&mut net, &layers[1], 0.040, 0.001);
     add_lateral_inhibition(&mut net, &layers[2], 0.150, 0.001);
+    let homeo_params = HomeoParams {
+        tau: 1.0,
+        target_rate: 5.0,
+        eta: 0.005,
+    };
+    for &h in &layers[1] {
+        net.neurons[h.0].enable_homeostasis(Homeostasis::new(homeo_params));
+    }
+    let mod_params = ModulatorParams {
+        decay_tau: 0.100,
+        baseline: 0.0,
+    };
+    net.modulator = Some(Modulator::new(mod_params));
+    for &out in &layers[2] {
+        net.enable_neuron_modulator(out, mod_params);
+    }
     net.stdp_params = StdpParams {
         a_plus: 0.01,
         a_minus: 0.0,
@@ -81,10 +98,6 @@ fn main() -> ExitCode {
         tau: 0.200,
         learning_rate: 0.3,
     });
-    net.modulator = Some(Modulator::new(ModulatorParams {
-        decay_tau: 0.100,
-        baseline: 0.0,
-    }));
     net.weight_clamp = Some((0.0, 0.020));
 
     let inputs = layers[0].clone();
@@ -99,6 +112,7 @@ fn main() -> ExitCode {
             let label = train_labels[i] as usize;
             present_sample(&mut net, img, &inputs, Some((&outputs, label)), &mut rng);
             net.reward(1.0);
+            net.reward_neuron(outputs[label], 1.0);
             settle(&mut net);
             if k % 100 == 0 {
                 println!(
@@ -160,10 +174,15 @@ fn settle(net: &mut Network) {
 
 fn save_weights<P: AsRef<Path>>(net: &Network, path: P) -> std::io::Result<()> {
     let mut w = BufWriter::new(File::create(path)?);
-    let count = net.synapses.len() as u32;
-    w.write_all(&count.to_le_bytes())?;
+    let syn_count = net.synapses.len() as u32;
+    w.write_all(&syn_count.to_le_bytes())?;
     for s in &net.synapses {
         w.write_all(&s.weight.to_le_bytes())?;
+    }
+    let neuron_count = net.neurons.len() as u32;
+    w.write_all(&neuron_count.to_le_bytes())?;
+    for n in &net.neurons {
+        w.write_all(&n.soma.params.v_threshold.to_le_bytes())?;
     }
     Ok(())
 }
