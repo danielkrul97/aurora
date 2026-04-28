@@ -24,5 +24,8 @@ target
 # MNIST dataset + cached weights (download via scripts/get_mnist.sh)
 data/
 
+# Training run artifacts (text logs + JSONL metrics)
+logs/
+
 # Claude Code local session state
 .claude/
