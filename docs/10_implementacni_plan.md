@@ -175,21 +175,137 @@
 
 ---
 
-## Sprint 7 — Vyhodnocení a další směr (původní Sprint 6, decision point)
+## Sprint 7 — Homeostáza + per-output kredit (druhý pokus o MNIST)
 
-**Cíl:** Rozhodnout, kam dál. Tady končí „základní výzkum" a začíná buď scale-up k LLM, nebo iterace na architektuře.
+**Cíl:** Odstranit dvě konkrétní příčiny, proč Sprint 6 WTA pipeline dává accuracy ~chance: (1) hidden vrstva nediverzifikuje features, (2) globální modulátor neumí rozlišit kreditem mezi outputy. Pokud po obojím nedosáhneme ≥50 % MNIST, Sprint 8 = pivot na surrogate gradients.
+
+**Princip plánování:**
+- **Existing infrastruktura first.** Homeostasis modul je hotový od Sprintu 2 a nikdy nebyl integrován do training pipeline — to je nejlevnější high-impact akce.
+- **Per-output reward attribution je strukturální fix R-STDP.** Per Frémaux & Gerstner 2016, jediný globální modulátor strukturálně limituje, co se síť může naučit. Více modulátorů s neuron-scope řeší credit-assignment cleanly.
+- **Měřit výsledky průběžně.** Po každé z dvou změn nezávisle změřit MNIST accuracy, aby bylo jasné, která změna kolik přinesla. Žádné slepé tunování všeho najednou.
+
+**Deliverables:**
+- **A: Integrace homeostázy do MNIST hidden** (~50 LOC):
+  - V `examples/mnist_train.rs` po `build_feedforward` zavolat `enable_homeostasis(Homeostasis::new(HomeoParams { tau: 1.0, target_rate: 5.0, eta: 0.005 }))` na každém hidden neuronu.
+  - V `mnist_eval.rs` stejný setup (homeostasis vyžaduje aktivní state pro fungování — i když threshold zafrozne, neurony musí mít stejný v_threshold start).
+  - Volitelně: dump per-hidden-neuron firing rate po tréninku do diagnostiky, aby šlo zkontrolovat, že se rates rozdělují (ne všechny na 0 nebo všechny na max).
+  - **Hypotéza:** Po homeostáze každý hidden neuron firuje ~5 Hz mean. Threshold se adaptuje tak, že každý hidden má svou „specializaci" — neurony co fires moc snižují svůj příspěvek (raised threshold), neurony co málo zvyšují citlivost. Bez competition signal (žádný teacher na hidden), specializace je inherent stochastická — nemusí být class-aligned.
+  - **Měřitelný impact:** target ≥20 % MNIST accuracy (hidden specializace kombinovaná s WTA výstupní vrstvou by měla nad chance).
+
+- **B: Per-output modulátory** (~150 LOC, structural change):
+  - `Network::modulators: Vec<Option<Modulator>>` indexed by `NeuronId`. Each modulator scopes to synapses targeting that neuron.
+  - Backward compat: pokud `modulator_for(neuron) == None`, fallback na global `self.modulator`.
+  - API: `Network::reward_neuron(neuron: NeuronId, amount: f64)` — injects do specific modulátoru.
+  - V commit loopu: pro každou synapsi look up modulátor podle `syn.post_neuron`. To přidá O(1) lookup per synapse, ale stále paralelizovatelné.
+  - V `mnist_train.rs`: `for class in 0..10 { net.add_modulator(outputs[class], ModulatorParams::default()) }`. Při tréninku class-X: `net.reward_neuron(outputs[class], 1.0)` — jen modulátor pro správný output zaktivuje, jen synapse cílící na něj komitují weight change.
+  - **Hypotéza:** S per-output rewardem každá hid→out_X cesta dostane signal jen když class X byl target. Hidden firing patterns se postupně stávají class-discriminative, protože jen `correct` cesty rostou. Ostatní zůstávají na initial weights → output_correct má dominant drive na test time.
+  - **Měřitelný impact:** target ≥50 % MNIST accuracy.
+
+- **C: Tests + benchmarks**:
+  - `tests/per_output_credit.rs` — 2-class task ověří, že synapse na correct output rostou, na wrong stagnate (ne ekvivalentně jako Sprint 6 smoke).
+  - Update `tests/classify_synthetic.rs` na full pipeline s homeostasis + per-output, asseroval ≥70 % accuracy (za chance 50 %).
+  - Update `benches/sparsity_scaling.rs` aby měřil i three-factor mode s per-output (per-synapse modulátor lookup overhead).
+
+**Exit kritérium:** Buď (a) MNIST test accuracy ≥50 % po implementaci A+B (success → Sprint 8 už dělá Diehl-Cook scale-up nebo přechází k recurrent topologii), nebo (b) MNIST stále <50 % i s A+B integrovanými → Sprint 8 = surrogate gradient pretraining. Jeden ze dvou outcomes — clear decision point bez pokračujícího band-aid tuning.
+
+**Co Sprint 7 záměrně NEŘEŠÍ:**
+- Adaptivní lateral inhibition strength. Drží se hand-tuned (Sprint 6 hodnoty).
+- Multi-population output (2+ neurons per class). Potenciálně přínosné, ale zvyšuje dimensionalitu hyperparametrů. Až po měření base impact A+B.
+- Surrogate gradients. Pokud kritérium fail → Sprint 8.
+
+**Otevřené otázky:**
+- Per-output modulátor: vlastně synapses cílící na *jakýkoli* output, nebo i hid→out spojení? Pravděpodobně oboje (cílový post je output_X). Hidden→hidden synapse (zatím žádné, ale možné v Sprintu 8+) by potřebovaly fallback na global.
+- Jak handlovat nevybrané outputy (no reward) — komitují se s M=0 (no change) nebo s mírně negativním M (decay)? Neutral default M=0; eventually možno experimentovat s -0.1 baseline.
+- Homeostasis parameters: target_rate 5 Hz vs 10 Hz vs 1 Hz. Diehl-Cook používá adaptive ~5 Hz. Budeme začínat tam.
+
+---
+
+## Sprint 8 — Surrogate gradients (Sprint 7 fail outcome)
+
+**Sprint 7 výsledek:** MNIST 7.2 % accuracy (klesá při víc epochách kvůli weight clamp saturation). Per Sprint 7 exit kritéria → **Sprint 8 = surrogate gradient pretraining**.
+
+**Cíl:** Implementovat backprop-through-time s fast-sigmoid surrogate gradient pro spike funkci. Forward pass dělá pravé Heaviside spikes (žádný change semantiky simulace), backward pass používá smooth approximation `1/(1+α|v−θ|)²` aby gradient mohl téct skrz spiking síť. Cíl: dosáhnout ≥85 % MNIST (původní Sprint 5 target).
+
+**Princip plánování:**
+- **Hand-coded BPTT, ne plný autograd framework.** Architektura `784 → H → 10` je jednoduchá, BPTT se napíše ručně přes ~150 LOC. Plný framework typu burn/candle je out-of-scope (přínos vs. risk nedává smysl pro single-architecture).
+- **Koexistence s R-STDP `Network`.** Surrogate gradient cesta je úplně oddělená od existujícího `Network` struct — vlastní `SurrogateSnn` typ s vlastní simulací. Aurora má od teď **dvě nezávislé learning paths**: lokální (STDP přes `Network`) a globální (BPTT přes `SurrogateSnn`).
+- **f32 throughout** pro paměťovou stopu — BPTT tape ukládá veškerý forward state.
+
+**Deliverables:**
+- `src/surrogate.rs` — `SpikeFn { threshold, alpha }` s `forward()` (Heaviside) a `backward()` (fast sigmoid). 30 LOC.
+- `src/snn_loss.rs` — `softmax`, `cross_entropy_with_grad` (vrací loss + dloss/dlogits), `argmax`. 30 LOC.
+- `src/snn_dense.rs` — `SurrogateSnn` (2-layer dense): `forward(input_spikes) -> ForwardCache`, `backward(cache, input, target) -> (loss, pred)`, `step_sgd(lr)`, `zero_grad()`. Hand-coded BPTT s subtraction reset (`v -= θ × stop_grad(spike)`). 250 LOC včetně matvec helpers.
+- `tests/surrogate_classify.rs` — 4×4 stripe 2-class task. **Cíl: ≥95 % test accuracy.** Měřitelný proof, že učení funguje.
+- `examples/mnist_surrogate.rs` — train+eval v jednom binary. Default 5000 train, 1000 test, 3 epochs. Per-epoch reportuje train + test accuracy. **Cíl: ≥85 % test accuracy.**
+
+**Exit kritérium:**
+- ✅ Stripe test ≥95 % accuracy (mechanism works) — naměřeno **100 %** v 1 epoše.
+- 🟡 MNIST ≥85 % test accuracy — k ověření uživatelem (`cargo run --release --example mnist_surrogate`).
+
+**Co Sprint 8 záměrně NEŘEŠÍ:**
+- Plné autograd framework s automatickým grafem operací — over-engineering pro current scope.
+- Convolutions / pooling — MNIST plně-connected je dostatečný pro demonstration.
+- GPU acceleration — Sprint 9+ pokud accuracy bude OK ale rychlost mizerná.
+- Hybrid local + surrogate — pretrain surrogate, fine-tune R-STDP — zajímavé, ale samostatný sprint.
+
+**Otevřené otázky:**
+- Adam vs SGD: SGD jednodušší, Adam by možná konvergoval rychleji. Začneme SGD; pokud konvergence je pomalá, Adam je ~50 LOC change.
+- Reset semantika: subtraction reset (`v -= θ`) vs. hard reset (`v = 0`). Subtraction má cleanší gradient (zvolen). Hard reset by potřeboval `stop_grad` přes všechno před resetem, což komplikuje BPTT.
+- Spike-count loss vs. last-step loss: aktuálně `loss = CE(softmax(Σ spike_t), label)`. Alternativa `CE(softmax(spike[T-1]))` (jen last step) — méně signál, ale možná stabilnější. Pro MNIST sum funguje dobře.
+
+---
+
+## Sprint 9 — Recurrent surrogate SNN (cesta k sekvenčnímu zpracování)
+
+**Sprint 8 výsledek:** plný MNIST 97.19 % test accuracy v 21 minutách. Surrogate gradient stack je hotový a funguje na publikované úrovni. Od decision pointu (původní Sprint 9 = explore-first vs unify-now) volíme **scale-up směrem k recurrent topologii**, protože LLM cíl bez recurrence není možný a Sequential MNIST je nejmenší krok ke char-level LM (Sprint 10+).
+
+**Cíl:** Postavit `RecurrentSurrogateSnn` s hidden→hidden recurrent connections + biases, demonstrovat funkci na pure memory testu, dosáhnout >85 % na Sequential MNIST (T=28, řádek per timestep).
+
+**Princip plánování:**
+- **Build-on-Sprint-8.** Architektura paralelní k `SurrogateSnn` (samostatný typ, sdílí `SpikeFn` + `snn_loss`), nesnaží se generalizovat — explicit two-impl strategy match aurořině přístupu (`Network` vs `EventNetwork`).
+- **Recurrent gradient flow je stable jen s clipping.** Default `clip_grads(1.0-1.5)` zařadit do training loopu — bez clippingu BPTT přes ~30+ kroků dostane nan/inf na 1 z 50 vzorků.
+- **Recurrent W initialization je delicate.** Scale `0.5/sqrt(n_hidden)` drží spectral radius pod 1, brání exponenciálnímu zesílení signálu přes čas.
+
+**Deliverables:**
+- `src/snn_recurrent.rs` (~340 LOC) — `RecurrentSurrogateSnn`:
+  - Fields: `w_in [H,I]`, `w_rec [H,H]`, `w_out [O,H]`, `b_h [H]`, `b_o [O]` + odpovídající `grad_*` buffery.
+  - `forward(input_spikes)`: per timestep `h_v_pre = h_v_after_prev * decay + W_in @ x + W_rec @ h_spike_prev + b_h`. Subtraction reset, surrogate spikes.
+  - `backward(cache, input, target)`: BPTT s tří-cestnou gradient flow do `h_v_pre[t-1]`: (1) decay carryover, (2) recurrent feedback `W_rec.T @ d_h_v_pre[t]`, (3) output-side `W_out.T @ d_o_v_pre[t-1]`.
+  - `clip_grads(max_norm)`: globální L2-norm clipping přes všech 5 parameter groups.
+  - `step_sgd(lr)`, `zero_grad()`.
+- `tests/recurrent_remember.rs` — 2-class pulse test (T=8, key 3 steps, silent 5 steps): trénink dosáhne >90 % a `‖W_rec‖_F` musí být netriviální. Functional smoke, ne pure long-memory benchmark (research-grade).
+- `examples/seq_mnist.rs` — Sequential MNIST. T=28 (jeden řádek 28 pixelů per step), n_hidden=100, gradient clipping 1.5, LR=0.002. Stejný pretty output jako `mnist_surrogate`.
+
+**Exit kritérium:**
+- ✅ Memory test ≥90 % accuracy + W_rec norm > 0.001 — naměřeno **100 % a ‖W_rec‖=1.49**.
+- 🟡 Seq-MNIST test acc ≥85 % na 5000 train / 1000 test / 3 epochs — k ověření uživatelem.
+
+**Co Sprint 9 záměrně NEŘEŠÍ:**
+- Plný 784-step Sequential MNIST (1 input neuron, T=784) — cca 28× pomalejší trénink, marginální vědecká hodnota nad row-by-row.
+- Permuted Sequential MNIST (random permutation of pixel order) — varianta která blokuje feedforward shortcuts. Pokud row-by-row uspěje a chceme tvrdší benchmark, dobrý Sprint 10 add-on.
+- Adam optimizer — SGD funguje pro Sprint 8, mělo by stačit i tady. Adam je drop-in upgrade, můžeme přidat později pokud konvergence stagnuje.
+- Hybrid surrogate→STDP fine-tune — Sprint 10+ téma.
+
+**Otevřené otázky:**
+- LSTM / GRU-like gating: snnTorch/Norse implementují LIF s explicit forget gate. Pro Sprint 9 MVP necháváme čistý LIF s recurrent lin layer; gating je iteration pokud accuracy nedostačuje.
+- Loss readout: aktuálně sum spikes přes celý T. Pro sekvenční tasks where output má smysl jen po sekvenci, last-step CE nebo sum přes posledních K steps může lépe lokalizovat gradient. Default zůstává sum-all (Sprint 8 compatible).
+
+---
+
+## Sprint 10 — Decision point: scale, hybrid, nebo efektivita
 
 **Vstupy do rozhodnutí:**
-- Výsledky MNIST (sprint 5)
-- Profilace: kde se tráví čas, paměť per neuron, energie per spike
-- Realistické zhodnocení: kolik neuronů můžeme uživit na našem HW při jaké rychlosti
+- Sprint 9 Seq-MNIST výsledek
+- Profilace: kde se tráví čas, paměť per neuron, kolik neuronů můžeme uživit
+- Realistické zhodnocení: jaká je cesta od Seq-MNIST k char-level LM
 
 **Možné větve:**
-- **A: Scale-up.** CIFAR, pak sekvenční úkoly (Sequential MNIST, copy task, language modelling na malém korpusu). Cíl: dostat se k „spiking LM" na úrovni char-RNN.
-- **B: Architektonické experimenty.** Spiking attention, recurrent topologie, multi-compartment dendrity, neuromodulační populace.
-- **C: Efektivita.** Multi-thread engine, GPU prototyp (CUDA přes `cust` crate), exploratorní port na neuromorfní HW (Loihi 2 SDK).
+- **A: Char-level LM.** Vlastní tokenizer (byte-level), tiny corpus (~1 MB Wikipedia), recurrent SNN learns next-char prediction. První signál, jestli SNN umí language modeling.
+- **B: Hybrid surrogate→STDP.** Aurora má teď konkrétně: backbone trained surrogate, fine-tune online STDP na new classes. Test biological plausibility "two-phase learning" hypotézy.
+- **C: Permuted Seq-MNIST + Copy task.** Tvrdší recurrence benchmarks. Validate před scale-up.
+- **D: Efektivita.** Rayon batch BPTT, GPU port (cust crate), Adam optimizer.
 
-**Toto rozhodnutí padne až po sprintu 5, ne dřív.** Předčasné větvení je nejčastější způsob, jak research projekt spadne.
+**Toto rozhodnutí padne až po Sprintu 9, ne dřív.**
 
 ---
 
