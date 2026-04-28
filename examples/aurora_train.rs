@@ -153,8 +153,8 @@ fn main() -> ExitCode {
         }
     };
 
-    if cli.hidden > 512 {
-        eprintln!("hidden must be ≤ 512 (Sprint 25 megakernel constraint)");
+    if cli.hidden > 1024 {
+        eprintln!("hidden must be ≤ 1024 (megakernel workgroup memory budget)");
         return ExitCode::FAILURE;
     }
 

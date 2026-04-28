@@ -91,7 +91,7 @@ fn build_active_indices(tid: u32, n: u32) {
             let idx = atomicAdd(&sh_n_active, 1u);
             sh_active_indices[idx] = c;
         }
-        c = c + 64u;
+        c = c + 256u;
     }
     workgroupBarrier();
 }
@@ -107,7 +107,7 @@ fn build_active_indices(tid: u32, n: u32) {
 // - `logits_packed`: `b * T * O + t * O + h`.
 // - `input_bytes` / `loss_seq`: `b * T + t`.
 // - `initial_h_v_after` / `initial_h_spike`: `b * N + h`.
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wgid: vec3<u32>,
@@ -135,7 +135,7 @@ fn main(
         h_v_after_packed[cache_off + hi] = init_v;
         sh_h_spike[hi] = init_s;
         sh_h_v_after[hi] = init_v;
-        hi = hi + 64u;
+        hi = hi + 256u;
     }
     workgroupBarrier();
 
@@ -175,7 +175,7 @@ fn main(
             h_spike_packed[cache_off + next_slot + h2] = s;
             h_v_after_packed[cache_off + next_slot + h2] = h_v_after_t;
 
-            h2 = h2 + 64u;
+            h2 = h2 + 256u;
         }
         workgroupBarrier();
 
@@ -184,7 +184,7 @@ fn main(
             if (h2 >= n) { break; }
             sh_h_spike[h2] = h_spike_packed[cache_off + next_slot + h2];
             sh_h_v_after[h2] = h_v_after_packed[cache_off + next_slot + h2];
-            h2 = h2 + 64u;
+            h2 = h2 + 256u;
         }
         workgroupBarrier();
 
@@ -202,7 +202,7 @@ fn main(
                 logit = logit + w_out[oi * n + c];
             }
             logits_packed[logits_off + t * o_dim + oi] = logit;
-            oi = oi + 64u;
+            oi = oi + 256u;
         }
     }
 }

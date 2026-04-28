@@ -7,8 +7,9 @@
 //! per layer is rebuilt after each layer's Phase 2.
 //!
 //! Constraints: 2 layers hardcoded; uniform `n_hidden` across layers;
-//! `n_hidden <= 512` (workgroup memory budget at MAX_HIDDEN=512:
-//! 4 × 512 × 4 = 8 KB state + 2 × 512 × 4 = 4 KB active_indices = 12 KB).
+//! `n_hidden <= 1024` (workgroup memory budget at MAX_HIDDEN=1024:
+//! 4 × 1024 × 4 = 16 KB state + 2 × 1024 × 4 = 8 KB active_indices =
+//! 24 KB. Workgroup is 256 threads.
 
 use std::sync::Arc;
 
@@ -56,7 +57,7 @@ struct ForwardParams {
 
 var<push_constant> p: ForwardParams;
 
-const MAX_HIDDEN: u32 = 512u;
+const MAX_HIDDEN: u32 = 1024u;
 var<workgroup> sh_l0_h_spike: array<f32, MAX_HIDDEN>;
 var<workgroup> sh_l0_h_v_after: array<f32, MAX_HIDDEN>;
 var<workgroup> sh_l1_h_spike: array<f32, MAX_HIDDEN>;
@@ -82,7 +83,7 @@ fn build_active_l0(tid: u32, n: u32) {
             let idx = atomicAdd(&sh_n_active_l0, 1u);
             sh_active_l0[idx] = c;
         }
-        c = c + 64u;
+        c = c + 256u;
     }
     workgroupBarrier();
 }
@@ -97,12 +98,12 @@ fn build_active_l1(tid: u32, n: u32) {
             let idx = atomicAdd(&sh_n_active_l1, 1u);
             sh_active_l1[idx] = c;
         }
-        c = c + 64u;
+        c = c + 256u;
     }
     workgroupBarrier();
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wgid: vec3<u32>,
@@ -145,7 +146,7 @@ fn main(
         sh_l0_h_v_after[hi] = init_v_l0;
         sh_l1_h_spike[hi] = init_s_l1;
         sh_l1_h_v_after[hi] = init_v_l1;
-        hi = hi + 64u;
+        hi = hi + 256u;
     }
     workgroupBarrier();
 
@@ -181,7 +182,7 @@ fn main(
             h_spike_packed[cache_init_off_l0 + next_slot + h2] = s;
             h_v_after_packed[cache_init_off_l0 + next_slot + h2] = h_v_after_t;
 
-            h2 = h2 + 64u;
+            h2 = h2 + 256u;
         }
         workgroupBarrier();
 
@@ -191,7 +192,7 @@ fn main(
             if (h2 >= n) { break; }
             sh_l0_h_spike[h2] = h_spike_packed[cache_init_off_l0 + next_slot + h2];
             sh_l0_h_v_after[h2] = h_v_after_packed[cache_init_off_l0 + next_slot + h2];
-            h2 = h2 + 64u;
+            h2 = h2 + 256u;
         }
         workgroupBarrier();
 
@@ -228,7 +229,7 @@ fn main(
             h_spike_packed[cache_init_off_l1 + next_slot + h2] = s;
             h_v_after_packed[cache_init_off_l1 + next_slot + h2] = h_v_after_t;
 
-            h2 = h2 + 64u;
+            h2 = h2 + 256u;
         }
         workgroupBarrier();
 
@@ -237,7 +238,7 @@ fn main(
             if (h2 >= n) { break; }
             sh_l1_h_spike[h2] = h_spike_packed[cache_init_off_l1 + next_slot + h2];
             sh_l1_h_v_after[h2] = h_v_after_packed[cache_init_off_l1 + next_slot + h2];
-            h2 = h2 + 64u;
+            h2 = h2 + 256u;
         }
         workgroupBarrier();
 
@@ -254,7 +255,7 @@ fn main(
                 logit = logit + w_out[oi * n + c];
             }
             logits_packed[logits_off + t * o_dim + oi] = logit;
-            oi = oi + 64u;
+            oi = oi + 256u;
         }
     }
 }
