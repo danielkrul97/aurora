@@ -3,11 +3,24 @@
 Cílem projektu Aurora je vytvořit custom LLM, přičemž využije neurobiologicky inspirovanou architekturu 
 umělé neuronové sítě. Projekt je napsán v Rustu. Cílem však NENÍ vytvořit další obecnou LLM.
 
-## Architektura
+## Hlavní vstupní body
 
-| Vrstva       | Technologie |
-| ------------ |-------------|
-| Tests        |             |
+- **Hlavní training example:** `examples/aurora_train.rs` (GPU 2-layer + BPE + checkpointing + auto-resume).
+  Spouštěj přes `scripts/overnight.sh` nebo přímo `cargo run --release --features gpu --example aurora_train -- ...`.
+- **Anti-regrese:** `tests/lm_quality_regression.rs` (CPU byte + BPE BPB threshold + checkpoint round-trip),
+  `tests/gpu_parity.rs` (CPU↔GPU drift < 5e-2). Před commitem oba zkontroluj.
+- **Diagnostické grafy:** `python3 analysis/diagnostics.py logs/<run>.jsonl` po skončení tréninku.
+
+## Konvence
+
+- **Aktivní plán = `docs/11_implementacni_plan_v2.md`.** `docs/10_implementacni_plan.md` je zamrzlý
+  historický záznam (Sprint 0–25, 92 KB), do něj nepiš. Nový sprint dokumentuj v 11; pokud 11 přeroste
+  ~50 KB, založ 12.
+- **JSONL metriky** chodí default do `logs/<ckpt_stem>_<unix_ts>.jsonl`. Schema: `run` / `chunk` /
+  `epoch_done` / `checkpoint` events. Per-event flush — `tail -f` má sub-second lag.
+- **Checkpoint format `AURORA02`** (`src/checkpoint.rs`). Bumpy magic při schema change, drž backward compat
+  pro `AURORA01`.
+- **Korpusy** se stahují přes `scripts/get_corpus.sh <variant>` do `data/`. `data/` a `logs/` jsou v gitignore.
 
 # Code style
 
