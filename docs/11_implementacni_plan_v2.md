@@ -202,12 +202,45 @@ Per-layer scalar correction se v Adamu chová jako *layer-wide bias decay* (vše
 
 **Otevřené (Sprint 34+):**
 - TET loss (`softmax_ce` kernel surgery — CPU + GPU).
-- GPU side α-gradient (reduction kernel + Adam pro α buffer).
+- ~~GPU side α-gradient (reduction kernel + Adam pro α buffer)~~ — Sprint 34.
 - λ scheduling — adaptivní λ podle current rate distribution. Mohlo by automatizovat trade-off.
 
 ---
 
-## Sprint 34+ — Pokračování
+## Sprint 34 — GPU α-gradient ✓ DONE
+
+**Cíl:** dokončit LSG smyčku tak, aby α evolvovala i při GPU-only tréninku (do Sprintu 33 byla učenlivá jen na CPU, GPU jen četla současnou hodnotu).
+
+**Hotovo:**
+
+1. **`gated_cell_back` kernel:** přidaná binding 7 — `d_h_spike_packed` buffer (B × L × T × N, stejný indexing jako `h_v_pre_packed`). Kernel persistuje per-(b, t, h) hodnotu `d_spike` na 1 dodatečný write per thread.
+
+2. **Nový kernel `AlphaGradReduceKernel`:** post-backward 256-thread workgroup-shared reduction přes (B × T × N) entries pro každou vrstvu. Spočítá `Σ d_spike · ∂surrogate/∂α = Σ d_spike · (-2|v−θ|) / (1 + α|v−θ|)³` → 1 scalar per layer do `fb.alpha_grad[2]`.
+
+3. **`step_adam_gpu` rozšířen:** download `alpha_grad` (jen 2 floaty), apply Adam na host straně (per-layer 1-element optimizer), update `alpha_per_layer` který přečte cell_back další chunk.
+
+4. **Single-layer kompatibilita:** `snn_gated_gpu.rs` má dummy `d_h_spike_packed` buffer, signature parita zachována, gpu_parity testy zelené.
+
+**Měřené delty proti Sprint 33 baseline:**
+
+| Test | Sprint 33 | Sprint 34 | Delta |
+|---|---|---|---|
+| GPU aurora_train tiny_200k 1 ep | val BPB 2.682, α [4.00, 4.00] | val BPB 2.686, α **[4.01, 4.05]** | α se konečně hýbe |
+| GPU parity 6/6 | ✓ | ✓ | žádná regrese |
+| Per-chunk overhead (α reduce) | 0 | ~50 µs | pod 0.1 % chunk času |
+
+**Drobná BPB regrese** (2.682 → 2.686) je očekávaná — α se v 1 epoše posunula jen o 0.01–0.05, což je perturbace bez dostatečného času na compensaci v ostatních váhách. Při delším tréninku (overnight enwik8) by α mělo dostat čas zkonvergovat na lepší hodnotu.
+
+**Pozn. k formě integrace:** α-Adam state na GPU by byl 8 floatů, neefektivní (overhead launch > výkon). Ponecháno na hostu, download α-grad → CPU Adam → write back. Žádná měřitelná latence.
+
+**Otevřené (Sprint 35+):**
+- TET loss (CPU + GPU softmax_ce surgery).
+- λ scheduling — adaptivní λ podle current rate.
+- Overnight enwik8 benchmark — teď máme všechny nástroje, čas to změřit.
+
+---
+
+## Sprint 35+ — Pokračování
 
 ---
 

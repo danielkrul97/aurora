@@ -171,6 +171,13 @@ struct FbScratch {
     /// contiguous so a single buffer holds both layers' counts (writes
     /// indexed by `output_offset = layer_idx × n_hidden`).
     spike_count: GpuBuffer,
+
+    /// Sprint 34: persisted `d_h_spike` per (b, layer, t, h) for the
+    /// post-backward α-gradient reduction. Same shape + indexing as
+    /// `h_v_pre_packed`.
+    d_h_spike_packed: GpuBuffer,
+    /// Sprint 34: per-layer α gradient scratch `[n_layers]`.
+    alpha_grad: GpuBuffer,
 }
 
 impl FbScratch {
@@ -229,6 +236,8 @@ impl FbScratch {
             initial_h_v_after: GpuBuffer::zeros(ctx, "initial_h_v_after", b * l * n_hidden),
             initial_h_spike: GpuBuffer::zeros(ctx, "initial_h_spike", b * l * n_hidden),
             spike_count: GpuBuffer::zeros(ctx, "spike_count", l * n_hidden),
+            d_h_spike_packed: GpuBuffer::zeros(ctx, "d_h_spike_packed", b * l * t * n_hidden),
+            alpha_grad: GpuBuffer::zeros(ctx, "alpha_grad", l),
         }
     }
 
@@ -290,6 +299,11 @@ pub struct MultiLayerGatedSnnGpu {
     spike_rate_reduce: Arc<crate::gpu::kernels::SpikeRateReduceKernel>,
     rate_reg_bias: Arc<crate::gpu::kernels::RateRegBiasKernel>,
     pub rate_reg: crate::snn_gated_multi::RateReg,
+    alpha_grad_reduce: Arc<crate::gpu::kernels::AlphaGradReduceKernel>,
+    /// Sprint 34: per-layer Adam state for the LSG learnable α
+    /// (m1, m2 each `[n_layers]`-sized scalars stored as Vec).
+    alpha_adam_m1: Vec<f32>,
+    alpha_adam_m2: Vec<f32>,
 
     bind_l0: wgpu::BindGroup,
     bind_l1: wgpu::BindGroup,
@@ -350,6 +364,8 @@ impl MultiLayerGatedSnnGpu {
             Arc::new(crate::gpu::kernels::SpikeRateReduceKernel::new(&ctx));
         let rate_reg_bias =
             Arc::new(crate::gpu::kernels::RateRegBiasKernel::new(&ctx));
+        let alpha_grad_reduce =
+            Arc::new(crate::gpu::kernels::AlphaGradReduceKernel::new(&ctx));
 
         let grads = MultiLayerGpuGrads::zeros(&ctx, n_input, n_hidden, n_output);
         let adam = MultiLayerGpuAdam::zeros(&ctx, n_input, n_hidden, n_output);
@@ -408,6 +424,9 @@ impl MultiLayerGatedSnnGpu {
             spike_rate_reduce,
             rate_reg_bias,
             rate_reg: net.rate_reg,
+            alpha_grad_reduce,
+            alpha_adam_m1: vec![0.0; net.layers.len()],
+            alpha_adam_m2: vec![0.0; net.layers.len()],
             bind_l0,
             bind_l1,
             bind_io: None,
@@ -508,6 +527,23 @@ impl MultiLayerGatedSnnGpu {
             );
         }
         self.ctx.queue.submit(Some(encoder.finish()));
+
+        // Sprint 34: per-layer α Adam step. The α gradient was reduced
+        // to `fb.alpha_grad[layer]` after backward; download (just 2
+        // floats), apply Adam on the host, write the new α back to
+        // `alpha_per_layer` so the next chunk's cell_back picks it up.
+        let alpha_grads = self.fb.alpha_grad.download(&self.ctx);
+        for (l, &g) in alpha_grads.iter().enumerate() {
+            let m1 = &mut self.alpha_adam_m1[l];
+            let m2 = &mut self.alpha_adam_m2[l];
+            *m1 = config.beta1 * *m1 + (1.0 - config.beta1) * g;
+            *m2 = config.beta2 * *m2 + (1.0 - config.beta2) * g * g;
+            let m1_hat = *m1 / bc1;
+            let m2_hat = *m2 / bc2;
+            let new_alpha = self.alpha_per_layer[l]
+                - config.lr * m1_hat / (m2_hat.sqrt() + config.eps);
+            self.alpha_per_layer[l] = new_alpha.max(0.1);
+        }
     }
 
     /// Download all 14 grad buffers back to a CPU
@@ -683,6 +719,7 @@ impl MultiLayerGatedSnnGpu {
         if self.rate_reg.lambda > 0.0 {
             self.apply_rate_reg(t_steps, batch_size);
         }
+        self.reduce_alpha_grad(t_steps, batch_size);
 
         let n = self.n_hidden as usize;
         let h_v_after_full = self.fb.h_v_after_packed.download(&self.ctx);
@@ -699,6 +736,46 @@ impl MultiLayerGatedSnnGpu {
         }
 
         total_loss
+    }
+
+    /// Sprint 34: dispatch the per-layer α gradient reduction. One
+    /// 256-thread workgroup per layer scans (B × T × N) entries of
+    /// `d_h_spike_packed` and `h_v_pre_packed`, computing
+    /// `Σ d_spike · ∂surrogate/∂α` into `fb.alpha_grad[layer]`.
+    /// Cheap (~50 µs at our default config) and gives Adam a real
+    /// signal for LSG to actually move α away from 4.0.
+    fn reduce_alpha_grad(&mut self, t_steps: usize, batch_size: usize) {
+        let n = self.n_hidden as usize;
+        let l = 2_usize;
+        let n_per_sample = t_steps * n; // (T) × N for one layer's no-init slice
+        let cache_stride_no_init = l * n_per_sample;
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("aurora multi alpha_grad_reduce"),
+            });
+        for layer_idx in 0..2u32 {
+            let layer_offset = (layer_idx as usize) * n_per_sample;
+            self.alpha_grad_reduce.dispatch_into(
+                &self.ctx,
+                &mut encoder,
+                &self.fb.h_v_pre_packed,
+                &self.fb.d_h_spike_packed,
+                &self.fb.alpha_grad,
+                layer_offset as u32,
+                cache_stride_no_init as u32,
+                n_per_sample as u32,
+                batch_size as u32,
+                layer_idx,
+                self.threshold,
+                self.alpha_per_layer
+                    .get(layer_idx as usize)
+                    .copied()
+                    .unwrap_or(self.alpha),
+            );
+        }
+        self.ctx.queue.submit(Some(encoder.finish()));
     }
 
     /// Sprint 32: dispatch the spike-rate l2 regularization correction.
@@ -884,6 +961,7 @@ impl MultiLayerGatedSnnGpu {
                     &self.fb.h_v_after_packed,
                     &self.fb.gate_packed,
                     &self.fb.d_cell_packed[layer],
+                    &self.fb.d_h_spike_packed,
                     h,
                     self.threshold,
                     self.alpha_per_layer.get(layer).copied().unwrap_or(self.alpha),

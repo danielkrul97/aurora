@@ -691,6 +691,7 @@ struct GCB {
 @group(0) @binding(4) var<storage, read>       h_v_after_prev: array<f32>;
 @group(0) @binding(5) var<storage, read>       gate: array<f32>;
 @group(0) @binding(6) var<storage, read_write> packed_out: array<f32>;
+@group(0) @binding(7) var<storage, read_write> d_h_spike_packed: array<f32>;
 var<push_constant>             p: GCB;
 
 fn surrogate(v_minus_theta: f32, alpha: f32) -> f32 {
@@ -724,6 +725,9 @@ fn main(
     packed_out[0u * slot_stride + scratch_base + h] = d_v_pre;
     packed_out[1u * slot_stride + scratch_base + h] = d_gate_pre;
     packed_out[2u * slot_stride + scratch_base + h] = d_v_after_out;
+    // Sprint 34: persist d_spike at the same indexing as h_v_pre so a
+    // post-backward reduction kernel can compute the per-layer α grad.
+    d_h_spike_packed[h_v_pre_idx] = d_spike;
 }
 ";
 
@@ -766,6 +770,7 @@ impl GatedCellBackwardKernel {
                     storage_entry(4, true),
                     storage_entry(5, true),
                     storage_entry(6, false),
+                    storage_entry(7, false),
                 ],
             });
         let pl = ctx
@@ -812,6 +817,7 @@ impl GatedCellBackwardKernel {
         h_v_after_prev: &GpuBuffer,
         gate: &GpuBuffer,
         packed_out: &GpuBuffer,
+        d_h_spike_packed: &GpuBuffer,
         n_hidden: u32,
         threshold: f32,
         alpha: f32,
@@ -863,6 +869,10 @@ impl GatedCellBackwardKernel {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: packed_out.inner.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: d_h_spike_packed.inner.as_entire_binding(),
                 },
             ],
         });
@@ -2087,6 +2097,187 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
             min_binding_size: None,
         },
         count: None,
+    }
+}
+
+// =====================================================================
+// Sprint 34: per-layer α gradient reduction (LSG).
+// =====================================================================
+//
+// Computes
+//   dα_l = Σ_{b,t,i} d_h_spike[b,l,t,i] · ∂surrogate(v_t,i − θ)/∂α
+//        = Σ d_h_spike · (-2|v−θ|) / (1 + α|v−θ|)³
+// for one layer per dispatch. h_v_pre_packed and d_h_spike_packed share
+// the same indexing (`b * cache_stride + t * N + h`), so a single
+// linear scan covers both. Reduction in workgroup-shared memory,
+// final tree reduce → 1 scalar.
+const ALPHA_GRAD_REDUCE_WGSL: &str = "
+struct AGR {
+    layer_offset: u32,            // start of this layer's slice in packed bufs
+    cache_stride_no_init: u32,    // = L * T * N (per-sample, multi-layer) or T * N (single)
+    n_per_sample: u32,            // = T * N for this layer
+    batch_size: u32,
+    output_offset: u32,           // where to write the scalar result
+    threshold: f32,
+    alpha: f32,
+    _p0: u32,
+};
+
+@group(0) @binding(0) var<storage, read>       h_v_pre: array<f32>;
+@group(0) @binding(1) var<storage, read>       d_h_spike: array<f32>;
+@group(0) @binding(2) var<storage, read_write> alpha_grad_out: array<f32>;
+var<push_constant> p: AGR;
+
+var<workgroup> sh: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    var local: f32 = 0.0;
+    let total = p.batch_size * p.n_per_sample;
+    var i: u32 = tid;
+    loop {
+        if (i >= total) { break; }
+        let b = i / p.n_per_sample;
+        let elem = i % p.n_per_sample;
+        let idx = b * p.cache_stride_no_init + p.layer_offset + elem;
+        let dv = h_v_pre[idx] - p.threshold;
+        let abs_dv = abs(dv);
+        let denom = 1.0 + p.alpha * abs_dv;
+        let cubic = denom * denom * denom;
+        let dalpha = d_h_spike[idx] * (-2.0 * abs_dv / cubic);
+        local = local + dalpha;
+        i = i + 256u;
+    }
+    sh[tid] = local;
+    workgroupBarrier();
+
+    var s: u32 = 128u;
+    loop {
+        if (s == 0u) { break; }
+        if (tid < s) { sh[tid] = sh[tid] + sh[tid + s]; }
+        workgroupBarrier();
+        s = s / 2u;
+    }
+    if (tid == 0u) { alpha_grad_out[p.output_offset] = sh[0]; }
+}
+";
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct AlphaGradReduceParams {
+    layer_offset: u32,
+    cache_stride_no_init: u32,
+    n_per_sample: u32,
+    batch_size: u32,
+    output_offset: u32,
+    threshold: f32,
+    alpha: f32,
+    _p0: u32,
+}
+
+pub struct AlphaGradReduceKernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bind_group_layout: Arc<wgpu::BindGroupLayout>,
+}
+
+impl AlphaGradReduceKernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("aurora alpha_grad_reduce wgsl"),
+                source: wgpu::ShaderSource::Wgsl(ALPHA_GRAD_REDUCE_WGSL.into()),
+            });
+        let bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("aurora alpha_grad_reduce bgl"),
+                entries: &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, false),
+                ],
+            });
+        let pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("aurora alpha_grad_reduce pl"),
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..32,
+                }],
+            });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("aurora alpha_grad_reduce pipeline"),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        Self {
+            pipeline: Arc::new(pipeline),
+            bind_group_layout: Arc::new(bgl),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_into(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        h_v_pre: &GpuBuffer,
+        d_h_spike: &GpuBuffer,
+        alpha_grad_out: &GpuBuffer,
+        layer_offset: u32,
+        cache_stride_no_init: u32,
+        n_per_sample: u32,
+        batch_size: u32,
+        output_offset: u32,
+        threshold: f32,
+        alpha: f32,
+    ) {
+        let p = AlphaGradReduceParams {
+            layer_offset,
+            cache_stride_no_init,
+            n_per_sample,
+            batch_size,
+            output_offset,
+            threshold,
+            alpha,
+            _p0: 0,
+        };
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora alpha_grad_reduce bind"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: h_v_pre.inner.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: d_h_spike.inner.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: alpha_grad_out.inner.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("aurora alpha_grad_reduce pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(1, 1, 1);
     }
 }
 

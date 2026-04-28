@@ -23,7 +23,8 @@
     clippy::needless_pass_by_ref_mut,
     clippy::doc_markdown,
     clippy::too_many_lines,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::suboptimal_flops
 )]
 
 pub mod buffers;

@@ -147,6 +147,11 @@ struct FbScratch {
 
     initial_h_v_after: GpuBuffer,
     initial_h_spike: GpuBuffer,
+
+    /// Sprint 34: dummy d_h_spike_packed (single-layer doesn't compute
+    /// α gradient, but the cell_back kernel signature now requires this
+    /// binding for parity with the multi-layer code path).
+    d_h_spike_packed: GpuBuffer,
 }
 
 impl FbScratch {
@@ -182,6 +187,7 @@ impl FbScratch {
             d_gate_pre: GpuBuffer::zeros(ctx, "d_gate_pre", b * n_hidden),
             initial_h_v_after: GpuBuffer::zeros(ctx, "initial_h_v_after", b * n_hidden),
             initial_h_spike: GpuBuffer::zeros(ctx, "initial_h_spike", b * n_hidden),
+            d_h_spike_packed: GpuBuffer::zeros(ctx, "d_h_spike_packed", b * t * n_hidden),
         }
     }
 
@@ -202,6 +208,8 @@ impl FbScratch {
         let n = self.n_hidden;
         let o = self.n_output;
         self.h_v_pre_packed = GpuBuffer::zeros(ctx, "h_v_pre_packed", new_b * new_t * n);
+        self.d_h_spike_packed =
+            GpuBuffer::zeros(ctx, "d_h_spike_packed", new_b * new_t * n);
         self.h_v_after_packed =
             GpuBuffer::zeros(ctx, "h_v_after_packed", new_b * (new_t + 1) * n);
         self.h_spike_packed = GpuBuffer::zeros(ctx, "h_spike_packed", new_b * (new_t + 1) * n);
@@ -1112,6 +1120,7 @@ impl GatedRecurrentSnnGpu {
                 &self.fb.h_v_after_packed,
                 &self.fb.gate_packed,
                 &self.fb.d_cell_packed,
+                &self.fb.d_h_spike_packed,
                 h,
                 self.threshold,
                 self.alpha,
