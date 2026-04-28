@@ -23,3 +23,6 @@ target
 
 # MNIST dataset + cached weights (download via scripts/get_mnist.sh)
 data/
+
+# Claude Code local session state
+.claude/

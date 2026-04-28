@@ -30,14 +30,18 @@ impl GpuContext {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("aurora gpu device"),
-                required_features: wgpu::Features::empty(),
+                // PUSH_CONSTANTS lets kernels read params via
+                // `var<push_constant>` instead of a per-dispatch uniform
+                // buffer + bind group entry; saves ~100-200 µs per
+                // dispatch on the Vulkan path.
+                required_features: wgpu::Features::PUSH_CONSTANTS,
                 required_limits: {
-                    // Default desktop limits give us 8+ storage bindings per
-                    // stage, which the gated_cell_step kernel needs (9). The
-                    // fallback `downlevel_defaults` caps at 4.
                     let supported = adapter.limits();
                     let mut wanted = wgpu::Limits::default();
                     wanted = wanted.using_resolution(supported.clone());
+                    // 32 bytes covers all current kernel param structs
+                    // (largest is AdamStepParams: 8 × u32/f32 = 32 B).
+                    wanted.max_push_constant_size = 32.max(supported.max_push_constant_size);
                     wanted
                 },
                 memory_hints: wgpu::MemoryHints::default(),

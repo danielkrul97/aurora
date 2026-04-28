@@ -25,6 +25,11 @@ neuromodulace), žádný backprop.
 - Stateful TBPTT s detach na chunk hranicích (`forward_lm_bytes_stateful`, parallel streams)
 - GPU foundation přes wgpu (feature `gpu`, NVIDIA/Vulkan/Metal/DX12); první kernel + parity test
 - GPU forward end-to-end pro gated SNN (`GatedRecurrentSnnGpu`, multi-timestep dispatch, CPU↔GPU parity test)
+- GPU backward + Adam end-to-end pro gated SNN (BPTT na GPU, parity vs CPU < 5e-3 přes všech 8 grad bufferů, `forward_backward_lm_bytes_gpu`, `step_adam_gpu`, `clip_grads_gpu`, `to_cpu`)
+- Fused `gate_pre` + workgroup-shared `softmax_cross_entropy` WGSL kernely — eliminace per-timestep CPU↔GPU roundtripů (4.5× rychlejší GPU forward+backward vs Sprint 15)
+- Encoder batching + push constants (1 `queue.submit` per phase místo ~6400, push constants místo per-dispatch uniform bufferu) — 6.8× cumulative speedup od Sprint 14
+- Forward megakernel (single dispatch covers entire chunk, workgroup-shared state mezi timesteps) + packed cache buffery + cached bind groups — 7.3× cumulative speedup od Sprint 14 při hidden ≤ 256
+- Multi-sample batch fusion ve forward + softmax_ce (forward dispatchuje B workgroups, softmax 2D grid B×T) — `forward_backward_batch_gpu_fused`, **11.6× cumulative speedup** od Sprint 14 při batch=4
 
 ## Spuštění
 
@@ -39,6 +44,8 @@ cargo run --release --example seq_mnist        # recurrent surrogate, Sequential
 cargo run --release --example char_lm -- data/tiny.txt  # byte-level char LM (Sprint 10)
 cargo run --release --example char_lm_gated -- data/tiny.txt  # gated cell variant (Sprint 11)
 cargo run --release --example char_lm_gated_cz -- data/cesky.txt  # CZ char-LM (UTF-8)
+cargo run --release --features gpu --example char_lm_gated_gpu -- data/tiny.txt  # plný GPU trénink
+cargo bench  --features gpu --bench lm_gpu_speedup        # CPU vs GPU throughput
 ```
 
 ## Dokumentace

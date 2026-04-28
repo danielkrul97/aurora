@@ -34,3 +34,12 @@ harness = false
 [[bench]]
 name = "lm_sparse_speedup"
 harness = false
+
+[[bench]]
+name = "lm_gpu_speedup"
+harness = false
+required-features = ["gpu"]
+
+[[example]]
+name = "char_lm_gated_gpu"
+required-features = ["gpu"]

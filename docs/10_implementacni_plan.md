@@ -515,18 +515,247 @@
 - GPU end-to-end training. Až po backward portu.
 - `char_lm_gated_gpu.rs` example. Až po training port.
 
-**Sprint 15+ followups:**
-- WGSL `gated_cell_step_backward` kernel s surrogate gradient (per-timestep gradient inputs/outputs, dependence na cache)
-- WGSL `outer_product_accum` kernel pro `grad_w += d_out ⊗ in` (W_out, W_rec, W_gate_rec gradient updates)
-- WGSL `column_accum` kernel pro `grad_w[:, byte_idx] += d_h_v_pre` (W_in, W_gate_in sparse gradient)
-- WGSL `adam_step` kernel — Adam update přes parameter buffer
-- `forward_backward_batch_gpu` end-to-end
-- `examples/char_lm_gated_gpu.rs` s `--gpu` flag
-- `benches/lm_gpu_speedup.rs` měření chunks/sec speedup
+---
+
+## Sprint 15 — GPU backward + Adam + end-to-end training
+
+**Cíl:** Doplnit GPU stack o BPTT backward, Adam optimizer a kompletní training pipeline. Zachovat per-buffer parity s CPU implementací (~5e-3 abs diff přes ~16-step BPTT). Vytvořit `char_lm_gated_gpu` example který provede plný trénink na GPU.
+
+**Princip plánování:**
+- **Cache forward state na GPU.** Per-timestep buffery (`h_v_pre`, `h_v_after`, `h_spike`, `gate`, `logits`) preallokovat ve scratch struktuře, lazily zvětšovat když chunk T roste.
+- **Cross-entropy gradient přes CPU roundtrip.** Po forwardu stáhnout všechny logity (T × O × 4 B = ~64 KB při T=64, O=256), spočítat softmax + d_logits CPU-side, uploadnout jednou. Náhrada za in-shader softmax kernel (workgroup-shared reduction) — odloženo na pozdější micro-optim. Roundtrip cost je řádově ~100 µs při hidden=512.
+- **Single d_h_spike_recurrent buffer.** Backward kernel ho přečte první (jako vstup), pak ho přepíšeme dvěma `dense_matvec_transpose` calls (`acc=0` pak `acc=1`) na nový obsah pro t-1. Žádný extra elementwise add.
+- **Sequenční per-sample batching.** `forward_backward_batch_gpu` jen volá single-sample variantu N krát, akumulujíc gradienty do `self.grads`. Skutečně-paralelní GPU batching (cross-sample shape fusion) je složitější a Sprint 16+ téma.
+
+**Deliverables (~1700 LOC):**
+- WGSL kernely (`src/gpu/kernels.rs` rozšíření):
+  - `dense_matvec_transpose` — `out = W^T @ v` s volitelným accumulate flag
+  - `gated_cell_step_backward` — fused per-element backward (surrogate gradient + gate sigmoid grad + membrane carryover)
+  - `outer_product_accum` — `M[r,c] += a[r] * b[c]` (W_out / W_rec / W_gate_rec grad)
+  - `column_accum` — `W[:, byte_idx] += d` (W_in / W_gate_in grad)
+  - `vector_add` — `b[i] += d[i]` (bias grads)
+  - `adam_step` — vectorizovaný Adam update přes parameter buffer
+  - `scale_buffer` — `b[i] *= factor` (clip_grads scale)
+  - `zero_buffer` — `b[i] = 0` (zero_grad)
+- `GatedRecurrentSnnGpu` rozšíření (`src/gpu/snn_gated_gpu.rs`):
+  - GPU-resident `GatedGpuGrads` (8 buffers) + `GatedGpuAdam` (16 buffers, m1+m2)
+  - `FbScratch` — per-timestep cache + per-step intermediate buffers, lazy-grow
+  - `forward_backward_lm_bytes_gpu(input, target, &mut h_v_after, &mut h_spike) -> loss` (stateful TBPTT with detach)
+  - `forward_backward_lm_bytes_gpu_stateless(input, target) -> loss`
+  - `forward_backward_batch_gpu(inputs, targets, states) -> loss`
+  - `zero_grad_gpu`, `clip_grads_gpu`, `step_adam_gpu`
+  - `to_cpu` (download weights to fresh CPU `GatedRecurrentSnn`), `download_grads`
+- `tests/gpu_parity.rs` rozšíření:
+  - `gated_backward_lm_grads_match_cpu_within_tolerance` — všech 8 grad bufferů, T=16 BPTT, hidden=32. Tolerance 5e-3 abs diff.
+  - `gated_end_to_end_gpu_training_reduces_loss` — 40 Adam stepů s clip + step_adam, předpokládaná redukce loss ≥ 15 %.
+- `examples/char_lm_gated_gpu.rs` — plná GPU pipeline (training na GPU, eval+sample na CPU snapshot z `to_cpu` po každé epoše).
+- `benches/lm_gpu_speedup.rs` — CPU vs GPU measurement na hidden ∈ {128, 256, 512}, chunk=64, N=50.
+
+**Exit kritérium:**
+- ✅ Backward parity test prochází (max diff 5e-3 přes všechny grad buffery při T=16).
+- ✅ End-to-end GPU training redukuje loss strictly přes 40 stepů (cycle-token testbed).
+- ✅ Cargo test (gpu feature) — 31/31 prochází (27 CPU + 2 sparse_matvec_onehot/forward parity + 2 nové).
+- ✅ Clippy clean s i bez gpu feature.
+
+**Sprint 15 ZÁMĚRNĚ NEŘEŠÍ:**
+- WGSL softmax / cross-entropy kernel (CPU roundtrip pro d_logits výpočet).
+- Fused-add WGSL kernel pro forward `gate_pre` (zděděno z Sprint 14).
+- Multi-sample paralelní batching na GPU (sequential per-sample stačí; batch fusion = Sprint 16+).
+- GPU `step_lm_byte` pro autoregressive sampling (sample přes `to_cpu` snapshot — stačí 1× per epoch).
+- Multi-stream parallel TBPTT (`forward_backward_batch_stateful_gpu`) — sequential per-sample TBPTT je dostatečný.
+
+**Sprint 16+ followups:**
+- Fused-add WGSL kernel pro `gate_pre` v forwardu (eliminuje 3 KB CPU roundtrip per timestep, mírný speedup).
+- WGSL softmax + cross-entropy kernel (eliminuje CPU roundtrip pro d_logits).
+- GPU `step_lm_byte` pro inference benchmarks.
+- Multi-stream paralelní batching (true multi-sample fusion s cross-batch shape).
+- f16 mixed precision na NVIDIA s tensor cores.
 
 ---
 
-## Sprint 14 a dál — možné větve (decision point po 13)
+## Sprint 16 — eliminace per-timestep CPU roundtripů
+
+**Cíl:** Sprint 15 GPU implementace měla dva CPU↔GPU sync points uvnitř per-timestep loopu: (a) `gate_pre = b_gate + W_gate_in_contrib + W_gate_rec_contrib` se počítal CPU-side po download/upload, (b) softmax + cross-entropy se počítaly CPU-side za cenu T downloadů + T uploadů `logits[t]`/`d_logits[t]` per chunk. Sprint 16 portuje obojí na GPU dvěma novými WGSL kernely.
+
+**Princip plánování:**
+- **Žádná změna API.** Public API (`forward_backward_lm_bytes_gpu`, `step_adam_gpu`, ...) zůstává identické. Vnitřní cesta jen vymění CPU sumy/softmax za GPU dispatche.
+- **Workgroup-shared softmax redukce.** Single workgroup of 256 threads na timestep; redukce přes `var<workgroup>` shared array. Hardcoded na `n_output ≤ 256` (VOCAB pro byte-LM přesně 256, panic pro větší).
+- **Per-timestep loss buffer.** `loss_seq: GpuBuffer` velikosti T, zapisovaný `softmax_ce` kernelem. Jediný `download` na konci chunku → CPU `.iter().sum()` pro total_loss. Žádný per-timestep sync.
+
+**Deliverables (~600 LOC):**
+- `src/gpu/kernels.rs`:
+  - `FusedGatePreKernel` — `gate_pre[h] = b_gate[h] + gate_in_contrib[h] + gate_rec_contrib[h]`. Workgroup_size(64), 1D dispatch.
+  - `SoftmaxCrossEntropyKernel` — workgroup_size(256), shared-mem max + sum redukce, output `d_logits = softmax - one_hot(target)` + `loss_seq[t_idx] = -log(softmax[target])`. Hardcoded na O ≤ 256.
+- `src/gpu/snn_gated_gpu.rs`:
+  - `FbScratch.loss_seq` — per-timestep loss buffer, lazily resized s capacity_t.
+  - `gpu_forward` — `fused_gate_pre.dispatch(...)` místo download/CPU sum/upload.
+  - `forward_lm_bytes_gpu` (stateless inference) — stejný refactor.
+  - `compute_d_logits_gpu` (rename z `compute_d_logits_cpu_roundtrip`) — per-timestep `softmax_ce.dispatch(...)`, single download `loss_seq` na konci.
+
+**Exit kritérium:**
+- ✅ Sprint 15 GPU parity testy prochází beze změny tolerancí (forward 1e-3, backward 5e-3, end-to-end loss strictly drops). Naměřená max diff backward gradů beze změn vůči Sprint 15.
+- ✅ Smoke test reálného char-LM tréninku (5 KB tiny-shakespeare, hidden=256, chunk=32, batch=4, 1 epoch): pre-Sprint-16 = 23.2 s → post-Sprint-16 = 5.1 s, **4.5× speedup** na GPU side při zachování BPB.
+- ✅ Cargo test (gpu feature) — 31/31 prochází. Clippy clean s i bez gpu feature.
+
+**Měřený throughput vs CPU (`benches/lm_gpu_speedup`, NVIDIA GTX 1650 Vulkan, 50 chunks × 64 bytes):**
+- hidden 128: CPU 905 chunks/s, GPU 15.2 chunks/s (0.02× — CPU vyhrává)
+- hidden 256: CPU 349 chunks/s, GPU 14.1 chunks/s (0.04×)
+- hidden 512: CPU 120 chunks/s, GPU 11.5 chunks/s (0.10×)
+
+**Co Sprint 16 NEŘEŠÍ a proč GPU stále zaostává za CPU:**
+- **Sparse spike CPU optimalizace.** CPU `forward_lm_bytes` skipuje nulové spike (`active_indices`), což je extrémně efektivní u našich rate ~5 Hz. GPU dělá dense matvec přes celý `h_spike` vektor.
+- **Dispatch granularita.** Single-sample forward+backward = ~10 kernel dispatches per timestep × 64 timesteps + ~700 dispatches/chunk. Při ~10 µs overhead per dispatch = 7 ms čistého submission overheadu před tím, než reálný compute začne.
+- **Žádné batch fusion.** Multi-sample sequential (sample-by-sample) v `forward_backward_batch_gpu` znamená 4× ten samý overhead bez paralelizace přes batch dim.
+
+**Sprint 17+ followups (cesta k reálnému GPU speedupu):**
+- **Multi-sample batch fusion.** Refactor kernelů na 2D grid `[hidden × batch]`; dense matvec → batched matmul. Cíl: ≥10× speedup vůči CPU multi-thread pri batch ≥ 16, hidden ≥ 256.
+- **Sparse spike GPU path.** Build `active_indices` GPU-side (atomic counter + compaction), pak per-active-spike kernely. Komplexní, ale eliminuje hlavní CPU advantage.
+- **Persistent-thread mega-kernel.** Jeden kernel místo ~10 per timestep, in-shader timestep loop. Eliminuje dispatch overhead úplně. Sloučitelné s batch fusion.
+- **GPU `step_lm_byte`** pro inference benchmarks.
+- **f16 mixed precision** na NVIDIA s tensor cores (volitelné post-batch-fusion).
+
+---
+
+## Sprint 17 — encoder batching + push constants
+
+**Cíl:** Snížit per-dispatch CPU overhead. Sprint 16 dodal kernely a parity, ale realný profile reálného `char_lm_gated_gpu` na tiny.txt (1.1 MB) byl prakticky neúnosný — uživatel nahlásil "příšerně pomalé". Per-chunk overhead: ~6400 kernel dispatches × ~300-500 µs CPU work = 2-3 s pure overhead. Většina toho byly per-dispatch alokace command encoderu, uniform bufferu, a bind groupu.
+
+**Princip plánování:**
+- **Batch dispatches do jednoho command encoderu per phase.** wgpu serializuje každé `queue.submit()` (lock + validation + scheduler hand-off). Místo ~6400 submitů per chunk → 4 (forward + softmax_ce + backward + finální download).
+- **Push constants místo uniform buffer per dispatch.** wgpu's `var<push_constant> p: Params` se vejde do command bufferu inline, bez per-dispatch alokace `wgpu::Buffer` (~50-200 µs saved per dispatch). Vyžaduje `wgpu::Features::PUSH_CONSTANTS` a `max_push_constant_size: 32`.
+- **Žádná změna API.** Public methods stále stejné. Refactor je čistě interní.
+
+**Deliverables (~600 LOC):**
+- `src/gpu/context.rs`: feature `PUSH_CONSTANTS` + `max_push_constant_size: 32`.
+- `src/gpu/kernels.rs`: Each kernel:
+  - WGSL: `@group(0) @binding(N) var<uniform> p: T;` → `var<push_constant> p: T;`. Storage bindings unchanged.
+  - BindGroupLayout: drops the uniform entry.
+  - PipelineLayout: adds `push_constant_ranges: [PushConstantRange { stages: COMPUTE, range: 0..32 }]`.
+  - Dispatch: `dispatch(...)` → `dispatch_into(&mut wgpu::CommandEncoder, ...)`. No per-dispatch encoder/submit. Uniform buffer creation + bind entry replaced by `pass.set_push_constants(0, bytemuck::bytes_of(&p))`.
+- `src/gpu/snn_gated_gpu.rs`:
+  - `gpu_forward`, `compute_d_logits_gpu`, `gpu_backward`, `zero_grad_gpu`, `clip_grads_gpu`, `step_adam_gpu`: každá metoda vytvoří JEDEN encoder na začátku, zavolá `dispatch_into` v loopu, na konci `queue.submit(Some(encoder.finish()))`.
+  - `copy_packed_slot` → `copy_packed_slot_into(encoder, ...)`: variant taking shared encoder.
+- `tests/gpu_parity.rs`: aktualizováno na nový `dispatch_into` (1 caller).
+- `examples/char_lm_gated_gpu.rs`: `report_every` z 10% chunků → 2% (50 reports per epoch místo 10) — uživatel vidí progress výrazně rychleji.
+
+**Exit kritérium:**
+- ✅ Sprint 15 GPU parity testy prochází beze změny tolerancí (forward 1e-3, backward 5e-3, end-to-end loss strictly drops).
+- ✅ Cargo test (gpu feature) — 31/31 prochází. Clippy clean s i bez gpu feature.
+- ✅ Smoke test (5 KB tiny-shakespeare, hidden=256, chunk=32, batch=4, 1 epoch):
+  - Pre-Sprint-16: 23.2 s
+  - Sprint 16 (kernely): 5.1 s (4.5× nad 15)
+  - Sprint 17 encoder batching: 3.7 s (1.4× nad 16)
+  - Sprint 17 + push constants: 3.4 s (1.1× nad encoder batching)
+  - **Total: 6.8× speedup since pre-Sprint-16**.
+- 🟡 lm_gpu_speedup bench (50 chunks × 64 bytes, hidden=512): GPU 14.7 chunks/s vs CPU 117 chunks/s → 0.13× (CPU stále vyhrává díky sparse spike skipping).
+
+**Co Sprint 17 NEŘEŠÍ a proč GPU stále zaostává za CPU u našich rozměrů:**
+- **Sparse spike CPU optimalizace** (`active_indices` při ~5 Hz firing rate) zůstává nepřekonatelná pro single-sample sequential GPU dispatch.
+- **Bind group creation per dispatch** zatím persistuje (~50-100 µs each). Vyžadovala by buďto packed timestep buffers (single buffer for all T timesteps, indexed via push constant offset) nebo cached bind groups per fixed-input shape.
+- **Žádné batch fusion.** Sequential per-sample znamená 4× ten samý overhead bez paralelismu přes batch dim.
+
+**Sprint 18+ followups (decision point po 17):**
+- **Multi-sample batch fusion** — refactor kernelů na 2D grid `[hidden × batch]`. Single dispatch covers B samples. Bind group reusable across timesteps if buffers are packed. Cíl: ≥10× speedup vs CPU při batch ≥ 16.
+- **Persistent-thread mega-kernel** — jeden velký kernel s in-shader timestep loop. Eliminuje dispatch overhead úplně. Limit: workgroup size (256 threads), works for hidden ≤ 256 with one neuron per thread.
+- **Packed timestep buffers + cached bind groups** — `h_v_pre[T*N]` jako single buffer indexed by t_idx push constant. Forward + backward bind groups vytvořené jednou per kernel a reusable.
+
+---
+
+## Sprint 18 — forward megakernel + packed cache + cached bind groups
+
+**Cíl:** Eliminace dispatch overhead ve forwardu + bind-group creation overhead v backward. Sprint 17 měl ~6400 dispatches per chunk se ~50 µs CPU work každý. Sprint 18 redukuje forward na 1 dispatch (megakernel s in-shader timestep loop) a backward refactoruje na čtení z packed cache bufferů přes offset push constants — bind groups v hot pathu jsou stabilní (lazy-cached) místo per-dispatch alokace.
+
+**Princip plánování:**
+- **Megakernel = 1 dispatch covers entire forward chunk.** Workgroup_size(64), stride loop přes `n_hidden`. Workgroup-shared `array<f32, 1024>` drží `h_spike` a `h_v_after` mezi timesteps; per-timestep stav se zapisuje do globálních packed bufferů. Tři fáze per timestep: (1) compute new state from sh_*, (2) load new state to sh_*, (3) compute logits.
+- **Packed forward cache.** Místo `Vec<GpuBuffer>` per-timestep buffers (size T × n_hidden separátních buffer objektů) jsou všechny stavy v single packed bufferech: `h_v_pre_packed[T*N]`, `h_v_after_packed[(T+1)*N]` (slot 0 = initial), `h_spike_packed[(T+1)*N]`, `gate_packed[T*N]`, `logits_packed[T*O]`, `d_logits_packed[T*O]`. Backward kernely čtou přes offset push constants (`h_v_pre_offset`, `a_offset`, `b_offset`, `v_offset`, `d_offset`).
+- **Cached bind groups.** Forward megakernel binding groups (weights group + io group) jsou vytvořené jednou v `from_cpu` a `ensure_fwd_mega_bind_io`; invalidovány jen při `fb` reallokaci.
+- **Single workgroup limitation.** Megakernel běží 1 workgroup (state musí být shared mezi timesteps), což limituje GPU paralelismus. Multi-sample batch fusion (jeden workgroup per sample, B paralelních) je Sprint 19+ téma.
+
+**Deliverables (~700 LOC):**
+- `src/gpu/forward_mega.rs` (NEW, ~300 LOC):
+  - `ForwardMegaKernel` — pipeline + 2 cached bind group layouts (weights group + io group, 8 storage bindings each).
+  - WGSL: `workgroup_size(64)`, dvě shared arrays (`sh_h_spike`, `sh_h_v_after` — `array<f32, 1024>`), in-shader for-loop přes T timesteps, sigmoid/spike/gate computation.
+  - `pack_bytes_u32` helper — widen `&[u8]` na `Vec<u32>` pro upload (WGSL storage buffers nepodporují 8-bit element types bez extension).
+- `src/gpu/kernels.rs`:
+  - `dense_matvec_transpose`: `+v_offset: u32` push constant; reads `v[v_offset + r]`.
+  - `gated_cell_backward`: `+h_v_pre_offset, h_v_after_prev_offset, gate_offset` push constants pro čtení packed cache.
+  - `outer_product_accum`: `+a_offset, b_offset` push constants.
+  - `vector_add`: `+d_offset` push constant.
+  - `softmax_cross_entropy`: kernel přepsán na čtení/zápis packed `logits/d_logits` na offset `t_idx*O`.
+- `src/gpu/snn_gated_gpu.rs`:
+  - `FbScratch`: per-timestep `Vec<GpuBuffer>` nahrazena packed `GpuBuffer`s. `ensure_capacity` returns `bool` (true if reallocated).
+  - `GatedRecurrentSnnGpu`: + `forward_mega: Arc<ForwardMegaKernel>`, + `fwd_mega_bind_weights: BindGroup` (cached), + `fwd_mega_bind_io: Option<BindGroup>` (lazy + invalidated on resize).
+  - `gpu_forward` přepsáno na single megakernel dispatch.
+  - `gpu_backward` aktualizováno aby předávalo offsety přes push constants při čtení z packed cache.
+  - `forward_backward_lm_bytes_gpu`: final state download z packed bufferů (slot t_steps).
+
+**Exit kritérium:**
+- ✅ Sprint 15 GPU parity testy prochází beze změny tolerancí (forward 1e-3, backward 5e-3, end-to-end loss strictly drops). Forward output bit-equivalent (in tolerance) přes megakernel cestu.
+- ✅ Cargo test (gpu feature) — 31/31 prochází. Clippy clean s i bez gpu feature.
+- ✅ Smoke test (5 KB tiny-shakespeare, hidden=256, chunk=32, batch=4, 1 epoch):
+  - Pre-Sprint-16: 23.2 s
+  - Sprint 17: 3.4 s
+  - Sprint 18: 3.2 s (1.06× nad Sprint 17)
+- 🟡 lm_gpu_speedup bench (50 chunks × 64 bytes):
+  - hidden 128: GPU 23.9 chunks/s (Sprint 17: 19.9 → +20%)
+  - hidden 256: GPU 19.0 chunks/s (Sprint 17: 18.6 → +2%)
+  - hidden 512: GPU 11.0 chunks/s (Sprint 17: 14.7 → -25%, **regrese**)
+
+**Známá limitace Sprint 18:** Při hidden=512 megakernel zaostává za Sprint 17 per-step pathem. Důvod: megakernel běží single workgroup (64 threads stride-looping přes 512 neurons × 64 timesteps × N×N matvec). Single workgroup využívá jen jeden GPU compute unit — ostatní SM jsou idle. Per-step path naopak dispatchuje N/64 workgroups paralelně na celý GPU pro matvec.
+
+Sprint 18 zlepšuje per-step CPU dispatch overhead (hidden ≤ 256 wins) ale obětuje GPU paralelismus za větší hidden. Cesta k zařadit obojí je multi-sample batch fusion (Sprint 19): dispatch B workgroups ve forwardu (jeden per batch sample), využít celý GPU paralelně.
+
+**Sprint 19+ followups:**
+- **Multi-sample batch fusion** ve forward megakernelu — `dispatch_workgroups(B, 1, 1)`, každý workgroup zpracovává jeden sample. Při batch=16 a hidden=512 by se měl využít ~16/32 SM na GTX 1650 → real GPU speedup.
+- **Sparse spike GPU path** — atomic compaction `active_indices` GPU-side, eliminace dense matvec při řídké spike rate (~5 Hz). Komplexní ale eliminuje hlavní CPU advantage.
+- **Backward megakernel** — kombinace s batch fusion. Vyžaduje atomic adds pro outer product accum přes batch dim, OR reduce-to-scratch trick.
+- **f16 mixed precision** na NVIDIA s tensor cores (volitelné post-batch-fusion).
+
+---
+
+## Sprint 19 — multi-sample forward batch fusion
+
+**Cíl:** Sprint 18 megakernel běžel single-workgroup → využíval ~1/32 GPU. Sprint 19 batchuje forward + softmax_ce na úrovni workgroups: `dispatch_workgroups(B, 1, 1)` pro forward, `dispatch_workgroups(B, T, 1)` pro softmax. Při batch=4 GPU paralelně používá 4 SM (a 16 SM by využilo 50 % GTX 1650). Backward zůstává sekvenční per sample, ale čte z packed batched cache pomocí sample-base offsetů.
+
+**Princip plánování:**
+- **Batched packed buffers.** Per-sample slice v packed bufferech: `h_v_after_packed[b * (T+1) * N + slot * N + h]`, podobně pro h_spike, h_v_pre, gate, logits, d_logits. Initial state separátně `[B*N]`. Stride bufferů přesně matchuje `(t_steps, batch_size)` (ensure_capacity reallocuje při změně dimenzí, místo paměťového paddingu).
+- **Forward megakernel: workgroup per sample.** WGSL přidá `b = workgroup_id.x` a indexuje vše s per-sample base offsetem. Workgroup-shared `sh_h_spike` / `sh_h_v_after` zůstávají per-workgroup (každý sample má svůj nezávislý stav).
+- **Softmax_ce: 2D grid `(B, T, 1)`.** Místo per-(b,t) loopu jediný dispatch covers všechny softmaxes. Targets se čtou ze storage bufferu `target_bytes_buf[b * T + t]` (4. binding přidaný do BGL).
+- **Backward sekvenční per sample.** Beze změny WGSL — kernely už mají offset push constants ze Sprintu 18. `gpu_backward_sample(input_bytes, b_idx)` jen předává offsety s per-sample base (`b_idx * T * N` a `b_idx * (T+1) * N`).
+
+**Deliverables (~700 LOC):**
+- `src/gpu/forward_mega.rs`: WGSL přidá `b = workgroup_id.x`, dispatch signature `dispatch_into(..., batch_size: u32)`.
+- `src/gpu/kernels.rs`: `softmax_ce` přepsán na 2D grid `(B, T)` s 4. storage bindingem (targets); push constants `n_output, n_timesteps`; kernel sám indexuje `bt_idx = b * T + t`.
+- `src/gpu/snn_gated_gpu.rs`:
+  - `FbScratch`: + `capacity_b`, + `target_bytes_buf`, + per-sample dimenze ve všech packed bufferech. `ensure_capacity(t, b)` reallocuje na exact match.
+  - `GatedRecurrentSnnGpu` přidá: `gpu_forward_batched(t, b)`, `compute_d_logits_gpu_batched(b, t)`, `gpu_backward_sample(inputs, b_idx)`, `upload_batch_io`, `upload_batch_initial_state`.
+  - **Nový API**: `forward_backward_batch_gpu_fused(inputs, targets, states) -> f32` — 1 forward dispatch + 1 softmax dispatch + B sequential backward.
+  - Single-sample `forward_backward_lm_bytes_gpu` přepsáno aby uploadovalo do b=0 slice a volalo `gpu_forward_batched(T, 1)`.
+- `tests/gpu_parity.rs`: + `batch_fused_matches_sequential_per_sample` — porovnává `forward_backward_batch_gpu_fused` (B=4, T=12, hidden=32) proti 4× sekvenční single-sample. Tolerance 5e-3 na všech 8 grad bufferech.
+- `examples/char_lm_gated_gpu.rs`: training loop volá `forward_backward_batch_gpu_fused` místo per-sample sekvenčního.
+
+**Exit kritérium:**
+- ✅ Cargo test (gpu feature) — 32/32 prochází (5 GPU + 27 CPU). Clippy clean s i bez gpu feature.
+- ✅ Batch parity test: max grad diff < 5e-3 mezi single-sample-N× a batch-fused (B=4, T=12).
+- ✅ Smoke test (5 KB tiny-shakespeare, hidden=256, chunk=32, batch=4, 1 epoch):
+  - Pre-Sprint-16: 23.2 s
+  - Sprint 18: 3.2 s
+  - **Sprint 19: 2.0 s** (1.6× nad Sprint 18, **11.6× cumulative** od Sprint 14).
+- 🟡 lm_gpu_speedup bench (single-sample, B=1): beze změny vůči Sprint 18 (bench nezahrnuje batch dim).
+
+**Co Sprint 19 NEŘEŠÍ:**
+- **Backward batch fusion.** Backward stále běží B× sekvenčně (každý sample vlastní iterace). To je další ~50 % chunk času.
+- **Bench update na batch.** Sprint 19 bench by měl měřit batch=4/16, ne single-sample. Sprint 20 add-on.
+- **Velký hidden (≥ 512).** Pojme single workgroup of 64 threadů + N×N matvec. Při hidden=512 jeden workgroup dělá 32k operací stride-loopem — pomalé. Mitigace by byla buď 2D workgroup `(64, B)` nebo workgroup_size scaling.
+
+**Sprint 20+ followups:**
+- **Backward batch fusion.** Kernely (`gated_cell_backward`, `dense_matvec_transpose`, `outer_product_accum`, `column_accum`, `vector_add`) rozšířit o batch dim. `outer_product_accum` musí scinat přes batch dim (per-thread loop nebo atomic adds). Cíl: druhý ~2× speedup nad Sprint 19.
+- **Sparse spike GPU path** — atomic compaction `active_indices` GPU-side při ~5 Hz firing rate.
+- **Bench update**: měřit s batch=4/16 aby se ukázal Sprint 19 win.
+
+---
+
+## Sprint 20 a dál — možné větve (decision point po 19)
 
 **Vstupy do rozhodnutí:**
 - Sprint 13 GPU speedup
