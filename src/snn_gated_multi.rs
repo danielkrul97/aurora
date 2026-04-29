@@ -206,6 +206,10 @@ pub struct MultiLayerGatedGrads {
     pub layers: Vec<LayerGrads>,
     pub w_out: Vec<f32>,
     pub b_o: Vec<f32>,
+    /// Sprint 38: SDSA gradient bundle. `Some` when network has SDSA
+    /// enabled — populated by `backward_lm_tokens_into`, consumed by
+    /// `step_adam`. Parallel batch trainers each carry their own.
+    pub sdsa: Option<crate::sdsa::SdsaGrads>,
 }
 
 impl MultiLayerGatedGrads {
@@ -220,6 +224,7 @@ impl MultiLayerGatedGrads {
             layers,
             w_out: vec![0.0; n_output * top_hidden],
             b_o: vec![0.0; n_output],
+            sdsa: None,
         }
     }
 
@@ -229,6 +234,9 @@ impl MultiLayerGatedGrads {
         }
         self.w_out.fill(0.0);
         self.b_o.fill(0.0);
+        if let Some(g) = self.sdsa.as_mut() {
+            g.zero();
+        }
     }
 
     pub fn add(&mut self, other: &Self) {
@@ -240,6 +248,9 @@ impl MultiLayerGatedGrads {
         }
         for (a, b) in self.b_o.iter_mut().zip(&other.b_o) {
             *a += b;
+        }
+        if let (Some(a), Some(b)) = (self.sdsa.as_mut(), other.sdsa.as_ref()) {
+            a.add(b);
         }
     }
 
@@ -253,6 +264,11 @@ impl MultiLayerGatedGrads {
         for v in self.w_out.iter().chain(&self.b_o) {
             sq += v * v;
         }
+        if let Some(g) = self.sdsa.as_ref() {
+            for v in g.iter_all() {
+                sq += v * v;
+            }
+        }
         sq.sqrt()
     }
 
@@ -264,6 +280,11 @@ impl MultiLayerGatedGrads {
         }
         for v in self.w_out.iter_mut().chain(&mut self.b_o) {
             *v *= factor;
+        }
+        if let Some(g) = self.sdsa.as_mut() {
+            for v in g.iter_all_mut() {
+                *v *= factor;
+            }
         }
     }
 }
@@ -292,10 +313,15 @@ impl LayerCache {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MultiLayerCache {
     pub layers: Vec<LayerCache>,
     pub logits: Vec<Vec<f32>>,
+    /// Sprint 38: SDSA forward cache + flat residual `y = h_spike +
+    /// sdsa_out` over the chunk's top spikes. Both `Some` together when
+    /// the network has SDSA enabled.
+    pub sdsa: Option<crate::sdsa::SdsaCache>,
+    pub sdsa_y: Option<Vec<f32>>,
 }
 
 impl MultiLayerCache {
@@ -417,6 +443,13 @@ pub struct MultiLayerGatedSnn {
     pub b_o: Vec<f32>,
     pub spike_fn: SpikeFn,
     pub rate_reg: RateReg,
+    /// Sprint 38: optional Spike-Driven Self-Attention block applied
+    /// after the top SNN layer, before the W_out projection. When
+    /// `None`, behavior is identical to pre-SDSA Aurora (sparse W_out
+    /// matvec from spike output). When `Some`, residual `y = h_spike +
+    /// sdsa_out` feeds a dense W_out matvec.
+    pub sdsa: Option<crate::sdsa::SdsaCell>,
+    sdsa_adam: Option<crate::sdsa::SdsaAdam>,
     grads: MultiLayerGatedGrads,
     adam_t: usize,
     layer_adam: Vec<LayerAdam>,
@@ -464,6 +497,8 @@ impl MultiLayerGatedSnn {
             b_o: vec![0.0; n_output],
             spike_fn,
             rate_reg: RateReg::default(),
+            sdsa: None,
+            sdsa_adam: None,
             adam_t: 0,
             layer_adam,
             adam_w_out: AdamGroup::zeros(n_output * top_hidden),
@@ -471,12 +506,35 @@ impl MultiLayerGatedSnn {
         }
     }
 
+    /// Sprint 38: turn on Spike-Driven Self-Attention. Allocates
+    /// `SdsaCell` (LayerNorm + Q/K/V projections, dim = top hidden)
+    /// + grads + Adam state. Reuses the network's RNG seed so two
+    /// calls with the same seed produce identical SDSA params.
+    pub fn enable_sdsa<R: Rng>(&mut self, rng: &mut R) {
+        let n = self.layers.last().expect("≥1 layer").n_hidden;
+        self.sdsa = Some(crate::sdsa::SdsaCell::new(n, rng));
+        self.grads.sdsa = Some(crate::sdsa::SdsaGrads::zeros(n));
+        self.sdsa_adam = Some(crate::sdsa::SdsaAdam::zeros(n));
+    }
+
     pub fn fresh_states(&self) -> Vec<GatedState> {
+        let n_layers = self.layers.len();
         self.layers
             .iter()
-            .map(|l| GatedState {
-                h_v_after: vec![0.0_f32; l.n_hidden],
-                h_spike: vec![0.0_f32; l.n_hidden],
+            .enumerate()
+            .map(|(idx, l)| {
+                // SDSA accumulator carries between chunks; lives on
+                // the top layer's state when SDSA is enabled.
+                let attn_state = if self.sdsa.is_some() && idx + 1 == n_layers {
+                    vec![0.0_f32; l.n_hidden]
+                } else {
+                    Vec::new()
+                };
+                GatedState {
+                    h_v_after: vec![0.0_f32; l.n_hidden],
+                    h_spike: vec![0.0_f32; l.n_hidden],
+                    attn_state,
+                }
             })
             .collect()
     }
@@ -490,7 +548,12 @@ impl MultiLayerGatedSnn {
         for l in &self.layers {
             layer_dims.push(l.n_hidden);
         }
-        MultiLayerGatedGrads::zeros(&layer_dims, self.n_output)
+        let mut g = MultiLayerGatedGrads::zeros(&layer_dims, self.n_output);
+        if self.sdsa.is_some() {
+            let n = self.layers.last().expect("≥1 layer").n_hidden;
+            g.sdsa = Some(crate::sdsa::SdsaGrads::zeros(n));
+        }
+        g
     }
 
     pub fn zero_grad(&mut self) {
@@ -578,6 +641,14 @@ impl MultiLayerGatedSnn {
             bc1,
             bc2,
         );
+        // Sprint 38: step the SDSA params if enabled.
+        if let (Some(cell), Some(g), Some(adam)) = (
+            self.sdsa.as_mut(),
+            self.grads.sdsa.as_ref(),
+            self.sdsa_adam.as_mut(),
+        ) {
+            crate::sdsa::sdsa_step_adam(cell, g, adam, config, bc1, bc2);
+        }
     }
 
     /// Stateful sparse LM forward over arbitrary token IDs (u32).
@@ -595,6 +666,8 @@ impl MultiLayerGatedSnn {
         let mut cache = MultiLayerCache {
             layers: (0..n_layers).map(|_| LayerCache::with_capacity(t_steps)).collect(),
             logits: Vec::with_capacity(t_steps),
+            sdsa: None,
+            sdsa_y: None,
         };
         for (l, st) in states.iter().enumerate() {
             cache.layers[l].initial_h_v_after = st.h_v_after.clone();
@@ -677,17 +750,53 @@ impl MultiLayerGatedSnn {
             }
 
             // Output projection from top layer's spike output.
-            let top_active = layer_input_active; // == active indices of top spike
-            let mut logits = self.b_o.clone();
-            for o in 0..self.n_output {
-                let row_offset = o * top_hidden;
-                let mut acc = self.b_o[o];
-                for &c in &top_active {
-                    acc += self.w_out[row_offset + c];
+            // Sprint 38: when SDSA is enabled, defer logits to a
+            // post-loop pass over the residual `y = h_spike + sdsa_out`.
+            if self.sdsa.is_none() {
+                let top_active = layer_input_active; // == active indices of top spike
+                let mut logits = self.b_o.clone();
+                for o in 0..self.n_output {
+                    let row_offset = o * top_hidden;
+                    let mut acc = self.b_o[o];
+                    for &c in &top_active {
+                        acc += self.w_out[row_offset + c];
+                    }
+                    logits[o] = acc;
                 }
-                logits[o] = acc;
+                cache.logits.push(logits);
             }
-            cache.logits.push(logits);
+        }
+
+        // Sprint 38 SDSA pass: collect top-layer h_spike across all
+        // timesteps, run linear-attention forward, then dense W_out
+        // matvec on the residual `y = h_spike + sdsa_out`.
+        if let Some(sdsa) = &self.sdsa {
+            let top = n_layers - 1;
+            let h_top_flat: Vec<f32> = cache.layers[top]
+                .h_spike
+                .iter()
+                .flat_map(|row| row.iter().copied())
+                .collect();
+            let initial_attn = states[top].attn_state.clone();
+            let (y_flat, sdsa_cache) =
+                crate::sdsa::sdsa_forward(sdsa, &h_top_flat, &initial_attn);
+            states[top].attn_state = sdsa_cache.final_attn_state.clone();
+
+            for t in 0..t_steps {
+                let y_t = &y_flat[t * top_hidden..(t + 1) * top_hidden];
+                let mut logits = vec![0.0_f32; self.n_output];
+                for o in 0..self.n_output {
+                    let row_offset = o * top_hidden;
+                    let mut acc = self.b_o[o];
+                    for h in 0..top_hidden {
+                        acc += self.w_out[row_offset + h] * y_t[h];
+                    }
+                    logits[o] = acc;
+                }
+                cache.logits.push(logits);
+            }
+            cache.sdsa = Some(sdsa_cache);
+            cache.sdsa_y = Some(y_flat);
         }
 
         cache
@@ -730,6 +839,19 @@ impl MultiLayerGatedSnn {
         let n_layers = self.layers.len();
         let top_hidden = self.layers.last().unwrap().n_hidden;
 
+        // Sprint 38: when SDSA is on, the W_out matvec ate the dense
+        // residual `y` (not sparse `h_spike`), so its gradient is a
+        // dense outer product. We pre-compute `d_y[t]` (and accumulate
+        // W_out + b_o grads), run SDSA backward over all timesteps in
+        // one shot to get the augmented `d_h_spike` for the top layer,
+        // and feed that back into the per-t reverse loop in place of
+        // the sparse `matvec_transpose(W_out, d_logits)` route.
+        let (d_h_top_pre, sdsa_loss) = if self.sdsa.is_some() {
+            self.backward_top_through_sdsa(cache, targets, grads)
+        } else {
+            (None, 0.0)
+        };
+
         // Per-layer carry buffers (carry from t+1 back into t).
         let mut d_h_v_after_carry: Vec<Vec<f32>> = self
             .layers
@@ -745,29 +867,32 @@ impl MultiLayerGatedSnn {
         let mut total_loss = 0.0_f32;
 
         for t in (0..t_steps).rev() {
-            let (loss_t, d_logits) =
-                cross_entropy_with_grad(&cache.logits[t], targets[t] as usize);
-            total_loss += loss_t;
+            let d_h_top_spike_from_out = if let Some(d_arr) = d_h_top_pre.as_ref() {
+                // SDSA path: loss + W_out grad already accounted for in
+                // `backward_top_through_sdsa`. d_h is the SDSA backward
+                // result with residual contribution included.
+                d_arr[t].clone()
+            } else {
+                let (loss_t, d_logits) =
+                    cross_entropy_with_grad(&cache.logits[t], targets[t] as usize);
+                total_loss += loss_t;
 
-            // Top layer spike at t (used for W_out grad and back-prop
-            // into top layer hidden).
-            let top_layer = n_layers - 1;
-            let active_top_t = active_indices(&cache.layers[top_layer].h_spike[t]);
+                let top_layer = n_layers - 1;
+                let active_top_t = active_indices(&cache.layers[top_layer].h_spike[t]);
 
-            // grad_w_out and grad_b_o + d_h_top_spike via output.
-            for o in 0..self.n_output {
-                let d = d_logits[o];
-                if d == 0.0 {
-                    continue;
+                for o in 0..self.n_output {
+                    let d = d_logits[o];
+                    if d == 0.0 {
+                        continue;
+                    }
+                    grads.b_o[o] += d;
+                    let row_offset = o * top_hidden;
+                    for &h in &active_top_t {
+                        grads.w_out[row_offset + h] += d;
+                    }
                 }
-                grads.b_o[o] += d;
-                let row_offset = o * top_hidden;
-                for &h in &active_top_t {
-                    grads.w_out[row_offset + h] += d;
-                }
-            }
-            let d_h_top_spike_from_out =
-                matvec_transpose(&self.w_out, &d_logits, self.n_output, top_hidden);
+                matvec_transpose(&self.w_out, &d_logits, self.n_output, top_hidden)
+            };
 
             // Top-down gradient that becomes the per-layer
             // `d_h_spike_from_above` for the top layer; for layer L<top
@@ -921,7 +1046,78 @@ impl MultiLayerGatedSnn {
             }
         }
 
-        total_loss
+        total_loss + sdsa_loss
+    }
+
+    /// Sprint 38: SDSA-aware top-of-stack backward. Walks all
+    /// timesteps' logits in one shot, accumulates `W_out` + `b_o`
+    /// grads against the dense residual `y`, runs `sdsa_backward`
+    /// once over the chunk, returns per-t `d_h_spike` for the top
+    /// layer plus the summed CE loss. Caller injects the per-t result
+    /// in place of the sparse-W_out path.
+    fn backward_top_through_sdsa(
+        &self,
+        cache: &MultiLayerCache,
+        targets: &[u32],
+        grads: &mut MultiLayerGatedGrads,
+    ) -> (Option<Vec<Vec<f32>>>, f32) {
+        let sdsa = self.sdsa.as_ref().expect("SDSA enabled");
+        let sdsa_cache = cache
+            .sdsa
+            .as_ref()
+            .expect("forward must populate cache.sdsa when SDSA on");
+        let y_flat = cache
+            .sdsa_y
+            .as_ref()
+            .expect("forward must populate cache.sdsa_y when SDSA on");
+        let n_layers = self.layers.len();
+        let top = n_layers - 1;
+        let n_h = self.layers[top].n_hidden;
+        let t_steps = targets.len();
+
+        let mut total_loss = 0.0_f32;
+        let mut d_y_flat = vec![0.0_f32; t_steps * n_h];
+        for t in 0..t_steps {
+            let (loss_t, d_logits) =
+                cross_entropy_with_grad(&cache.logits[t], targets[t] as usize);
+            total_loss += loss_t;
+            let y_t = &y_flat[t * n_h..(t + 1) * n_h];
+            for o in 0..self.n_output {
+                let d = d_logits[o];
+                if d == 0.0 {
+                    continue;
+                }
+                grads.b_o[o] += d;
+                let row = o * n_h;
+                for h in 0..n_h {
+                    grads.w_out[row + h] += d * y_t[h];
+                }
+            }
+            let d_y_t = matvec_transpose(&self.w_out, &d_logits, self.n_output, n_h);
+            d_y_flat[t * n_h..(t + 1) * n_h].copy_from_slice(&d_y_t);
+        }
+
+        let h_top_flat: Vec<f32> = cache.layers[top]
+            .h_spike
+            .iter()
+            .flat_map(|r| r.iter().copied())
+            .collect();
+        let sdsa_grads = grads
+            .sdsa
+            .as_mut()
+            .expect("MultiLayerGatedGrads.sdsa must be Some when SDSA on");
+        let d_h_spike_flat = crate::sdsa::sdsa_backward(
+            sdsa,
+            sdsa_cache,
+            &h_top_flat,
+            &d_y_flat,
+            sdsa_grads,
+        );
+
+        let d_h_per_t: Vec<Vec<f32>> = (0..t_steps)
+            .map(|t| d_h_spike_flat[t * n_h..(t + 1) * n_h].to_vec())
+            .collect();
+        (Some(d_h_per_t), total_loss)
     }
 
     /// Byte-level wrapper around `backward_lm_tokens_into` (Sprint 26).

@@ -162,6 +162,11 @@ pub struct GatedLmCache {
 pub struct GatedState {
     pub h_v_after: Vec<f32>,
     pub h_spike: Vec<f32>,
+    /// Sprint 38: SDSA running attention accumulator. Empty `Vec` when
+    /// SDSA is not in use (per-layer state for non-top layers, or any
+    /// layer when the network has no `sdsa: Option<SdsaCell>`). For
+    /// the top layer with SDSA enabled, sized to that layer's hidden.
+    pub attn_state: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -304,6 +309,7 @@ impl GatedRecurrentSnn {
         GatedState {
             h_v_after: vec![0.0_f32; self.n_hidden],
             h_spike: vec![0.0_f32; self.n_hidden],
+            attn_state: Vec::new(),
         }
     }
 

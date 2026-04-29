@@ -355,7 +355,45 @@ SpikGPT (RWKV-style spiking, 46M params) hits BPC 1.26 na enwik8. Aurora s SDSA 
 
 ---
 
-## Sprint 38+ — Pokračování
+## Sprint 38 — SDSA wiring do MultiLayerGatedSnn ✓ DONE (CPU)
+
+**Cíl:** Sprint 35 SDSA modul integrovat do CPU trénovací cesty `MultiLayerGatedSnn`. Forward, backward, Adam, end-to-end test.
+
+**Hotovo:**
+
+1. **`GatedState` rozšířen** o `attn_state: Vec<f32>` (default empty). `fresh_states()` alokuje attn_state jen pro top vrstvu když je SDSA on.
+
+2. **`MultiLayerGatedSnn`** dostal `pub sdsa: Option<SdsaCell>` + privátní `sdsa_adam`. **`MultiLayerGatedGrads`** rozšířen o `sdsa: Option<SdsaGrads>` (umožňuje parallel batch trainers s vlastním SDSA grad).
+
+3. **`enable_sdsa(&mut rng)`** API — turn on SDSA na existujícím netu. Default off zachovává backward compat se všemi existujícími testy.
+
+4. **Forward**: po SNN cell t-loopu, pokud SDSA on, sdsa_forward přes top-layer h_spike, residual `y = h_spike + sdsa_out`, dense W_out matvec proti `y[t]`. Pokud SDSA off, existing sparse W_out cesta beze změny.
+
+5. **Backward**: nový helper `backward_top_through_sdsa()` — pre-počítá d_y a W_out + b_o grads (dense outer product), volá sdsa_backward, vrací per-t d_h_spike pro top vrstvu. Hlavní per-t reverse loop pak používá tuto pre-computed hodnotu místo sparse `matvec_transpose(W_out, d_logits)`.
+
+6. **Adam**: `step_adam()` volá `sdsa_step_adam()` na konci pokud SDSA on. **`MultiLayerGatedGrads::{zero, add, l2_norm, scale}`** všechny pokrývají SDSA pole.
+
+7. **`tests/sdsa_integration.rs`** — 2 testy:
+   - `sdsa_enabled_forward_backward_train_step`: SDSA on, ověří finite loss, Adam updateuje SDSA váhy (W_q[0] se hýbe), attn_state je non-zero po několika chunks
+   - `sdsa_disabled_path_unchanged`: SDSA off, fresh_states nezalokuje attn_state, training nedotčen
+
+**Test results:**
+- 51/51 unit testů (49 + 2 SDSA integration)
+- 6/6 GPU parity (žádná regrese)
+- Clippy clean v novém kódu
+
+**Záměrně neudělané** (Sprint 39):
+- **GPU port** — aurora_train je GPU-only, takže SDSA zatím není používaná v hlavní training cestě. Vyžaduje nové WGSL kernely: linear-attention forward (per-t accumulator update + Hadamard q×state), linear-attention backward (reverse cumulative attn-grad), spike binarize Q/K/V via existing surrogate.
+- **Aurora_train `--sdsa` flag** — bude přidán až SDSA poteče přes GPU.
+- **Checkpoint v3** s SDSA params — momentálně se SDSA váhy ztratí přes resume.
+
+**Důsledek pro empirické testování:**
+
+SDSA matematika je verified, integrace do CPU pipeline je hotová a otestovaná. Ale **Aurora_train neschopen SDSA**, takže overnight enwik8_10m benchmark se SDSA on **vyžaduje Sprint 39** (GPU port). Do té doby SDSA experiment dostupný jen přes CPU regression-style smoke testy.
+
+---
+
+## Sprint 39+ — Pokračování
 
 ---
 
