@@ -26,6 +26,8 @@ gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 
 [dev-dependencies]
 criterion = "0.5"
+indicatif = "0.18"
+textplots = "0.8"
 
 [[bench]]
 name = "sparsity_scaling"
@@ -47,3 +49,6 @@ harness = false
 [[example]]
 name = "aurora_train"
 required-features = ["gpu"]
+
+[[example]]
+name = "aurora_lnn_train"

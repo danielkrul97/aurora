@@ -16,6 +16,7 @@ pub mod gpu;
 pub mod homeostasis;
 pub mod lif;
 pub mod linalg;
+pub mod lnn;
 pub mod mnist;
 pub mod network;
 pub mod neuromodulator;
