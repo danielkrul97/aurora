@@ -75,17 +75,85 @@ impl SsmLayer {
     /// `b = (1 - a) · θ` so `v_eq = θ` regardless of `a`. Effective
     /// memory ≈ `1 / (1 - a)` timesteps.
     pub fn new_with_a<R: Rng>(n_in: usize, n_hidden: usize, a_init: f32, rng: &mut R) -> Self {
+        Self::new_with_a_spread(n_in, n_hidden, a_init, 0.0, rng)
+    }
+
+    /// Sprint 48: HiPPO-style log-linear memory spectrum. Neurons
+    /// span timescales from fast (`a ≈ a_lo`, ~1/(1-a_lo) steps memory)
+    /// to slow (`a ≈ a_hi`, ~1/(1-a_hi) steps), with `log(1-a_i)`
+    /// linearly interpolated between the two. Standard SSM init
+    /// (Gu et al., HiPPO) — provides intrinsic multi-scale temporal
+    /// representation without requiring time-varying gates.
+    pub fn new_with_a_spectrum<R: Rng>(
+        n_in: usize,
+        n_hidden: usize,
+        a_lo: f32,
+        a_hi: f32,
+        rng: &mut R,
+    ) -> Self {
         let scale_in = (2.0 / n_in as f32).sqrt();
         let w_in = (0..n_hidden * n_in)
             .map(|_| (rng.random::<f32>() - 0.5) * 2.0 * scale_in)
             .collect();
-        let b_init = (1.0 - a_init).max(1e-3);
+        let log_lo = (1.0 - a_lo).max(1e-3).ln();
+        let log_hi = (1.0 - a_hi).max(1e-3).ln();
+        let a: Vec<f32> = (0..n_hidden)
+            .map(|i| {
+                let frac = if n_hidden > 1 {
+                    i as f32 / (n_hidden - 1) as f32
+                } else {
+                    0.5
+                };
+                let log_decay = log_lo + (log_hi - log_lo) * frac;
+                (1.0 - log_decay.exp()).clamp(0.05, 0.99)
+            })
+            .collect();
+        let b: Vec<f32> = a.iter().map(|&v| (1.0 - v).max(1e-3)).collect();
         Self {
             n_in,
             n_hidden,
-            a: vec![a_init; n_hidden],
+            a,
             w_in,
-            b: vec![b_init; n_hidden],
+            b,
+            alpha: DEFAULT_ALPHA,
+        }
+    }
+
+    /// Sprint 48: heterogenous diagonal `a`. Each neuron's `a` is
+    /// drawn uniformly from `[a_init - spread, a_init + spread]`,
+    /// clamped to `[0.05, 0.99]`. Per-neuron `b = (1 - a_i) · θ` keeps
+    /// equilibrium at threshold for every neuron individually. Spread
+    /// > 0 introduces a memory-spectrum: some neurons fast, some slow
+    /// — diversity that may break the WTA failure mode of homogeneous
+    /// long-memory init.
+    pub fn new_with_a_spread<R: Rng>(
+        n_in: usize,
+        n_hidden: usize,
+        a_init: f32,
+        spread: f32,
+        rng: &mut R,
+    ) -> Self {
+        let scale_in = (2.0 / n_in as f32).sqrt();
+        let w_in = (0..n_hidden * n_in)
+            .map(|_| (rng.random::<f32>() - 0.5) * 2.0 * scale_in)
+            .collect();
+        let a: Vec<f32> = (0..n_hidden)
+            .map(|_| {
+                let r = if spread > 0.0 {
+                    a_init + (rng.random::<f32>() - 0.5) * 2.0 * spread
+                } else {
+                    a_init
+                };
+                r.clamp(0.05, 0.99)
+            })
+            .collect();
+        let b: Vec<f32> = a.iter().map(|&v| (1.0 - v).max(1e-3)).collect();
+        Self {
+            n_in,
+            n_hidden,
+            a,
+            w_in,
+            b,
             alpha: DEFAULT_ALPHA,
         }
     }
@@ -344,14 +412,57 @@ impl MultiLayerSsmSnn {
         a_init: f32,
         rng: &mut R,
     ) -> Self {
+        Self::new_with_a_spread(n_input, hidden_dims, n_output, spike_fn, a_init, 0.0, rng)
+    }
+
+    pub fn new_with_a_spread<R: Rng>(
+        n_input: usize,
+        hidden_dims: &[usize],
+        n_output: usize,
+        spike_fn: SpikeFn,
+        a_init: f32,
+        spread: f32,
+        rng: &mut R,
+    ) -> Self {
         assert!(!hidden_dims.is_empty(), "at least one layer required");
         let mut layers = Vec::with_capacity(hidden_dims.len());
         let mut prev_dim = n_input;
         for &h in hidden_dims {
-            layers.push(SsmLayer::new_with_a(prev_dim, h, a_init, rng));
+            layers.push(SsmLayer::new_with_a_spread(prev_dim, h, a_init, spread, rng));
             prev_dim = h;
         }
-        let top_hidden = prev_dim;
+        Self::finish_construction(layers, n_input, hidden_dims, n_output, spike_fn, rng)
+    }
+
+    /// Sprint 48: HiPPO-style construction.
+    pub fn new_with_spectrum<R: Rng>(
+        n_input: usize,
+        hidden_dims: &[usize],
+        n_output: usize,
+        spike_fn: SpikeFn,
+        a_lo: f32,
+        a_hi: f32,
+        rng: &mut R,
+    ) -> Self {
+        assert!(!hidden_dims.is_empty(), "at least one layer required");
+        let mut layers = Vec::with_capacity(hidden_dims.len());
+        let mut prev_dim = n_input;
+        for &h in hidden_dims {
+            layers.push(SsmLayer::new_with_a_spectrum(prev_dim, h, a_lo, a_hi, rng));
+            prev_dim = h;
+        }
+        Self::finish_construction(layers, n_input, hidden_dims, n_output, spike_fn, rng)
+    }
+
+    fn finish_construction<R: Rng>(
+        layers: Vec<SsmLayer>,
+        n_input: usize,
+        hidden_dims: &[usize],
+        n_output: usize,
+        spike_fn: SpikeFn,
+        rng: &mut R,
+    ) -> Self {
+        let top_hidden = *hidden_dims.last().unwrap();
         let scale_out = (2.0 / top_hidden as f32).sqrt();
         let w_out = (0..n_output * top_hidden)
             .map(|_| (rng.random::<f32>() - 0.5) * 2.0 * scale_out)

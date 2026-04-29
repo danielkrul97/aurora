@@ -102,6 +102,14 @@ struct Cli {
     /// Sprint 47: SSM diagonal decay init. Effective memory ≈
     /// `1 / (1 - a)` timesteps. Default 0.5 matches Sprint 46.
     ssm_a_init: f32,
+    /// Sprint 48: per-neuron heterogenous `a` spread. Each neuron's
+    /// `a` ~ Uniform[a_init - spread, a_init + spread], clamped to
+    /// [0.05, 0.99]. Default 0 = homogeneous.
+    ssm_a_spread: f32,
+    /// Sprint 48: HiPPO-style log-linear spectrum `a_lo,a_hi`. When
+    /// set, overrides `--ssm-a-init` / spread — neuron i gets
+    /// `a_i = 1 - exp(lerp(log(1-a_lo), log(1-a_hi), i/(N-1)))`.
+    ssm_spectrum: Option<String>,
 }
 
 impl Cli {
@@ -131,6 +139,8 @@ impl Cli {
         let mut seed: u64 = 0xC0FFEE;
         let mut cell: String = "gated".to_string();
         let mut ssm_a_init: f32 = 0.5;
+        let mut ssm_a_spread: f32 = 0.0;
+        let mut ssm_spectrum: Option<String> = None;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -241,6 +251,17 @@ impl Cli {
                     }
                     i += 2;
                 }
+                "--ssm-a-spread" => {
+                    ssm_a_spread = next()?.parse().map_err(|e| format!("--ssm-a-spread: {e}"))?;
+                    if ssm_a_spread < 0.0 || ssm_a_spread > 0.5 {
+                        return Err(format!("--ssm-a-spread must be in [0, 0.5], got {ssm_a_spread}"));
+                    }
+                    i += 2;
+                }
+                "--ssm-spectrum" => {
+                    ssm_spectrum = Some(next()?.clone());
+                    i += 2;
+                }
                 "--seed" => {
                     let v = next()?;
                     seed = if let Some(rest) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
@@ -342,6 +363,8 @@ impl Cli {
             seed,
             cell,
             ssm_a_init,
+            ssm_a_spread,
+            ssm_spectrum,
         })
     }
 }
@@ -742,14 +765,46 @@ fn run_ssm(
 
     let mut rng = StdRng::seed_from_u64(cli.seed);
     let hidden_dims: Vec<usize> = vec![cli.hidden; cli.n_layers];
-    let mut net = MultiLayerSsmSnn::new_with_a(
-        actual_vocab,
-        &hidden_dims,
-        actual_vocab,
-        SpikeFn::default(),
-        cli.ssm_a_init,
-        &mut rng,
-    );
+    let mut net = if let Some(spec) = &cli.ssm_spectrum {
+        let parts: Vec<&str> = spec.split(',').collect();
+        if parts.len() != 2 {
+            eprintln!("--ssm-spectrum expects 'a_lo,a_hi', got '{spec}'");
+            return ExitCode::FAILURE;
+        }
+        let a_lo: f32 = match parts[0].trim().parse() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("--ssm-spectrum a_lo parse: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let a_hi: f32 = match parts[1].trim().parse() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("--ssm-spectrum a_hi parse: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        MultiLayerSsmSnn::new_with_spectrum(
+            actual_vocab,
+            &hidden_dims,
+            actual_vocab,
+            SpikeFn::default(),
+            a_lo,
+            a_hi,
+            &mut rng,
+        )
+    } else {
+        MultiLayerSsmSnn::new_with_a_spread(
+            actual_vocab,
+            &hidden_dims,
+            actual_vocab,
+            SpikeFn::default(),
+            cli.ssm_a_init,
+            cli.ssm_a_spread,
+            &mut rng,
+        )
+    };
     let backend_name = "CPU SSM (rayon)".to_string();
 
     let adam = AdamConfig {

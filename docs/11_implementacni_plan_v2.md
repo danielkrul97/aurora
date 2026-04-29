@@ -969,6 +969,89 @@ Logy v `logs/sprint47/*.jsonl`.
 
 ---
 
+## Sprint 48 — 5 hyperparam experimentů ✓ DONE (3 wow výsledky)
+
+**Cíl:** Quality + speed exploration na SSM cellu. 5 nezávislých
+experimentů, "wow threshold" Δ ≤ −0.05 BPB vs Sprint 47 baseline (2.522).
+
+**Setup:** tiny_600k, h=128 × 2L, 3 epoch, n=3 seedů, paired vs Sprint 47.
+
+| # | experiment | val BPB | Δ | wow? |
+|---|---|---|---|---|
+| 1 | lr=0.005 | **2.445 ± 0.005** | **−0.077** | ✓ |
+| 1b | lr=0.01 | 2.468 ± 0.003 | −0.054 | ✓ |
+| 2 | h=256, lr=0.005 | 2.390 ± 0.008 | −0.132 | ✓ |
+| 2b | h=512, lr=0.005 | **2.377 ± 0.005** | **−0.145** | ✓ |
+| 3 | a-spread=0.2 | 2.458 ± 0.005 | −0.064 (vs S47) | – |
+| 3b | a-spread=0.4 | 2.474 ± 0.005 | −0.048 | – |
+| 4 | spectrum [0.1, 0.95] | 2.578 ± 0.001 | +0.056 | – (regression) |
+| 4b | spectrum [0.3, 0.9] | 2.528 ± 0.004 | +0.006 | – |
+| 5a | h=512 + lr=0.005 + 6 ep | **2.365 ± 0.006** | **−0.157** | ✓✓ |
+| 5b | h=512 + lr=0.005 + chunk=32 | 2.397 ± 0.005 | −0.125 | ✓ |
+
+**3 wow nálezy:**
+
+1. **Default lr=0.002 byl bottleneck.** Bumping na 0.005 = okamžitý
+   −0.077 BPB win bez další změny. Gated cell potřebovala konzervativnější
+   LR; SSM toleruje agresivnější.
+2. **Capacity scaling pomáhá lineárně do h=256**, pak diminishing
+   returns. Sprint 47's tvrzení "h=128 stačí" platilo jen při lr=0.002.
+3. **Longer training (6 ep) dál konverguje** s velkým modelem
+   (h=512). Při h=128 by 6 ep nepomohlo (model už saturoval).
+
+**Negativní nálezy (ale informativní):**
+
+4. **A-diversita nepomohla.** Random spread (Exp 3) i strukturovaný
+   HiPPO spectrum (Exp 4) dají horší výsledky. Při h=128 je multi-scale
+   memory luxus, který přijde o reprezentační kapacitu. Možná by
+   pomohlo při h=512+ (untested).
+5. **Chunk=32 neunlock** víc kvality. Extra Adam steps nevyrovnají
+   ztrátu kontextového okna.
+
+**Finální BPB trajektorie:**
+
+```
+Aurora gated baseline (Sprint 45):  2.717   výchozí stav
++ SSM cell      (Sprint 46):        2.520   Δ −0.197 (-7.3 %)
++ lr=0.005      (Sprint 48 Exp 1):  2.445   Δ −0.075 (-3.0 %)
++ h=512         (Sprint 48 Exp 2):  2.377   Δ −0.068 (-2.8 %)
++ 6 epoch       (Sprint 48 Exp 5):  2.365   Δ −0.012 (-0.5 %)
+                                    ─────
+Cumulative gain:                    −0.352 BPB (-13.0 %)
+```
+
+**CLI doplněk:** `--ssm-a-spread <delta>` (heterogenous random a),
+`--ssm-spectrum a_lo,a_hi` (HiPPO log-linear spectrum).
+
+**Wall time:**
+
+- h=128 lr=0.005, 3 epoch: 23 s/run
+- h=512 lr=0.005, 3 epoch: 78 s/run (~3.4× pomalejší per epoch, 4× params)
+- h=512 lr=0.005, 6 epoch: 156 s/run
+
+**Doporučená Aurora konfigurace pro tiny_600k:**
+
+```
+--cell ssm --hidden 512 --lr 0.005 --epochs 6 --ssm-a-init 0.5
+```
+
+→ val BPB 2.365 ± 0.006, deterministic across seeds.
+
+**Open vs co dál:**
+
+- Multi-seed na enwik8_10m (scaling test) na nové konfiguraci.
+- A-diversita možná funguje při h=512 (untested kombinace).
+- State LayerNorm / tanh activation pro long-memory regime
+  (Sprint 47's open) se dál nezkoušelo — LR + capacity zlomily plateau
+  bez nutnosti.
+
+**Soubory:** `src/ssm.rs` (`new_with_a_spread`, `new_with_a_spectrum`,
+`new_with_spectrum`, `finish_construction` helper),
+`examples/aurora_train.rs` (`--ssm-a-spread`, `--ssm-spectrum`).
+Logy v `logs/sprint48/*.jsonl`.
+
+---
+
 ## Sprint 33+ — možné větve (rozhodneme po měření 32)
 
 | Větev | Co odemyká | Effort | Zdroj |
