@@ -766,17 +766,20 @@ impl MultiLayerGatedSnn {
                     }
                     h_v_pre_t[hi] = acc.clamp(-MEMBRANE_CLAMP, MEMBRANE_CLAMP);
                 }
-                let h_spike_t: Vec<f32> = h_v_pre_t
-                    .iter()
-                    .map(|&v| self.spike_fn.forward(v))
-                    .collect();
-                let h_v_after_t: Vec<f32> = h_v_pre_t
-                    .iter()
-                    .zip(h_spike_t.iter())
-                    .map(|(&v, &s)| v - theta * s)
-                    .collect();
-
-                let active_t = active_indices(&h_spike_t);
+                // Fused spike / h_v_after / active-set scan: three
+                // O(n_h) passes (`map → collect`, `zip-map → collect`,
+                // `active_indices`) compressed into one tight loop.
+                let mut h_spike_t: Vec<f32> = Vec::with_capacity(n_h);
+                let mut h_v_after_t: Vec<f32> = Vec::with_capacity(n_h);
+                let mut active_t: Vec<usize> = Vec::new();
+                for (hi, &v) in h_v_pre_t.iter().enumerate() {
+                    let s = self.spike_fn.forward(v);
+                    h_spike_t.push(s);
+                    h_v_after_t.push(v - theta * s);
+                    if s != 0.0 {
+                        active_t.push(hi);
+                    }
+                }
 
                 // Sprint 40 AdLIF update: w_t = ρ·w_{t-1} + b·spike_t.
                 if !states[l].adlif_w.is_empty() {
@@ -1206,7 +1209,6 @@ impl MultiLayerGatedSnn {
             sdsa_grads,
         );
 
-        let _ = t_steps;
         (Some(d_h_spike_flat), total_loss)
     }
 

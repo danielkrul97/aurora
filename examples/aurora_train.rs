@@ -51,7 +51,6 @@ const GRAD_CLIP: f32 = 1.0;
 const SAMPLE_LEN: usize = 200;
 const SAMPLE_TEMP: f32 = 0.8;
 const BATCH_SIZE: usize = 16;
-const N_LAYERS: usize = 2;
 
 #[derive(Debug, Clone)]
 struct Cli {
@@ -73,6 +72,9 @@ struct Cli {
     sdsa: bool,
     /// Sprint 40: enable AdLIF adaptation current. CPU-only.
     adlif: bool,
+    /// Sprint 41: stack depth. Default 2 (matches GPU megakernel
+    /// constraint). CPU supports any value.
+    n_layers: usize,
 }
 
 impl Cli {
@@ -89,6 +91,7 @@ impl Cli {
         let mut cpu: bool = false;
         let mut sdsa: bool = false;
         let mut adlif: bool = false;
+        let mut n_layers: usize = 2;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -147,6 +150,11 @@ impl Cli {
                     adlif = true;
                     i += 1;
                 }
+                "--n-layers" => {
+                    n_layers =
+                        next()?.parse().map_err(|e| format!("--n-layers: {e}"))?;
+                    i += 2;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
@@ -172,6 +180,15 @@ impl Cli {
                 "--adlif currently requires --cpu (GPU AdLIF port = Sprint 41+)".into(),
             );
         }
+        if n_layers != 2 && !cpu {
+            return Err(format!(
+                "--n-layers {n_layers} requires --cpu \
+                (GPU megakernel hardcoded for 2 layers; deeper GPU = Sprint 42+)"
+            ));
+        }
+        if n_layers == 0 {
+            return Err("--n-layers must be ≥ 1".into());
+        }
 
         Ok(Self {
             corpus,
@@ -186,6 +203,7 @@ impl Cli {
             cpu,
             sdsa,
             adlif,
+            n_layers,
         })
     }
 }
@@ -240,7 +258,7 @@ fn main() -> ExitCode {
 
     let mut rng = StdRng::seed_from_u64(0xC0FFEE);
     let (mut net_init, start_epoch) =
-        load_or_init_net(&cli.checkpoint, actual_vocab, cli.hidden, &mut rng);
+        load_or_init_net(&cli.checkpoint, actual_vocab, cli.hidden, cli.n_layers, &mut rng);
     let resumed = start_epoch > 0;
 
     if cli.sdsa {
@@ -506,6 +524,7 @@ fn load_or_init_net(
     path: &Path,
     vocab: usize,
     hidden: usize,
+    n_layers: usize,
     rng: &mut StdRng,
 ) -> (MultiLayerGatedSnn, u32) {
     if path.exists() {
@@ -513,7 +532,7 @@ fn load_or_init_net(
             Ok(Checkpoint { net, epoch }) => {
                 let arch_ok = net.n_input == vocab
                     && net.n_output == vocab
-                    && net.layers.len() == N_LAYERS
+                    && net.layers.len() == n_layers
                     && net.layers.iter().all(|l| l.n_hidden == hidden);
                 if arch_ok {
                     println!(
@@ -532,9 +551,10 @@ fn load_or_init_net(
             }
         }
     }
+    let hidden_dims: Vec<usize> = vec![hidden; n_layers];
     let net = MultiLayerGatedSnn::new(
         vocab,
-        &[hidden; N_LAYERS],
+        &hidden_dims,
         vocab,
         SpikeFn::default(),
         rng,
@@ -677,8 +697,9 @@ fn print_header(
         kv("split", &format!("{n_train} train / {n_val} val toks"))
     );
     let arch = format!(
-        "{vocab} → ({hidden} × {N_LAYERS} layers) → {vocab}",
-        hidden = cli.hidden
+        "{vocab} → ({hidden} × {n_layers} layers) → {vocab}",
+        hidden = cli.hidden,
+        n_layers = cli.n_layers,
     );
     println!("{}", kv("architecture", &arch));
     println!("{}", kv("chunk (BPTT toks)", &format!("{}", cli.chunk)));

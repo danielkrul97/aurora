@@ -500,7 +500,48 @@ existující regularizaci.
 
 ---
 
-## Sprint 41+ — Pokračování
+## Sprint 41 — Deeper stack (CPU) ✓ DONE (negative result, 3rd in row)
+
+**Cíl:** Capacity-via-depth. CPU `MultiLayerGatedSnn` už podporuje libovolnou hloubku;
+přidat `aurora_train --n-layers N` flag, A/B test 2 vs 4 layer.
+
+**Implementace:** `--n-layers N` flag, validace (n_layers != 2 vyžaduje `--cpu`),
+`load_or_init_net` parameterizováno depth, header zobrazuje skutečné `n_layers`.
+GPU megakernel zůstává hardcoded 2-layer (Sprint 42+ pro 4-layer GPU port).
+
+**A/B test** — tiny_200k vocab=1024 hidden=128 chunk=32 lr=0.003 5 epoch:
+
+| Config | Epoch 1 | Epoch 5 | Convergence |
+|---|---|---|---|
+| 2 vrstvy | 3.270 | **2.628** | jasný pokles |
+| 4 vrstvy | 3.263 | 3.258 | **stuck at b_o baseline** |
+
+**4-layer STUCK at ~3.26 BPB** — to je entropy konstantní `b_o` predikce, dejà vu
+Sprint 30 ("hidden vrstvy nikdy nefires") problém ale teď v deeper stacku.
+
+**Diagnóza:** Sprint 37 conservative W_rec scale (0.3/√H) je v 4-layer stacku už
+příliš contractive — gradient signal se rozplývá. b_h=0.5 init kompenzuje za 2-layer
+ale ne 4-layer. Deeper stack potřebuje **layer-aware init** — hlubší vrstvy potřebují
+větší b_h (víc kompenzace za sparse spike vstup) nebo větší W_rec scale.
+
+**Třetí negative result v řadě (SDSA, AdLIF, deeper):** Sprint 30→37 shrnutí — Aurora's
+dynamics je dobře laděná pro 2-layer + clamp + small W_rec, ale **kterýkoliv add-on**
+(architektonický nebo capacity-based) se rozbije v existujícím self-consistent
+setup. Buď to systém přeregularizuje (SDSA, AdLIF) nebo vykolejí gradient flow (depth).
+
+**Honest verdict:** Aurora má LOCAL OPTIMUM kolem 2.6 BPB s aktuálními sprinty 30–37
+hyperparametry. K poklesu pod 2.0 BPB potřeba **buď**:
+1. Reálná empirie na enwik8_10m s víc-epoch tréninkem (zatím jsme jen na 200K krátce)
+2. Layer-aware init pro deeper stack (Sprint 42 — mass tuning)
+3. Truly different paradigm (PSpikeSSM parallel scan, ANN→SNN conversion)
+
+**Doporučení:** Sprint 42 = **OVERNIGHT enwik8_10m s aktuálním 2-layer Sprint 37
+dynamics**. Pošesté: bez tohohle data pointu jsou další architektonické úpravy
+spekulativní. 7 hodin běhu, 0 dev času, 1 pevný empirický bod.
+
+---
+
+## Sprint 42+ — Pokračování
 
 ---
 
