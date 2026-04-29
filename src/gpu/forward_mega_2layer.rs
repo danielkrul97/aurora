@@ -173,7 +173,7 @@ fn main(
             let gate_in = w_gate_in_0[h2 * i_dim + byte];
             let gate_pre = b_gate_0[h2] + gate_in + gate_rec;
             let g = sigmoid(gate_pre);
-            let h_v_pre = sh_l0_h_v_after[h2] * g + h_in_val + h_rec + b_h_0[h2];
+            let h_v_pre = clamp(sh_l0_h_v_after[h2] * g + h_in_val + h_rec + b_h_0[h2], -10.0, 10.0);
             let s = select(0.0, 1.0, h_v_pre >= theta);
             let h_v_after_t = h_v_pre - theta * s;
 
@@ -220,7 +220,7 @@ fn main(
             }
             let gate_pre = b_gate_1[h2] + gate_in + gate_rec;
             let g = sigmoid(gate_pre);
-            let h_v_pre = sh_l1_h_v_after[h2] * g + h_in_val + h_rec + b_h_1[h2];
+            let h_v_pre = clamp(sh_l1_h_v_after[h2] * g + h_in_val + h_rec + b_h_1[h2], -10.0, 10.0);
             let s = select(0.0, 1.0, h_v_pre >= theta);
             let h_v_after_t = h_v_pre - theta * s;
 

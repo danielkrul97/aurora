@@ -314,7 +314,48 @@ SpikGPT (RWKV-style spiking, 46M params) hits BPC 1.26 na enwik8. Aurora s SDSA 
 
 ---
 
-## Sprint 37+ — Pokračování
+## Sprint 37 — Stop membrane runaway ✓ DONE
+
+**Cíl:** Overnight enwik8_10m run odhalil že membrane potential při tréninku exploduje na 10⁷, čímž zabíjí f32 precizi a trénink stagnuje. Tři koordinované změny aby se to víc nestávalo.
+
+**Pozorování z overnight runu** (`logs/overnight_20260429_0112.log`):
+- Best val BPB **3.21** v epoše 1, pak 12 epoch plato
+- Membrane peaks **10–27 milionů** (θ=1.0)
+- Rate distribution bimodal: L0 **0.5–0.66** (over-firing), L1 **0.03–0.06** (silenced)
+- Sample text = Wikipedia syntax noise bez sémantiky
+
+**Tři změny:**
+
+1. **Hard membrane clamp** `h_v_pre.clamp(-10, 10)` v CPU `forward_lm_tokens_stateful` + WGSL `forward_mega.rs` + `forward_mega_2layer.rs`. f32 precision zachována, dynamika nad |v|=10 ztracena (acceptable — θ=1.0 je 10× pod cap).
+
+2. **`b_gate` init 1.0 → 0.0** (β = sigmoid(0) = 0.5, ne 0.73). Half-life recurrent carry: 1 timestep místo ~3 → exponenciální runaway potlačen u zdroje.
+
+3. **`W_rec` scale 0.9/√H → 0.3/√H** (3× menší). Working spectral radius klesá z ~0.52 na ~0.17 → strongly contractive recurrent dynamics.
+
+4. **`b_h` init 0.3 → 0.5** (kompenzace za nižší β: equilibrium `b_h/(1−β) = 1.0` zachován blízko θ).
+
+**Měřené delty na tiny_200k smoke:**
+
+| Test | Sprint 36 | Sprint 37 | Delta |
+|---|---|---|---|
+| GPU aurora_train tiny_200k 1 ep | val BPB 2.685, peaks 13k/34k | val BPB **2.613**, peaks **+10.00/+10.00** | **−0.07 BPB**, 1.3M× lower peaks |
+| Rates | [0.37, 0.22] | [0.40, 0.09] | L1 close to target 0.1 |
+| α | [4.01, 4.05] | [4.03, 4.05] | beze změny (běh příliš krátký) |
+| GPU parity 6/6 | ✓ | ✓ | žádná regrese |
+| CPU regression byte | 4.68 BPB, rates [0.50, 0.54] | 4.74 BPB, rates [0.45, 0.60] | drobná regrese kvalita (-0.06) ale stable |
+
+**Best Aurora result ever**: 2.613 BPB. Sprint 30 baseline byla 2.768 — celková zlepšování za 7 sprintů: **−0.16 BPB**.
+
+**Pozn. ke checkpointu:** Existující `data/enwik8_10m_h1024_v4096.ckpt` má staré (b_gate=1, runaway-trained) váhy. **Smaž ho** před fresh overnight runem; nebo bude pokračovat z broken stavu.
+
+**Otevřené (Sprint 38+):**
+- Nový overnight enwik8_10m benchmark se Sprint 37 dynamics — to je teď první priorita.
+- Adaptive λ pro rate reg podle membrane magnitude — méně urgent po clampu.
+- TET loss, SDSA wiring — stále čekají.
+
+---
+
+## Sprint 38+ — Pokračování
 
 ---
 

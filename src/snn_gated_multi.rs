@@ -59,27 +59,36 @@ pub struct GatedLayer {
 }
 
 const DEFAULT_ALPHA: f32 = 4.0;
-/// Sprint 31: positive `b_h` init. With weights initialized small
-/// (He-style), random one-hot/spike inputs land the membrane potential
-/// near 0, far below θ=1.0 — the surrogate gradient is then ≈ 0 and
-/// the network can't bootstrap firing. With β≈0.73 and `b_h = c`, the
-/// equilibrium membrane is `c / (1−β) ≈ 3.7c`. Setting c=0.3 puts the
-/// equilibrium near θ=1.0, so neurons fire at moderate rate (~20–30 %)
-/// from step 0, surrogate grads flow, and recurrent dynamics don't
-/// immediately blow up. b_h = 0.5 was tried but produced membrane
-/// peaks > 40k from runaway recurrent integration.
-const DEFAULT_B_H_INIT: f32 = 0.3;
+/// Sprint 37: hard cap on membrane potential to prevent runaway
+/// integration. Observed peaks of 10⁷ in overnight enwik8_10m
+/// destroyed f32 precision (gradient noise floor at ~1.0 is bigger
+/// than θ=1.0 itself). Clamping to ±10 covers any reasonable spike
+/// dynamics — neurons that try to sit ten thresholds above firing
+/// simply saturate, lose nothing useful.
+pub const MEMBRANE_CLAMP: f32 = 10.0;
+/// Sprint 31 / Sprint 37 retuning. With `b_gate=0` (β=0.5, not 0.73),
+/// equilibrium membrane is `b_h / (1−β) = 2·b_h`. Setting `b_h=0.5`
+/// puts `v_eq` at θ=1.0 — same firing onset as Sprint 31 but with
+/// **half the recurrent carry**, dramatically reducing runaway risk.
+const DEFAULT_B_H_INIT: f32 = 0.5;
+/// Sprint 37: forget-gate-bias-zero. Old (b_gate=1) gave β≈0.73, which
+/// after Sprint 31's wake-up turned into runaway integration —
+/// observed membrane peaks of 10⁷ in overnight enwik8_10m destroyed
+/// f32 precision. β=0.5 means each timestep keeps half of the previous
+/// membrane and integrates the new input — much more aggressive leak.
+const DEFAULT_B_GATE_INIT: f32 = 0.0;
 
 impl GatedLayer {
     pub fn new<R: Rng>(n_in: usize, n_hidden: usize, rng: &mut R) -> Self {
-        // He-style init. Variance-conserving init from Klos &
-        // Memmesheimer 2024 was tried in Sprint 30 but doesn't apply
-        // cleanly: layer 0 sees a one-hot input (effective rate 1/n_in,
-        // not the canonical ν), so a single formula across layers
-        // overestimates the input variance and silences the network.
-        // Differentiating layer-0 vs deeper layers is open work.
+        // He-style for `W_in`; aggressively contractive for `W_rec`.
+        // The old `0.9/√H` scale aimed at "spectral radius ~1" but in
+        // practice trained weights routinely amplified the recurrent
+        // path past stability — combined with β=0.73 carry, membrane
+        // hit 10⁷ in 1 epoch on enwik8_10m. 0.3/√H drops the working
+        // spectral radius to ~0.17 (uniform-init effective). Much
+        // more boring dynamics; can be tuned up if convergence stalls.
         let scale_in = (2.0 / n_in as f32).sqrt();
-        let scale_rec = 0.9 / (n_hidden as f32).sqrt();
+        let scale_rec = 0.3 / (n_hidden as f32).sqrt();
         let scale_gate_in = 0.1 * scale_in;
         let scale_gate_rec = 0.1 * scale_rec;
 
@@ -104,7 +113,7 @@ impl GatedLayer {
             w_gate_in,
             w_gate_rec,
             b_h: vec![DEFAULT_B_H_INIT; n_hidden],
-            b_gate: vec![1.0; n_hidden], // forget-gate-bias-1 trick
+            b_gate: vec![DEFAULT_B_GATE_INIT; n_hidden],
             alpha: DEFAULT_ALPHA,
         }
     }
@@ -638,10 +647,11 @@ impl MultiLayerGatedSnn {
                     for &c in &active_prev {
                         h_rec_val += layer.w_rec[row_offset_rec + c];
                     }
-                    h_v_pre_t[hi] = state.h_v_after[hi] * gate[hi]
+                    h_v_pre_t[hi] = (state.h_v_after[hi] * gate[hi]
                         + h_in_val
                         + h_rec_val
-                        + layer.b_h[hi];
+                        + layer.b_h[hi])
+                        .clamp(-MEMBRANE_CLAMP, MEMBRANE_CLAMP);
                 }
                 let h_spike_t: Vec<f32> = h_v_pre_t
                     .iter()
@@ -995,10 +1005,11 @@ impl MultiLayerGatedSnn {
                 for &c in &active_prev {
                     h_rec_val += layer.w_rec[row_off_rec + c];
                 }
-                h_v_pre[hi] = states[l].h_v_after[hi] * gate[hi]
+                h_v_pre[hi] = (states[l].h_v_after[hi] * gate[hi]
                     + h_in_val
                     + h_rec_val
-                    + layer.b_h[hi];
+                    + layer.b_h[hi])
+                    .clamp(-MEMBRANE_CLAMP, MEMBRANE_CLAMP);
             }
             let h_spike: Vec<f32> = h_v_pre
                 .iter()
