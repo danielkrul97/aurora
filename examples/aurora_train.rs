@@ -96,6 +96,9 @@ struct Cli {
     /// Sprint 45: per-run seed override. Default 0xC0FFEE (matches all
     /// prior sprint baselines for reproducibility).
     seed: u64,
+    /// Sprint 46: cell type — `gated` (default, full Aurora pipeline)
+    /// or `ssm` (diagonal state-space cell with spike outputs, CPU-only).
+    cell: String,
 }
 
 impl Cli {
@@ -123,6 +126,7 @@ impl Cli {
         let mut apop_trophic_rate: f32 = 0.005;
         let mut apop_trophic_max_dead: f32 = 0.20;
         let mut seed: u64 = 0xC0FFEE;
+        let mut cell: String = "gated".to_string();
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -222,6 +226,10 @@ impl Cli {
                     apop_trophic_max_dead = next()?.parse().map_err(|e| format!("--apoptosis-trophic-max-dead: {e}"))?;
                     i += 2;
                 }
+                "--cell" => {
+                    cell = next()?.clone();
+                    i += 2;
+                }
                 "--seed" => {
                     let v = next()?;
                     seed = if let Some(rest) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
@@ -281,6 +289,22 @@ impl Cli {
             return Err("--apoptosis random requires --apoptosis-counts X,Y,…".into());
         }
 
+        match cell.as_str() {
+            "gated" | "ssm" => {}
+            other => return Err(format!("--cell must be gated|ssm, got '{other}'")),
+        }
+        if cell == "ssm" {
+            if !cpu {
+                return Err("--cell ssm requires --cpu (Sprint 46 scope)".into());
+            }
+            if sdsa || adlif {
+                return Err("--cell ssm currently incompatible with --sdsa / --adlif".into());
+            }
+            if apoptosis_mode != "off" {
+                return Err("--cell ssm currently incompatible with --apoptosis".into());
+            }
+        }
+
         Ok(Self {
             corpus,
             vocab,
@@ -305,6 +329,7 @@ impl Cli {
             apop_trophic_rate,
             apop_trophic_max_dead,
             seed,
+            cell,
         })
     }
 }
@@ -356,6 +381,11 @@ fn main() -> ExitCode {
     let n_train = (tokens.len() * 9) / 10;
     let train_toks = &tokens[..n_train];
     let val_toks = &tokens[n_train..];
+
+    if cli.cell == "ssm" {
+        return run_ssm(&cli, corpus.len(), tokens.len(), actual_vocab,
+            train_toks, val_toks, encode_s, comp);
+    }
 
     let mut rng = StdRng::seed_from_u64(cli.seed);
     let (mut net_init, start_epoch) =
@@ -681,6 +711,215 @@ fn load_or_train_bpe(
         }
         Ok(tok)
     }
+}
+
+/// Sprint 46: SSM training path — minimal mirror of the gated path
+/// that runs `MultiLayerSsmSnn`. No checkpointing, no sampling, no
+/// SDSA/AdLIF/apoptosis — focused on the cell-architecture A/B.
+fn run_ssm(
+    cli: &Cli,
+    corpus_bytes: usize,
+    n_tokens: usize,
+    actual_vocab: usize,
+    train_toks: &[u32],
+    val_toks: &[u32],
+    encode_s: f64,
+    comp: f32,
+) -> ExitCode {
+    use aurora::ssm::{MultiLayerSsmSnn, SsmState};
+
+    let mut rng = StdRng::seed_from_u64(cli.seed);
+    let hidden_dims: Vec<usize> = vec![cli.hidden; cli.n_layers];
+    let mut net = MultiLayerSsmSnn::new(
+        actual_vocab,
+        &hidden_dims,
+        actual_vocab,
+        SpikeFn::default(),
+        &mut rng,
+    );
+    let backend_name = "CPU SSM (rayon)".to_string();
+
+    let adam = AdamConfig {
+        lr: cli.lr,
+        ..AdamConfig::default()
+    };
+
+    let metrics_path = cli.metrics.clone().unwrap_or_else(|| {
+        let stem = cli
+            .checkpoint
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("aurora_train_ssm");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        PathBuf::from(format!("logs/{stem}_{ts}.jsonl"))
+    });
+    let mut metrics = match MetricsWriter::open(&metrics_path) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("⚠ metrics log open failed ({e}); continuing without metrics");
+            None
+        }
+    };
+    if let Some(m) = metrics.as_mut() {
+        m.run_meta(cli, corpus_bytes, n_tokens, actual_vocab, 0, &backend_name);
+    }
+
+    print_header(
+        cli,
+        corpus_bytes,
+        n_tokens,
+        actual_vocab,
+        train_toks.len(),
+        val_toks.len(),
+        encode_s,
+        0,
+        false,
+        &backend_name,
+    );
+
+    let total_start = Instant::now();
+    let mut best_val = f32::INFINITY;
+
+    for epoch in 0..cli.epochs as u32 {
+        let epoch_start = Instant::now();
+        epoch_open(epoch);
+
+        let stream_len = train_toks.len() / BATCH_SIZE;
+        let n_chunks_per_stream = stream_len.saturating_sub(1) / cli.chunk;
+        let report_every = (n_chunks_per_stream / 50).max(1);
+        let mut total_nats = 0.0_f32;
+        let mut total_tokens = 0_usize;
+
+        let mut states: Vec<Vec<SsmState>> =
+            (0..BATCH_SIZE).map(|_| net.fresh_states()).collect();
+        let mut inputs_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
+        let mut targets_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
+
+        for chunk_idx in 0..n_chunks_per_stream {
+            inputs_owned.clear();
+            targets_owned.clear();
+            for b in 0..BATCH_SIZE {
+                let stream_start = b * stream_len;
+                let p = stream_start + chunk_idx * cli.chunk;
+                inputs_owned.push(&train_toks[p..p + cli.chunk]);
+                targets_owned.push(&train_toks[p + 1..p + cli.chunk + 1]);
+            }
+            net.zero_grad();
+            let loss = net.forward_backward_batch_tokens_stateful(
+                &inputs_owned,
+                &targets_owned,
+                &mut states,
+            );
+            net.clip_grads(GRAD_CLIP);
+            net.step_adam(&adam);
+            total_nats += loss;
+            total_tokens += cli.chunk * BATCH_SIZE;
+
+            if (chunk_idx + 1).is_multiple_of(report_every) {
+                let frac = (chunk_idx + 1) as f64 / n_chunks_per_stream as f64;
+                let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
+                let elapsed = epoch_start.elapsed().as_secs_f64();
+                epoch_progress(frac, bpb, elapsed);
+                if let Some(m) = metrics.as_mut() {
+                    m.chunk(epoch, chunk_idx + 1, bpb, elapsed);
+                }
+            }
+        }
+
+        let train_bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
+        let (val_bpb, rates, mem) = evaluate_ssm(&net, val_toks, cli.chunk, comp);
+        if val_bpb < best_val {
+            best_val = val_bpb;
+        }
+        let epoch_elapsed = epoch_start.elapsed().as_secs_f64();
+        epoch_done(train_bpb, val_bpb, epoch_elapsed);
+        let alphas: Vec<f32> = net.layers.iter().map(|l| l.alpha).collect();
+        epoch_diagnostics(&rates, &alphas, &mem);
+
+        if let Some(m) = metrics.as_mut() {
+            let v_means: Vec<f32> = mem.iter().map(|(m, _)| *m).collect();
+            let v_peaks: Vec<f32> = mem.iter().map(|(_, p)| *p).collect();
+            m.epoch_done(
+                epoch,
+                train_bpb,
+                val_bpb,
+                &rates,
+                &alphas,
+                &v_means,
+                &v_peaks,
+                epoch_elapsed,
+            );
+        }
+        epoch_close();
+    }
+
+    let val_bytes_est = corpus_bytes
+        .saturating_sub(((train_toks.len()) * corpus_bytes) / n_tokens);
+    print_footer(best_val, total_start.elapsed().as_secs_f64(), val_bytes_est);
+    ExitCode::SUCCESS
+}
+
+fn evaluate_ssm(
+    net: &aurora::ssm::MultiLayerSsmSnn,
+    val_toks: &[u32],
+    chunk: usize,
+    comp: f32,
+) -> (f32, Vec<f32>, Vec<(f32, f32)>) {
+    if val_toks.len() < chunk + 1 {
+        return (
+            f32::INFINITY,
+            vec![0.0; net.layers.len()],
+            vec![(0.0, 0.0); net.layers.len()],
+        );
+    }
+    let mut states = net.fresh_states();
+    let mut total_nats = 0.0_f32;
+    let mut total_tokens = 0_usize;
+    let mut rate_acc = vec![0.0_f32; net.layers.len()];
+    let mut mem_acc: Vec<(f32, f32)> = vec![(0.0, f32::NEG_INFINITY); net.layers.len()];
+    let mut chunks_seen = 0_usize;
+    let mut pos = 0;
+    while pos + chunk < val_toks.len() {
+        let inputs = &val_toks[pos..pos + chunk];
+        let targets = &val_toks[pos + 1..pos + chunk + 1];
+        let cache = net.forward_lm_tokens_stateful(inputs, &mut states);
+        for (logits_t, &target) in cache.logits.iter().zip(targets.iter()) {
+            let max = logits_t.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let log_sum_exp =
+                max + logits_t.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
+            total_nats += log_sum_exp - logits_t[target as usize];
+        }
+        for (acc, r) in rate_acc.iter_mut().zip(cache.firing_rates()) {
+            *acc += r;
+        }
+        for (acc, (m, p)) in mem_acc.iter_mut().zip(cache.membrane_stats()) {
+            acc.0 += m;
+            if p > acc.1 {
+                acc.1 = p;
+            }
+        }
+        chunks_seen += 1;
+        total_tokens += chunk;
+        pos += chunk;
+    }
+    let mean_rates: Vec<f32> = rate_acc
+        .into_iter()
+        .map(|s| if chunks_seen == 0 { 0.0 } else { s / chunks_seen as f32 })
+        .collect();
+    let mean_mem: Vec<(f32, f32)> = mem_acc
+        .into_iter()
+        .map(|(m, p)| {
+            (
+                if chunks_seen == 0 { 0.0 } else { m / chunks_seen as f32 },
+                p,
+            )
+        })
+        .collect();
+    let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
+    (bpb, mean_rates, mean_mem)
 }
 
 fn build_apoptosis_config(cli: &Cli, n_layers: usize) -> Result<Option<ApoptosisConfig>, String> {

@@ -791,6 +791,93 @@ to data-limit, ne capacity-limit.
 
 ---
 
+## Sprint 46 — Diagonal SSM cell ✓ DONE (FIRST STATISTICALLY SIGNIFICANT WIN)
+
+**Hypotéza:** Po 6 negative results na biologically-motivated *add-ons*
+(SDSA, AdLIF, deep stack, apoptosis variants) je čas zkusit **změnit
+samotný recurrent cell**. Diagonální state-space (à la S4 / Mamba /
+SpikeGPT) místo gated LIF: per-neuron decay `a`, žádný `W_rec`, žádný
+gate, žádná spike feedback.
+
+**Architektura:**
+
+```
+s[t]     = a ⊙ s[t-1] + W_in · x[t] + b      (a per-neuron, clamped to [0, 0.99])
+spike[t] = heaviside(s[t] - θ)                (no reset — s NOT subtracted)
+```
+
+Méně parametrů než gated cell (chybí `W_rec`, `W_gate_in`, `W_gate_rec`,
+`b_gate` = ~½ params). Linear recurrence v `s` → future-proof pro
+parallel scan (Sprint 47+, GPU port).
+
+**Implementace:** `src/ssm.rs` (~600 ř.) — `SsmLayer`,
+`MultiLayerSsmSnn` mirror existující gated API. CLI flag `--cell ssm`
+v `aurora_train`, dedikovaná `run_ssm` cesta (žádné SDSA/AdLIF/apoptosis
+zatím — focus on cell A/B).
+
+**Smoke:** `tests/ssm_smoke.rs` — forward shape, loss-decreases,
+numerical-vs-analytical gradient check.
+
+**První pokus s `a = 0.95` (long memory) collapsed:** winner-take-all,
+layer-1 v_mean ~ −3.5 (atrofie) zatímco peak hit clamp +10. Bez
+subtract-on-spike state polarizuje: pár neuronů saturuje, většina
+ztichne. **Fix:** `a = 0.5` (Aurora's effective β at b_gate=0).
+
+**A/B na tiny_600k (h=128 × 2L, 3 ep, n=5 seedů, paired vs S45 baseline):**
+
+| seed | gated baseline | SSM cell | Δ |
+|---|---|---|---|
+| 1 | 2.714 | 2.515 | **−0.199** |
+| 2 | 2.779 | 2.520 | **−0.259** |
+| 3 | 2.682 | 2.515 | **−0.167** |
+| 4 | 2.697 | 2.527 | **−0.170** |
+| 5 | 2.711 | 2.521 | **−0.190** |
+
+**Statistika:**
+
+- Gated: 2.717 ± 0.037 σ
+- SSM:   **2.520 ± 0.005 σ** (7× nižší variance!)
+- Paired Δ = **−0.197 ± 0.037**, **|t| = 11.85**, df=4
+- **STATISTICKY VÝZNAMNÉ při α = 0.05** (kritická t = 2.78)
+- SSM wins na **5/5 seedech** (binomial pod null = 1/32, p ≈ 0.03)
+
+**Klíčová pozorování:**
+
+1. **První p < 0.05 pozitivní výsledek** za 9 sprintů (38–46) empirické
+   validace biologically-motivated features.
+2. **Lower variance:** SSM std je 7× menší než gated. Architektura
+   stabilnější napříč inicializacemi.
+3. **Méně parametrů** (no W_rec, no gate weights). Architektura
+   *jednodušší* a lepší — to je zdravý research signal, ne
+   over-engineered win.
+4. **v_mean je healthy** (0.93–0.96, blízko θ=1.0), rates 0.30–0.48 —
+   layer dynamics nejsou degenerated.
+
+**Co tento výsledek znamená:**
+
+Aurora plateau na BPB 2.72 nebyl data-limit, byl **architecture-limit**
+gated LIF cellu. Diagonální SSM cell zlomil bariéru o 0.20 BPB s méně
+parametry. Suggests Aurora's path forward je **architecture surgery**,
+ne biological add-ons.
+
+**Open vs co dál:**
+
+1. **Parallel scan** (next priority): současná implementace je
+   sériová. Linear recurrence umožňuje O(log T) parallel scan na GPU
+   → unlock pro long sequences + enwik8 trénink.
+2. **Selective SSM (Mamba-style):** input-dependent `a` per timestep.
+   Rebuilds the gating but principled.
+3. **SDSA / Apoptosis na SSM** — biologicky inspirované add-ony teď
+   na lepší base. Možná konečně ukáží signal.
+4. **enwik8_10m běh** — nakonec scaling test.
+
+**Soubory:** `src/ssm.rs` (cell + multi-layer + Adam),
+`src/lib.rs` (+module), `examples/aurora_train.rs` (`--cell` flag,
+`run_ssm`, `evaluate_ssm`), `tests/ssm_smoke.rs` (3 testy).
+Logy v `logs/sprint46/*.jsonl`.
+
+---
+
 ## Sprint 33+ — možné větve (rozhodneme po měření 32)
 
 | Větev | Co odemyká | Effort | Zdroj |

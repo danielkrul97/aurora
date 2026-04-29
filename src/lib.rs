@@ -29,6 +29,7 @@ pub mod snn_gated;
 pub mod snn_gated_multi;
 pub mod snn_loss;
 pub mod snn_recurrent;
+pub mod ssm;
 pub mod stdp;
 pub mod surrogate;
 pub mod synapse;
