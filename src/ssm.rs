@@ -386,6 +386,13 @@ pub struct MultiLayerSsmSnn {
     pub w_out: Vec<f32>,
     pub b_o: Vec<f32>,
     pub spike_fn: SpikeFn,
+    /// Sprint 49: when `true`, the cell skips the heaviside spike step
+    /// — inter-layer signal is the real-valued state directly. Dense
+    /// W_in / W_out matmul (no sparse active-set optimization) and no
+    /// surrogate gradient (cleaner backprop). A/B test: does dropping
+    /// the 1-bit quantization improve LM quality enough to justify
+    /// losing Aurora's "biological" spike identity?
+    pub continuous: bool,
     grads: MultiLayerSsmGrads,
     adam_t: usize,
     layer_adam: Vec<LayerAdam>,
@@ -482,6 +489,7 @@ impl MultiLayerSsmSnn {
             w_out,
             b_o: vec![0.0; n_output],
             spike_fn,
+            continuous: false,
             adam_t: 0,
             layer_adam,
             adam_w_out: AdamGroup::zeros(n_output * top_hidden),
@@ -611,20 +619,42 @@ impl MultiLayerSsmSnn {
             let n_in = layer.n_in;
 
             // Step 1: precompute `u[t][i]` for the whole chunk.
-            // Sparse: only sum over active inputs at each t.
+            // Sparse path (spike mode or layer 0): sum W_in cols over
+            // the active input set (signal=1 implicit).
+            // Dense path (layer >0 in continuous mode): sum W_in over
+            // all input dims, weighted by previous layer's real-valued
+            // signal — full GEMV.
             let mut u_per_t: Vec<Vec<f32>> = (0..t_steps)
                 .map(|_| layer.b.clone())
                 .collect();
+            let dense_signal: Option<&[Vec<f32>]> = if l > 0 && self.continuous {
+                Some(&cache.layers[l - 1].spike)
+            } else {
+                None
+            };
             for t in 0..t_steps {
                 let actives = &layer_input_active_per_t[t];
-                for i in 0..n_h {
-                    let row_in = i * n_in;
-                    let row = &layer.w_in[row_in..row_in + n_in];
-                    let mut delta = 0.0_f32;
-                    for &c in actives {
-                        delta += row[c];
+                if let Some(sig_per_t) = dense_signal {
+                    let signal = &sig_per_t[t];
+                    for i in 0..n_h {
+                        let row_in = i * n_in;
+                        let row = &layer.w_in[row_in..row_in + n_in];
+                        let mut delta = 0.0_f32;
+                        for c in 0..n_in {
+                            delta += row[c] * signal[c];
+                        }
+                        u_per_t[t][i] += delta;
                     }
-                    u_per_t[t][i] += delta;
+                } else {
+                    for i in 0..n_h {
+                        let row_in = i * n_in;
+                        let row = &layer.w_in[row_in..row_in + n_in];
+                        let mut delta = 0.0_f32;
+                        for &c in actives {
+                            delta += row[c];
+                        }
+                        u_per_t[t][i] += delta;
+                    }
                 }
             }
 
@@ -646,16 +676,26 @@ impl MultiLayerSsmSnn {
                 }
             }
 
-            // Step 3: spike + active-set scan per timestep.
+            // Step 3: spike + active-set scan per timestep. In
+            // continuous mode (`self.continuous`), the layer's output
+            // signal IS the state directly — no heaviside, no
+            // quantization. Active-set degenerates to "all neurons"
+            // and downstream matmuls run dense.
             let mut spike_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
             let mut active_per_t: Vec<Vec<usize>> = Vec::with_capacity(t_steps);
             for t in 0..t_steps {
                 let mut spike = Vec::with_capacity(n_h);
                 let mut active = Vec::new();
                 for i in 0..n_h {
-                    let s = self.spike_fn.forward(state_per_t[t][i]);
+                    let s = if self.continuous {
+                        state_per_t[t][i]
+                    } else {
+                        self.spike_fn.forward(state_per_t[t][i])
+                    };
                     spike.push(s);
-                    if s != 0.0 {
+                    if self.continuous {
+                        active.push(i);
+                    } else if s != 0.0 {
                         active.push(i);
                     }
                 }
@@ -676,18 +716,32 @@ impl MultiLayerSsmSnn {
             cache.layers[l].active = active_per_t;
         }
 
-        // Output projection from top spike (sparse, per timestep).
+        // Output projection from top layer. Sparse over `active` in
+        // spike mode (binary 0/1 signal); dense GEMV over the full
+        // state vector in continuous mode.
         let top = n_layers - 1;
         for t in 0..t_steps {
-            let top_active = &cache.layers[top].active[t];
             let mut logits = Vec::with_capacity(self.n_output);
-            for o in 0..self.n_output {
-                let row_offset = o * top_hidden;
-                let mut acc = self.b_o[o];
-                for &c in top_active {
-                    acc += self.w_out[row_offset + c];
+            if self.continuous {
+                let top_signal = &cache.layers[top].spike[t];
+                for o in 0..self.n_output {
+                    let row_offset = o * top_hidden;
+                    let mut acc = self.b_o[o];
+                    for h in 0..top_hidden {
+                        acc += self.w_out[row_offset + h] * top_signal[h];
+                    }
+                    logits.push(acc);
                 }
-                logits.push(acc);
+            } else {
+                let top_active = &cache.layers[top].active[t];
+                for o in 0..self.n_output {
+                    let row_offset = o * top_hidden;
+                    let mut acc = self.b_o[o];
+                    for &c in top_active {
+                        acc += self.w_out[row_offset + c];
+                    }
+                    logits.push(acc);
+                }
             }
             cache.logits.push(logits);
         }
@@ -724,6 +778,8 @@ impl MultiLayerSsmSnn {
         let theta = self.spike_fn.threshold;
 
         // Step A: top-layer d_spike per timestep (and W_out / b_o grads).
+        // Dense GEMV path in continuous mode; sparse over fired
+        // indices in spike mode.
         let mut total_loss = 0.0_f32;
         let mut d_spike_from_above_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
         for t in 0..t_steps {
@@ -731,16 +787,31 @@ impl MultiLayerSsmSnn {
                 cross_entropy_with_grad(&cache.logits[t], targets[t] as usize);
             total_loss += loss_t;
 
-            let active_top = &cache.layers[top].active[t];
-            for o in 0..self.n_output {
-                let d = d_logits[o];
-                if d == 0.0 {
-                    continue;
+            if self.continuous {
+                let top_signal = &cache.layers[top].spike[t];
+                for o in 0..self.n_output {
+                    let d = d_logits[o];
+                    if d == 0.0 {
+                        continue;
+                    }
+                    grads.b_o[o] += d;
+                    let row = o * top_hidden;
+                    for h in 0..top_hidden {
+                        grads.w_out[row + h] += d * top_signal[h];
+                    }
                 }
-                grads.b_o[o] += d;
-                let row = o * top_hidden;
-                for &h in active_top {
-                    grads.w_out[row + h] += d;
+            } else {
+                let active_top = &cache.layers[top].active[t];
+                for o in 0..self.n_output {
+                    let d = d_logits[o];
+                    if d == 0.0 {
+                        continue;
+                    }
+                    grads.b_o[o] += d;
+                    let row = o * top_hidden;
+                    for &h in active_top {
+                        grads.w_out[row + h] += d;
+                    }
                 }
             }
             let d_top_spike = matvec_transpose(&self.w_out, &d_logits, self.n_output, top_hidden);
@@ -756,24 +827,32 @@ impl MultiLayerSsmSnn {
             let alpha_l = layer.alpha;
             let layer_grad = &mut grads.layers[l];
 
-            // B1. Per-step gradient through the surrogate. Also
-            // accumulate `d_alpha` here — the same surrogate evaluation
-            // produces both the path to state and the path to α.
+            // B1. Per-step gradient from the spike → state path.
+            // In spike mode, factor through surrogate
+            // `1 / (1 + α|state-θ|)²` (and accumulate d_alpha).
+            // In continuous mode, the spike → state map is identity,
+            // gradient passes straight through (factor 1.0); α is
+            // unused.
             let mut d_input_per_t: Vec<Vec<f32>> = (0..t_steps)
                 .map(|_| vec![0.0_f32; n_h])
                 .collect();
             for t in 0..t_steps {
                 let d_above = &d_spike_from_above_per_t[t];
-                let state_t = &cache.layers[l].state[t];
-                for i in 0..n_h {
-                    let dv = state_t[i] - theta;
-                    let abs_dv = dv.abs();
-                    let denom = 1.0 + alpha_l * abs_dv;
-                    let cubic = denom * denom * denom;
-                    let s_grad = 1.0 / (denom * denom);
-                    d_input_per_t[t][i] = d_above[i] * s_grad;
-                    // ∂L/∂α += d_above · ∂surrogate/∂α
-                    layer_grad.d_alpha += d_above[i] * (-2.0 * abs_dv / cubic);
+                if self.continuous {
+                    for i in 0..n_h {
+                        d_input_per_t[t][i] = d_above[i];
+                    }
+                } else {
+                    let state_t = &cache.layers[l].state[t];
+                    for i in 0..n_h {
+                        let dv = state_t[i] - theta;
+                        let abs_dv = dv.abs();
+                        let denom = 1.0 + alpha_l * abs_dv;
+                        let cubic = denom * denom * denom;
+                        let s_grad = 1.0 / (denom * denom);
+                        d_input_per_t[t][i] = d_above[i] * s_grad;
+                        layer_grad.d_alpha += d_above[i] * (-2.0 * abs_dv / cubic);
+                    }
                 }
             }
 
@@ -794,6 +873,14 @@ impl MultiLayerSsmSnn {
 
             // B3. Accumulate grads to `b`, `W_in`, `a`. Per-t loop
             // because input-active set varies with `t`.
+            // Dense W_in grad path for layer >0 in continuous mode
+            // (multiply by previous layer's real-valued signal).
+            let dense_signal_back: Option<&[Vec<f32>]> =
+                if l > 0 && self.continuous {
+                    Some(&cache.layers[l - 1].spike)
+                } else {
+                    None
+                };
             for t in 0..t_steps {
                 let layer_input_one: [usize; 1];
                 let layer_input_active: &[usize] = if l == 0 {
@@ -807,16 +894,32 @@ impl MultiLayerSsmSnn {
                 } else {
                     &cache.layers[l].state[t - 1]
                 };
-                for i in 0..n_h {
-                    let d = d_state_per_t[t][i];
-                    if d == 0.0 {
-                        continue;
+                if let Some(sig_per_t) = dense_signal_back {
+                    let signal = &sig_per_t[t];
+                    for i in 0..n_h {
+                        let d = d_state_per_t[t][i];
+                        if d == 0.0 {
+                            continue;
+                        }
+                        layer_grad.b[i] += d;
+                        layer_grad.a[i] += d * s_prev[i];
+                        let row_in = i * n_in;
+                        for c in 0..n_in {
+                            layer_grad.w_in[row_in + c] += d * signal[c];
+                        }
                     }
-                    layer_grad.b[i] += d;
-                    layer_grad.a[i] += d * s_prev[i];
-                    let row_in = i * n_in;
-                    for &c in layer_input_active {
-                        layer_grad.w_in[row_in + c] += d;
+                } else {
+                    for i in 0..n_h {
+                        let d = d_state_per_t[t][i];
+                        if d == 0.0 {
+                            continue;
+                        }
+                        layer_grad.b[i] += d;
+                        layer_grad.a[i] += d * s_prev[i];
+                        let row_in = i * n_in;
+                        for &c in layer_input_active {
+                            layer_grad.w_in[row_in + c] += d;
+                        }
                     }
                 }
             }

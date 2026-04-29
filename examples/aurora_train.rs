@@ -110,6 +110,10 @@ struct Cli {
     /// set, overrides `--ssm-a-init` / spread — neuron i gets
     /// `a_i = 1 - exp(lerp(log(1-a_lo), log(1-a_hi), i/(N-1)))`.
     ssm_spectrum: Option<String>,
+    /// Sprint 49: drop the heaviside spike output — inter-layer signal
+    /// is the real-valued state directly. Tests whether 1-bit
+    /// quantization between layers is the quality bottleneck.
+    ssm_continuous: bool,
 }
 
 impl Cli {
@@ -141,6 +145,7 @@ impl Cli {
         let mut ssm_a_init: f32 = 0.5;
         let mut ssm_a_spread: f32 = 0.0;
         let mut ssm_spectrum: Option<String> = None;
+        let mut ssm_continuous: bool = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -262,6 +267,10 @@ impl Cli {
                     ssm_spectrum = Some(next()?.clone());
                     i += 2;
                 }
+                "--ssm-continuous" => {
+                    ssm_continuous = true;
+                    i += 1;
+                }
                 "--seed" => {
                     let v = next()?;
                     seed = if let Some(rest) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
@@ -365,6 +374,7 @@ impl Cli {
             ssm_a_init,
             ssm_a_spread,
             ssm_spectrum,
+            ssm_continuous,
         })
     }
 }
@@ -805,6 +815,7 @@ fn run_ssm(
             &mut rng,
         )
     };
+    net.continuous = cli.ssm_continuous;
     let backend_name = "CPU SSM (rayon)".to_string();
 
     let adam = AdamConfig {
