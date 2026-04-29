@@ -87,9 +87,15 @@ struct Cli {
     apop_check: usize,
     /// Comma-separated per-layer kill counts for `--apoptosis random`.
     apop_counts: Option<String>,
-    /// Sprint 43 trophic mode: kill if EMA < frac × layer_mean.
+    /// Sprint 43 trophic mode: kill if EMA < frac × layer_median.
     apop_trophic_frac: f32,
-    apop_trophic_max: usize,
+    /// Sprint 44 adaptive cap: max kills per check = max(1, floor(alive × rate)).
+    apop_trophic_rate: f32,
+    /// Sprint 44 hard ceiling: halt this layer's pruning at this fraction dead.
+    apop_trophic_max_dead: f32,
+    /// Sprint 45: per-run seed override. Default 0xC0FFEE (matches all
+    /// prior sprint baselines for reproducibility).
+    seed: u64,
 }
 
 impl Cli {
@@ -113,8 +119,10 @@ impl Cli {
         let mut apop_threshold: f32 = 0.005;
         let mut apop_check: usize = 100;
         let mut apop_counts: Option<String> = None;
-        let mut apop_trophic_frac: f32 = 0.1;
-        let mut apop_trophic_max: usize = 5;
+        let mut apop_trophic_frac: f32 = 0.01;
+        let mut apop_trophic_rate: f32 = 0.005;
+        let mut apop_trophic_max_dead: f32 = 0.20;
+        let mut seed: u64 = 0xC0FFEE;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -206,8 +214,21 @@ impl Cli {
                     apop_trophic_frac = next()?.parse().map_err(|e| format!("--apoptosis-trophic-frac: {e}"))?;
                     i += 2;
                 }
-                "--apoptosis-trophic-max" => {
-                    apop_trophic_max = next()?.parse().map_err(|e| format!("--apoptosis-trophic-max: {e}"))?;
+                "--apoptosis-trophic-rate" => {
+                    apop_trophic_rate = next()?.parse().map_err(|e| format!("--apoptosis-trophic-rate: {e}"))?;
+                    i += 2;
+                }
+                "--apoptosis-trophic-max-dead" => {
+                    apop_trophic_max_dead = next()?.parse().map_err(|e| format!("--apoptosis-trophic-max-dead: {e}"))?;
+                    i += 2;
+                }
+                "--seed" => {
+                    let v = next()?;
+                    seed = if let Some(rest) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                        u64::from_str_radix(rest, 16).map_err(|e| format!("--seed (hex): {e}"))?
+                    } else {
+                        v.parse::<u64>().map_err(|e| format!("--seed: {e}"))?
+                    };
                     i += 2;
                 }
                 "-h" | "--help" => {
@@ -281,7 +302,9 @@ impl Cli {
             apop_check,
             apop_counts,
             apop_trophic_frac,
-            apop_trophic_max,
+            apop_trophic_rate,
+            apop_trophic_max_dead,
+            seed,
         })
     }
 }
@@ -334,7 +357,7 @@ fn main() -> ExitCode {
     let train_toks = &tokens[..n_train];
     let val_toks = &tokens[n_train..];
 
-    let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+    let mut rng = StdRng::seed_from_u64(cli.seed);
     let (mut net_init, start_epoch) =
         load_or_init_net(&cli.checkpoint, actual_vocab, cli.hidden, cli.n_layers, &mut rng);
     let resumed = start_epoch > 0;
@@ -666,7 +689,8 @@ fn build_apoptosis_config(cli: &Cli, n_layers: usize) -> Result<Option<Apoptosis
         "activity" => ApoptosisMode::Activity,
         "trophic" => ApoptosisMode::Trophic {
             frac: cli.apop_trophic_frac,
-            max_per_check: cli.apop_trophic_max,
+            kill_rate: cli.apop_trophic_rate,
+            max_dead_frac: cli.apop_trophic_max_dead,
         },
         "random" => {
             let s = cli

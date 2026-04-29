@@ -691,6 +691,106 @@ analog NGF-driven trofického přežívání než pouhá aktivita.
 
 ---
 
+## Sprint 44 — Adaptive cap pro Trophic ✓ DONE
+
+**Cíl:** Manuální `max_per_check` ze Sprintu 43 byl křehký (cap=2 →
+50 kills, cap=1 → 22 kills, kvalita extrémně závislá na ručním tuningu).
+Self-regulating cap by měl škálovat s velikostí přežívající sítě.
+
+**Implementace:**
+
+`ApoptosisMode::Trophic { frac, kill_rate, max_dead_frac }` —
+nahradil `max_per_check` dvěma rozpočty:
+
+- `kill_rate` (float): per check, cap = `max(1, floor(alive × kill_rate))`.
+  Cap se přirozeně zmenšuje jak vrstva ubývá.
+- `max_dead_frac` (float): hard ceiling — když `dead/total ≥ max_dead_frac`,
+  pruning této vrstvy se úplně zastaví.
+
+Plus `headroom` constraint v jednom checku: nikdy nezabít víc než zbývá
+do hard ceilingu (`take = min(cap, max_dead_frac × total − dead)`).
+
+**Defaults:** `frac=0.01`, `kill_rate=0.005`, `max_dead_frac=0.20`.
+Pro h=128: cap=1 zpočátku, halt na 26 dead.
+
+**Verify (tiny_600k, seed 0xC0FFEE):**
+
+| run | val BPB | dead/layer | poznámka |
+|---|---|---|---|
+| baseline | 2.776 | 0/0 | reference |
+| trophic adaptive (default) | **2.758** | 10/12 | shoda s S43 mini |
+| trophic adaptive aggressive (rate=0.05, check=20) | 2.776 | 25/25 | saturace na 19.5 % |
+
+Mechanismus self-regulates jak doufáno: agresivní rate-config zaplnil
+20 % cap, pak halt → quality se vrátila k baseline. Konzervativní config
+dál mírně překonává baseline (= replikace S43 výsledku jediným seedem).
+
+---
+
+## Sprint 45 — Multi-seed validation ✓ DONE (negative — S43 byl artifact)
+
+**Cíl:** Zjistit, zda Sprintu 43's `Δ = −0.018` výsledek drží napříč
+seedy, nebo to byla single-seed šťastná střela.
+
+**Setup:** 5 seedů (1..=5), 2 conditions (baseline, trophic adaptive
+default), tiny_600k h=128 × 2L 3 epoch. CLI flag `--seed` přidán.
+
+**Výsledky (best val BPB):**
+
+| seed | baseline | trophic | Δ (trophic − base) |
+|---|---|---|---|
+| 1 | 2.714 | 2.735 | +0.021 |
+| 2 | 2.779 | 2.821 | +0.042 |
+| 3 | 2.682 | 2.672 | **−0.010** |
+| 4 | 2.697 | 2.706 | +0.009 |
+| 5 | 2.711 | 2.717 | +0.006 |
+
+**Souhrn:**
+
+- Baseline: **2.717 ± 0.037 σ** (n=5)
+- Trophic:  **2.730 ± 0.056 σ** (n=5)
+- Paired mean Δ = **+0.014 ± 0.019 σ**, **|t| = 1.57** (df=4)
+- **NESIGNIFIKANTNÍ** na α=0.05 (kritická t = 2.776)
+- Trophic wins na **1/5 seedů** (binomial under null = 50 %, nedosaženo)
+
+**Interpretace:**
+
+Sprintu 43 výsledek `−0.018` byl **single-seed artefakt**. Seed
+`0xC0FFEE` (původní Aurora baseline seed) je pro trophic favorable —
+ale 4 z 5 jiných seedů ukazují, že trophic je mírně **horší** než
+baseline. Inter-seed variance (0.04 BPB) je 3× větší než průměrný
+trophic efekt (0.014 BPB).
+
+**Co se vyřešilo (mimo trophic):**
+
+- Aurora val BPB má std ≈ 0.04 BPB napříč seedy na tiny_600k.
+  *Žádný předchozí sprint experiment v rozdílu < 0.08 BPB nemůže být
+  věrohodný bez multi-seed evidence.* Tj. zpětně Sprint 38–41 single-seed
+  delty 0.01–0.05 BPB jsou všechny v noise floor.
+- Multi-seed je teď k dispozici (`--seed` CLI flag) — všechny budoucí
+  empirické srovnání by měly běžet ≥ 3 seedy.
+
+**Bottom line:**
+
+Hypotéza "biologicky inspirovaný trophic signál > random selection" se
+**nedrží** při řádné statistické validaci. Aurora apoptosis stays in
+the codebase jako funkční mechanismus, ale **není to win**. Pět
+sprintů (38, 39, 40, 41, 42, 43, 44+45) přidalo biologically-motivated
+features bez kvalitativního zlepšení nad core gated-SNN+BPE+Adam pipeline.
+
+**Záver pro výzkumný směr Aurora:** přestat A/B-testovat biologické
+mechanismy na tiny korpusu. Buď scale up (enwik8_10m + multi-seed),
+nebo scale out (jiná architektura — attention v hidden, ne post-hoc
+SDSA). Alternativně: prozkoumat *why* je BPB plateau na 2.72 — není-li
+to data-limit, ne capacity-limit.
+
+**Soubory:** `src/apoptosis.rs` (Sprint 44 adaptive cap),
+`examples/aurora_train.rs` (`--seed`, `--apoptosis-trophic-rate`,
+`--apoptosis-trophic-max-dead`). Logy v `logs/sprint44/*.jsonl` a
+`logs/sprint45/*.jsonl`.
+
+---
+
 ## Sprint 33+ — možné větve (rozhodneme po měření 32)
 
 | Větev | Co odemyká | Effort | Zdroj |

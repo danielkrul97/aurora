@@ -27,11 +27,21 @@ use rand::Rng;
 pub enum ApoptosisMode {
     Off,
     Activity,
-    /// Sprint 43: trophic-factor analogue. Signal = |∂L/∂W_outgoing|_1
-    /// per neuron — measures how much downstream wants to update the
-    /// neuron's outgoing connections. Kill if EMA < `frac × layer_mean`,
-    /// at most `max_per_check` per layer per check.
-    Trophic { frac: f32, max_per_check: usize },
+    /// Sprint 43+44: trophic-factor analogue. Signal =
+    /// `|∂L/∂W_outgoing|_1` per neuron — measures how much downstream
+    /// wants to update the neuron's outgoing connections.
+    ///
+    /// **Sprint 44 adaptive cap.** `max_per_check` is replaced by two
+    /// self-regulating budgets:
+    /// - `kill_rate`: max kills per check = `max(1, floor(alive × kill_rate))`.
+    ///   Cap shrinks as the layer shrinks → graceful saturation.
+    /// - `max_dead_frac`: halt all kills if `dead / total ≥ max_dead_frac`.
+    ///   Hard ceiling on capacity loss.
+    Trophic {
+        frac: f32,
+        kill_rate: f32,
+        max_dead_frac: f32,
+    },
     RandomFixed { per_layer_counts: Vec<usize> },
 }
 
@@ -134,9 +144,11 @@ impl ApoptosisState {
         match self.config.mode.clone() {
             ApoptosisMode::Off => Vec::new(),
             ApoptosisMode::Activity => self.kill_activity(),
-            ApoptosisMode::Trophic { frac, max_per_check } => {
-                self.kill_trophic(frac, max_per_check)
-            }
+            ApoptosisMode::Trophic {
+                frac,
+                kill_rate,
+                max_dead_frac,
+            } => self.kill_trophic(frac, kill_rate, max_dead_frac),
             ApoptosisMode::RandomFixed { .. } => self.kill_random(rng),
         }
     }
@@ -169,32 +181,54 @@ impl ApoptosisState {
     /// "starving" if its trophic supply is far below typical.
     /// `max_per_check` caps kills per layer per check — avoids the
     /// snowball failure observed in Sprint 43.
-    fn kill_trophic(&mut self, frac: f32, max_per_check: usize) -> Vec<KillEvent> {
+    fn kill_trophic(
+        &mut self,
+        frac: f32,
+        kill_rate: f32,
+        max_dead_frac: f32,
+    ) -> Vec<KillEvent> {
         if !self.chunks_seen.is_multiple_of(self.config.check_interval) {
             return Vec::new();
         }
         let mut events = Vec::new();
         for (l, ema_row) in self.ema_rate.iter().enumerate() {
-            let alive: Vec<usize> = (0..ema_row.len())
-                .filter(|&i| !self.dead_mask[l][i])
-                .collect();
+            let total = ema_row.len();
+            let dead = self.dead_mask[l].iter().filter(|d| **d).count();
+            // Sprint 44 hard ceiling: stop pruning this layer once
+            // capacity loss reaches max_dead_frac.
+            if (dead as f32) / (total as f32) >= max_dead_frac {
+                continue;
+            }
+            let alive: Vec<usize> = (0..total).filter(|&i| !self.dead_mask[l][i]).collect();
             if alive.is_empty() {
                 continue;
             }
-            // Use median instead of mean — gradient magnitudes have a
+            // Sprint 44 adaptive cap: budget scales with surviving
+            // neuron count → as layer shrinks, kills slow down. At
+            // least 1 to keep the mechanism live.
+            let cap = ((alive.len() as f32) * kill_rate).floor().max(1.0) as usize;
+
+            // Median instead of mean — gradient magnitudes have a
             // heavy-tailed distribution where mean is dominated by the
             // top few neurons. Median gives a stable per-layer scale.
             let mut signals: Vec<f32> = alive.iter().map(|&i| ema_row[i]).collect();
             signals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let median = signals[signals.len() / 2];
             let threshold = frac * median;
+
             let mut candidates: Vec<(usize, f32)> = alive
                 .iter()
                 .map(|&i| (i, ema_row[i]))
                 .filter(|(_, v)| *v < threshold)
                 .collect();
-            candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            for (i, signal) in candidates.into_iter().take(max_per_check) {
+            candidates
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            // Respect both adaptive cap AND headroom to max_dead_frac
+            // (don't blast through the ceiling in a single check).
+            let headroom = ((total as f32 * max_dead_frac).floor() as usize)
+                .saturating_sub(dead);
+            let take = cap.min(headroom);
+            for (i, signal) in candidates.into_iter().take(take) {
                 self.dead_mask[l][i] = true;
                 events.push(KillEvent {
                     chunk: self.chunks_seen,
