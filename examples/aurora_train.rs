@@ -2,7 +2,8 @@
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::large_enum_variant
 )]
 
 //! Sprint 28: Aurora's primary training example.
@@ -63,6 +64,13 @@ struct Cli {
     checkpoint: PathBuf,
     bpe_path: Option<PathBuf>,
     metrics: Option<PathBuf>,
+    /// Sprint 39: opt out of GPU and run on CPU. Required for `--sdsa`
+    /// until the GPU SDSA port lands. Only useful for small configs
+    /// (hidden ≤ 256 typically); CPU is ~10× slower than GPU at scale.
+    cpu: bool,
+    /// Sprint 39: enable Spike-Driven Self-Attention block.
+    /// CPU-only path (Sprint 38 wiring); GPU port = Sprint 40+.
+    sdsa: bool,
 }
 
 impl Cli {
@@ -76,6 +84,8 @@ impl Cli {
         let mut checkpoint: Option<PathBuf> = None;
         let mut bpe_path: Option<PathBuf> = None;
         let mut metrics: Option<PathBuf> = None;
+        let mut cpu: bool = false;
+        let mut sdsa: bool = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -122,6 +132,14 @@ impl Cli {
                     metrics = Some(next()?.into());
                     i += 2;
                 }
+                "--cpu" => {
+                    cpu = true;
+                    i += 1;
+                }
+                "--sdsa" => {
+                    sdsa = true;
+                    i += 1;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
@@ -137,6 +155,12 @@ impl Cli {
             PathBuf::from(format!("data/{stem}_h{hidden}_v{vocab}.ckpt"))
         });
 
+        if sdsa && !cpu {
+            return Err(
+                "--sdsa currently requires --cpu (GPU SDSA port = Sprint 40+)".into(),
+            );
+        }
+
         Ok(Self {
             corpus,
             vocab,
@@ -147,6 +171,8 @@ impl Cli {
             checkpoint,
             bpe_path,
             metrics,
+            cpu,
+            sdsa,
         })
     }
 }
@@ -199,21 +225,36 @@ fn main() -> ExitCode {
     let train_toks = &tokens[..n_train];
     let val_toks = &tokens[n_train..];
 
-    let ctx = match GpuContext::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("GPU init failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let info = ctx.adapter_info();
-
     let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-    let (net_init, start_epoch) =
+    let (mut net_init, start_epoch) =
         load_or_init_net(&cli.checkpoint, actual_vocab, cli.hidden, &mut rng);
     let resumed = start_epoch > 0;
-    let mut net_gpu = MultiLayerGatedSnnGpu::from_cpu(&net_init, ctx);
-    drop(net_init);
+
+    if cli.sdsa {
+        net_init.enable_sdsa(&mut rng);
+    }
+
+    enum Backend {
+        Gpu(MultiLayerGatedSnnGpu, String),
+        Cpu(MultiLayerGatedSnn, String),
+    }
+    let mut backend = if cli.cpu {
+        Backend::Cpu(net_init, "CPU (rayon)".to_string())
+    } else {
+        let ctx = match GpuContext::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("GPU init failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let name = ctx.adapter_info().name;
+        Backend::Gpu(MultiLayerGatedSnnGpu::from_cpu(&net_init, ctx), name)
+    };
+    let backend_name = match &backend {
+        Backend::Gpu(_, n) => n.clone(),
+        Backend::Cpu(_, n) => n.clone(),
+    };
 
     let adam = AdamConfig {
         lr: cli.lr,
@@ -249,7 +290,7 @@ fn main() -> ExitCode {
             tokens.len(),
             actual_vocab,
             start_epoch,
-            &info.name,
+            &backend_name,
         );
     }
 
@@ -263,7 +304,7 @@ fn main() -> ExitCode {
         encode_s,
         start_epoch,
         resumed,
-        &info,
+        &backend_name,
     );
 
     let total_start = Instant::now();
@@ -280,9 +321,22 @@ fn main() -> ExitCode {
         let report_every = (n_chunks_per_stream / 50).max(1);
         let mut total_nats = 0.0_f32;
         let mut total_tokens = 0_usize;
-        let mut states: Vec<StateTuple> = (0..BATCH_SIZE)
-            .map(|_| (vec![0.0; h], vec![0.0; h], vec![0.0; h], vec![0.0; h]))
-            .collect();
+
+        // Per-backend state allocation. CPU uses `Vec<GatedState>`,
+        // GPU uses a flat 4-tuple (l0_h_v_after, l0_h_spike, l1_h_v_after, l1_h_spike).
+        let mut gpu_states: Vec<StateTuple> = Vec::new();
+        let mut cpu_states: Vec<Vec<aurora::snn_gated::GatedState>> = Vec::new();
+        match &backend {
+            Backend::Gpu(_, _) => {
+                gpu_states = (0..BATCH_SIZE)
+                    .map(|_| (vec![0.0; h], vec![0.0; h], vec![0.0; h], vec![0.0; h]))
+                    .collect();
+            }
+            Backend::Cpu(net, _) => {
+                cpu_states = (0..BATCH_SIZE).map(|_| net.fresh_states()).collect();
+            }
+        }
+
         let mut inputs_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
         let mut targets_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
 
@@ -295,14 +349,30 @@ fn main() -> ExitCode {
                 inputs_owned.push(&train_toks[p..p + cli.chunk]);
                 targets_owned.push(&train_toks[p + 1..p + cli.chunk + 1]);
             }
-            net_gpu.zero_grad_gpu();
-            let loss = net_gpu.forward_backward_batch_gpu_multi_fused_tokens(
-                &inputs_owned,
-                &targets_owned,
-                &mut states,
-            );
-            net_gpu.clip_grads_gpu(GRAD_CLIP);
-            net_gpu.step_adam_gpu(&adam);
+            let loss = match &mut backend {
+                Backend::Gpu(net_gpu, _) => {
+                    net_gpu.zero_grad_gpu();
+                    let l = net_gpu.forward_backward_batch_gpu_multi_fused_tokens(
+                        &inputs_owned,
+                        &targets_owned,
+                        &mut gpu_states,
+                    );
+                    net_gpu.clip_grads_gpu(GRAD_CLIP);
+                    net_gpu.step_adam_gpu(&adam);
+                    l
+                }
+                Backend::Cpu(net, _) => {
+                    net.zero_grad();
+                    let l = net.forward_backward_batch_tokens_stateful(
+                        &inputs_owned,
+                        &targets_owned,
+                        &mut cpu_states,
+                    );
+                    net.clip_grads(GRAD_CLIP);
+                    net.step_adam(&adam);
+                    l
+                }
+            };
             total_nats += loss;
             total_tokens += cli.chunk * BATCH_SIZE;
 
@@ -319,7 +389,10 @@ fn main() -> ExitCode {
 
         let train_bpb =
             bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
-        let net_snapshot = net_gpu.to_cpu();
+        let net_snapshot = match &backend {
+            Backend::Gpu(net_gpu, _) => net_gpu.to_cpu(),
+            Backend::Cpu(net, _) => net.clone(),
+        };
         let (val_bpb, rates, mem) = evaluate(&net_snapshot, val_toks, cli.chunk, comp);
         if val_bpb < best_val {
             best_val = val_bpb;
@@ -554,16 +627,18 @@ fn print_header(
     encode_s: f64,
     start_epoch: u32,
     resumed: bool,
-    adapter: &wgpu::AdapterInfo,
+    backend: &str,
 ) {
     let bar_h = "═".repeat(BOX_WIDTH);
     println!("╔{bar_h}╗");
-    println!("{}", center("Aurora · 2-layer gated SNN · BPE · GPU"));
+    let title = if cli.sdsa {
+        "Aurora · 2-layer gated SNN · BPE · SDSA"
+    } else {
+        "Aurora · 2-layer gated SNN · BPE"
+    };
+    println!("{}", center(title));
     println!("╠{bar_h}╣");
-    println!(
-        "{}",
-        kv("gpu", &format!("{} ({:?})", adapter.name, adapter.backend))
-    );
+    println!("{}", kv("backend", backend));
     println!(
         "{}",
         kv(

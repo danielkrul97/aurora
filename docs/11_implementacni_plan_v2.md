@@ -393,7 +393,61 @@ SDSA matematika je verified, integrace do CPU pipeline je hotová a otestovaná.
 
 ---
 
-## Sprint 39+ — Pokračování
+## Sprint 39 — Empirická validace SDSA ✓ DONE (negative result)
+
+**Cíl:** Před investicí do GPU portu SDSA (~5 h focused work) ověřit empiricky, jestli SDSA v současné implementaci skutečně pomáhá. Tier 1 z analytického přístupu — měřit, ne kódovat.
+
+**Implementace:**
+
+1. **`aurora_train --cpu` flag** — přepne na čistý CPU `MultiLayerGatedSnn::forward_backward_batch_tokens_stateful`. Nefunkční pro hidden=1024 (CPU pomalý), ale vhodné pro malé experimenty.
+
+2. **`aurora_train --sdsa` flag** — zapíná `enable_sdsa(rng)`. Validace: `--sdsa` bez `--cpu` vrátí error (GPU SDSA ještě není).
+
+3. **Backend enum** v aurora_train pro abstraction GPU/CPU. Per-backend state allocation, dispatch logic. Připraveno pro Sprint 40+ GPU port.
+
+4. **Header** + JSONL run event nyní obsahují backend name (např. "NVIDIA GeForce GTX 1650" nebo "CPU (rayon)"), title je "Aurora · 2-layer gated SNN · BPE · SDSA" když SDSA on.
+
+5. **Regression check**: GPU mode dává val BPB 2.610 na tiny_200k (vs Sprint 37 baseline 2.613) — žádná regrese.
+
+**Empirický A/B test** — tiny_200k, vocab=1024, hidden=128, chunk=32, lr=0.003, 5 epoch:
+
+| Epoch | bez SDSA | s SDSA |
+|---|---|---|
+| 1 | 3.270 | 3.265 |
+| 2 | 3.235 | 3.278 |
+| 3 | 2.982 | 3.161 |
+| 4 | 2.756 | 2.912 |
+| 5 | **2.628** | **2.765** |
+
+**SDSA je v současné implementaci o 0.137 BPB HORŠÍ.** Convergence pomalejší, finální výsledek slabší.
+
+**Hypotézy proč:**
+
+1. **Q/K/V spikes téměř nikdy nefires** — LayerNorm centruje hodnoty kolem 0, threshold θ=1.0 → spike rate ~0. SDSA contribution `Q ⊙ attn_state` je víceméně nulová. Residual `y = h_spike + 0` redukuje SDSA na no-op forward, ale gradient noise tečou skrz dead path → škodí.
+
+2. **Init scale W_q/W_k/W_v** (Xavier `√(6/(d_in + d_out))`) je pro non-spike outputy. Pro pre-activation která má jít do heaviside nad θ=1.0 by mělo být **mnohem větší**.
+
+3. **Architektura nesedí pro tento setting** — Yao 2023 dělal vision; LM dynamics jsou jiné.
+
+**Co s tím (volby):**
+
+| Přístup | Effort | Riziko |
+|---|---|---|
+| **A. Skip SDSA, focus na PLIF/AdLIF/MPBN** | medium | low — má jasný precedens v literatuře |
+| **B. Tune SDSA θ + init pro vision→LM transfer** | medium | medium — možná neopravitelné |
+| **C. Akceptovat negative result, dokumentovat, ukončit SDSA branch** | low | žádné — ale opouštíme Aurora's potenciálně novel contribution |
+| **D. Bigger A/B na velké data (vocab=4096, hidden=512+)** | medium (CPU pomalý) nebo wait pro GPU port | low — empirika přes víc bodů |
+
+**Cumulative pokrok od začátku v2 plánu:**
+- Sprint 30 baseline: 2.768 BPB
+- Sprint 37 (membrane fix): 2.613 BPB (−0.155)
+- Sprint 39 SDSA test: SDSA prozatím ne. Architectural skok blocked dokud neopravíme spike-firing v Q/K/V.
+
+**Tests:** 51/51 unit + 6/6 GPU parity (+ 2 SDSA integration ze Sprintu 38). Žádná regrese.
+
+---
+
+## Sprint 40+ — Pokračování
 
 ---
 
