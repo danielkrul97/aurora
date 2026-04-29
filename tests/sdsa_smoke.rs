@@ -40,7 +40,7 @@ fn sdsa_forward_finite_and_residual_growth_monotone() {
     for t_idx in 1..t {
         for i in 0..8 {
             assert!(
-                cache.attn_states[t_idx][i] >= cache.attn_states[t_idx - 1][i],
+                cache.attn_states[t_idx * 8 + i] >= cache.attn_states[(t_idx - 1) * 8 + i],
                 "attn state should be non-decreasing"
             );
         }

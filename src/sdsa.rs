@@ -77,9 +77,11 @@ pub struct SdsaCache {
     pub q_spike: Vec<f32>,
     pub k_spike: Vec<f32>,
     pub v_spike: Vec<f32>,
-    /// `attn_states[t]` = state AFTER adding `K_t ⊙ V_t`. The very
-    /// first entry is `initial_attn_state + K_0 ⊙ V_0`.
-    pub attn_states: Vec<Vec<f32>>,
+    /// Flat row-major `[T * n_hidden]`. `attn_states[t*n .. (t+1)*n]`
+    /// = state AFTER adding `K_t ⊙ V_t`. The very first slice is
+    /// `initial_attn_state + K_0 ⊙ V_0`. Stored flat to avoid per-step
+    /// `Vec<f32>` allocations on the forward path.
+    pub attn_states: Vec<f32>,
     pub initial_attn_state: Vec<f32>,
     pub final_attn_state: Vec<f32>,
 }
@@ -200,7 +202,7 @@ pub fn sdsa_forward(
     let k_spike: Vec<f32> = k_pre.iter().map(|&v| if v >= theta { 1.0 } else { 0.0 }).collect();
     let v_spike: Vec<f32> = v_pre.iter().map(|&v| if v >= theta { 1.0 } else { 0.0 }).collect();
 
-    let mut attn_states: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
+    let mut attn_states = vec![0.0_f32; t_steps * n];
     let mut sdsa_out = vec![0.0_f32; t_steps * n];
     let mut state = initial_attn_state.to_vec();
 
@@ -210,7 +212,7 @@ pub fn sdsa_forward(
         for i in 0..n {
             state[i] += k_spike[off + i] * v_spike[off + i];
         }
-        attn_states.push(state.clone());
+        attn_states[off..off + n].copy_from_slice(&state);
         // out_t = Q_t ⊙ attn_state
         for i in 0..n {
             sdsa_out[off + i] = q_spike[off + i] * state[i];
@@ -270,7 +272,7 @@ pub fn sdsa_backward(
     let mut d_attn_cum = vec![0.0_f32; n];
     for t in (0..t_steps).rev() {
         let off = t * n;
-        let attn_t = &cache.attn_states[t];
+        let attn_t = &cache.attn_states[off..off + n];
         // d_Q_t = d_sdsa_out_t ⊙ attn_t
         // d_attn_t = d_sdsa_out_t ⊙ Q_t  → accumulate into d_attn_cum
         for i in 0..n {

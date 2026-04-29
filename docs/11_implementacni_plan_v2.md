@@ -447,7 +447,60 @@ SDSA matematika je verified, integrace do CPU pipeline je hotová a otestovaná.
 
 ---
 
-## Sprint 40+ — Pokračování
+## Sprint 40 — AdLIF (CPU, fixed params) ✓ DONE (negative result)
+
+**Cíl:** Druhá architektonická intervence z research review — AdLIF adaptation current
+(`w_t = ρ·w_{t-1} + b·spike_t`, subtracted from `v_pre`) — neurony co často firují si
+budují "únavu" `w` co potlačuje subsequent firing. Stejný pattern jako Sprint 39: implementuj
+minimal viable, A/B test, rozhodni o GPU portu.
+
+**Implementace:**
+
+1. `GatedState.adlif_w: Vec<f32>` (carries between chunks, empty když opt-out).
+2. `MultiLayerGatedSnn.adlif_enabled: bool` + `enable_adlif()` opt-in.
+3. Forward: `v_pre -= w_prev` před clamp, pak `w_t = ρ·w + b·spike` po spike.
+4. Backward: per-layer `d_w_carry` carries reverse in time. `d_h_spike[t] += b·d_w_carry`,
+   pak `d_w_carry = ρ·d_w_carry − d_v_pre[t]`.
+5. Fixed `ρ=0.95, b ∈ {0.3, 0.1}` — žádné Adam (Sprint 41 by je mohl udělat learnable).
+6. `aurora_train --adlif` flag (jen s `--cpu` zatím).
+
+**A/B test** — tiny_200k, vocab=1024, hidden=128, 5 epoch, stejné jako Sprint 39 SDSA test:
+
+| Epoch | bez AdLIF | AdLIF b=0.3 | AdLIF b=0.1 |
+|---|---|---|---|
+| 1 | 3.270 | 3.295 | 3.264 |
+| 5 | **2.628** | 3.059 | 3.006 |
+
+**AdLIF horší o 0.38–0.43 BPB.** Convergence pomalejší.
+
+**Diagnóza:**
+
+Aurora už má spike-rate l2 reg (Sprint 32–33), který dělá podobnou práci jako AdLIF —
+suppression over-firing neuronů. AdLIF je redundantní damping který odebírá expressivitu.
+Plus fixed b je špatně laděné: at rate=0.5, w_eq=b·rate/(1−ρ) → 3.0 (b=0.3) nebo 1.0 (b=0.1).
+Membrane equilibrium `(b_h − w_eq)/(1−β)` klesá z 1.0 na −5.0 (b=0.3) nebo −1.0 (b=0.1) →
+network silenced.
+
+**Wzor: dvě architektonické intervence v řadě negativní (SDSA, AdLIF).**
+
+Aurora's existující stack (gated cell + clamp + per-neuron rate reg + LSG α) je už dost
+adaptivní pro daný compute budget. Inkrementální architektonické add-ons se utopí v
+existující regularizaci.
+
+**Doporučení (Sprint 41+):**
+
+1. **Pivot na CAPACITY místo dynamics** — jediná cesta k podstatnému BPB skoku je víc
+   parametrů (deeper, wider) nebo víc dat (real overnight enwik8). Ne jemná architecture
+   úprava existujícího cell.
+2. **Reálný overnight enwik8_10m** — Sprint 37 dynamics (clamp + b_gate=0 + small W_rec)
+   nebyly nikdy testovány na 10 MB víc-epoch. Bez toho data point je každá další
+   architektonická volba spekulativní.
+3. **Učinit AdLIF/SDSA learnable** může pomoci, ale empirický signal po 2 negativních
+   testech je proti.
+
+---
+
+## Sprint 41+ — Pokračování
 
 ---
 

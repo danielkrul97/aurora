@@ -66,6 +66,15 @@ const DEFAULT_ALPHA: f32 = 4.0;
 /// dynamics — neurons that try to sit ten thresholds above firing
 /// simply saturate, lose nothing useful.
 pub const MEMBRANE_CLAMP: f32 = 10.0;
+/// Sprint 40 AdLIF time constant. `w_t = ρ·w_{t-1} + b·spike_t`.
+/// `ρ=0.95` ≈ τ ≈ 20 timesteps half-life — slow accumulator.
+pub const ADLIF_RHO: f32 = 0.95;
+/// Sprint 40 AdLIF spike-driven gain. Each spike adds `b` to `w`,
+/// which then suppresses subsequent membrane by `−w`. b=0.3 was first
+/// guess; killed firing entirely (w_eq grows to 3.0 at rate=0.5 →
+/// membrane equilibrium drops to −5.0). b=0.1 is gentler — at
+/// rate=0.5, w_eq=1.0 → membrane shifts down by 1, still fires.
+pub const ADLIF_B: f32 = 0.1;
 /// Sprint 31 / Sprint 37 retuning. With `b_gate=0` (β=0.5, not 0.73),
 /// equilibrium membrane is `b_h / (1−β) = 2·b_h`. Setting `b_h=0.5`
 /// puts `v_eq` at θ=1.0 — same firing onset as Sprint 31 but with
@@ -296,8 +305,13 @@ pub struct LayerCache {
     pub h_v_after: Vec<Vec<f32>>,
     pub h_spike: Vec<Vec<f32>>,
     pub gate: Vec<Vec<f32>>,
+    /// Active spike indices per timestep — derived from `h_spike`,
+    /// memoized at forward time so backward (and downstream sparse
+    /// matvecs) can skip O(n_h) re-scans.
+    pub h_active: Vec<Vec<usize>>,
     pub initial_h_v_after: Vec<f32>,
     pub initial_h_spike: Vec<f32>,
+    pub initial_h_active: Vec<usize>,
 }
 
 impl LayerCache {
@@ -307,8 +321,10 @@ impl LayerCache {
             h_v_after: Vec::with_capacity(t_steps),
             h_spike: Vec::with_capacity(t_steps),
             gate: Vec::with_capacity(t_steps),
+            h_active: Vec::with_capacity(t_steps),
             initial_h_v_after: Vec::new(),
             initial_h_spike: Vec::new(),
+            initial_h_active: Vec::new(),
         }
     }
 }
@@ -450,6 +466,12 @@ pub struct MultiLayerGatedSnn {
     /// sdsa_out` feeds a dense W_out matvec.
     pub sdsa: Option<crate::sdsa::SdsaCell>,
     sdsa_adam: Option<crate::sdsa::SdsaAdam>,
+    /// Sprint 40: AdLIF adaptation. When `true`, every layer carries
+    /// a per-neuron `w` adaptation current that subtracts from `v_pre`
+    /// and updates `w ← ρ·w + b·spike` each timestep. Fixed scalars
+    /// for now (no Adam coupling) — make learnable in Sprint 41 if
+    /// the A/B test on small CPU run shows quality improvement.
+    pub adlif_enabled: bool,
     grads: MultiLayerGatedGrads,
     adam_t: usize,
     layer_adam: Vec<LayerAdam>,
@@ -499,6 +521,7 @@ impl MultiLayerGatedSnn {
             rate_reg: RateReg::default(),
             sdsa: None,
             sdsa_adam: None,
+            adlif_enabled: false,
             adam_t: 0,
             layer_adam,
             adam_w_out: AdamGroup::zeros(n_output * top_hidden),
@@ -517,15 +540,27 @@ impl MultiLayerGatedSnn {
         self.sdsa_adam = Some(crate::sdsa::SdsaAdam::zeros(n));
     }
 
+    /// Sprint 40: turn on AdLIF adaptation current with default
+    /// hardcoded `ρ=0.95`, `b=0.3`. Per-neuron `w` carries between
+    /// chunks via `GatedState::adlif_w`. No Adam state — params are
+    /// constants this sprint; Sprint 41 makes them learnable if the
+    /// CPU A/B shows quality improvement.
+    pub fn enable_adlif(&mut self) {
+        self.adlif_enabled = true;
+    }
+
     pub fn fresh_states(&self) -> Vec<GatedState> {
         let n_layers = self.layers.len();
         self.layers
             .iter()
             .enumerate()
             .map(|(idx, l)| {
-                // SDSA accumulator carries between chunks; lives on
-                // the top layer's state when SDSA is enabled.
                 let attn_state = if self.sdsa.is_some() && idx + 1 == n_layers {
+                    vec![0.0_f32; l.n_hidden]
+                } else {
+                    Vec::new()
+                };
+                let adlif_w = if self.adlif_enabled {
                     vec![0.0_f32; l.n_hidden]
                 } else {
                     Vec::new()
@@ -534,6 +569,7 @@ impl MultiLayerGatedSnn {
                     h_v_after: vec![0.0_f32; l.n_hidden],
                     h_spike: vec![0.0_f32; l.n_hidden],
                     attn_state,
+                    adlif_w,
                 }
             })
             .collect()
@@ -670,6 +706,7 @@ impl MultiLayerGatedSnn {
             sdsa_y: None,
         };
         for (l, st) in states.iter().enumerate() {
+            cache.layers[l].initial_h_active = active_indices(&st.h_spike);
             cache.layers[l].initial_h_v_after = st.h_v_after.clone();
             cache.layers[l].initial_h_spike = st.h_spike.clone();
         }
@@ -720,11 +757,14 @@ impl MultiLayerGatedSnn {
                     for &c in &active_prev {
                         h_rec_val += layer.w_rec[row_offset_rec + c];
                     }
-                    h_v_pre_t[hi] = (state.h_v_after[hi] * gate[hi]
+                    let mut acc = state.h_v_after[hi] * gate[hi]
                         + h_in_val
                         + h_rec_val
-                        + layer.b_h[hi])
-                        .clamp(-MEMBRANE_CLAMP, MEMBRANE_CLAMP);
+                        + layer.b_h[hi];
+                    if !state.adlif_w.is_empty() {
+                        acc -= state.adlif_w[hi];
+                    }
+                    h_v_pre_t[hi] = acc.clamp(-MEMBRANE_CLAMP, MEMBRANE_CLAMP);
                 }
                 let h_spike_t: Vec<f32> = h_v_pre_t
                     .iter()
@@ -738,13 +778,25 @@ impl MultiLayerGatedSnn {
 
                 let active_t = active_indices(&h_spike_t);
 
-                cache.layers[l].h_v_pre.push(h_v_pre_t);
-                cache.layers[l].h_v_after.push(h_v_after_t.clone());
-                cache.layers[l].h_spike.push(h_spike_t.clone());
-                cache.layers[l].gate.push(gate);
+                // Sprint 40 AdLIF update: w_t = ρ·w_{t-1} + b·spike_t.
+                if !states[l].adlif_w.is_empty() {
+                    for hi in 0..n_h {
+                        states[l].adlif_w[hi] =
+                            ADLIF_RHO * states[l].adlif_w[hi] + ADLIF_B * h_spike_t[hi];
+                    }
+                }
 
-                states[l].h_v_after = h_v_after_t;
-                states[l].h_spike = h_spike_t;
+                // Update state via clone_from (reuses Vec capacity, avoids
+                // an allocation per (layer, step)) before moving the
+                // originals into the cache.
+                states[l].h_v_after.clone_from(&h_v_after_t);
+                states[l].h_spike.clone_from(&h_spike_t);
+
+                cache.layers[l].h_v_pre.push(h_v_pre_t);
+                cache.layers[l].h_v_after.push(h_v_after_t);
+                cache.layers[l].h_spike.push(h_spike_t);
+                cache.layers[l].gate.push(gate);
+                cache.layers[l].h_active.push(active_t.clone());
 
                 layer_input_active = active_t;
             }
@@ -754,14 +806,14 @@ impl MultiLayerGatedSnn {
             // post-loop pass over the residual `y = h_spike + sdsa_out`.
             if self.sdsa.is_none() {
                 let top_active = layer_input_active; // == active indices of top spike
-                let mut logits = self.b_o.clone();
+                let mut logits = Vec::with_capacity(self.n_output);
                 for o in 0..self.n_output {
                     let row_offset = o * top_hidden;
                     let mut acc = self.b_o[o];
                     for &c in &top_active {
                         acc += self.w_out[row_offset + c];
                     }
-                    logits[o] = acc;
+                    logits.push(acc);
                 }
                 cache.logits.push(logits);
             }
@@ -772,26 +824,25 @@ impl MultiLayerGatedSnn {
         // matvec on the residual `y = h_spike + sdsa_out`.
         if let Some(sdsa) = &self.sdsa {
             let top = n_layers - 1;
-            let h_top_flat: Vec<f32> = cache.layers[top]
-                .h_spike
-                .iter()
-                .flat_map(|row| row.iter().copied())
-                .collect();
+            let mut h_top_flat: Vec<f32> = Vec::with_capacity(t_steps * top_hidden);
+            for row in &cache.layers[top].h_spike {
+                h_top_flat.extend_from_slice(row);
+            }
             let initial_attn = states[top].attn_state.clone();
             let (y_flat, sdsa_cache) =
                 crate::sdsa::sdsa_forward(sdsa, &h_top_flat, &initial_attn);
-            states[top].attn_state = sdsa_cache.final_attn_state.clone();
+            states[top].attn_state.clone_from(&sdsa_cache.final_attn_state);
 
             for t in 0..t_steps {
                 let y_t = &y_flat[t * top_hidden..(t + 1) * top_hidden];
-                let mut logits = vec![0.0_f32; self.n_output];
+                let mut logits = Vec::with_capacity(self.n_output);
                 for o in 0..self.n_output {
                     let row_offset = o * top_hidden;
                     let mut acc = self.b_o[o];
                     for h in 0..top_hidden {
                         acc += self.w_out[row_offset + h] * y_t[h];
                     }
-                    logits[o] = acc;
+                    logits.push(acc);
                 }
                 cache.logits.push(logits);
             }
@@ -864,21 +915,38 @@ impl MultiLayerGatedSnn {
             .map(|l| vec![0.0_f32; l.n_hidden])
             .collect();
 
+        // Sprint 40: AdLIF gradient carry. Per-layer running gradient
+        // on the adaptation current `w`, propagated backward in time:
+        //   dw[t-1] = ρ·dw[t] − d_v_pre[t]
+        // Plus per-step contribution to d_h_spike via the spike update:
+        //   d_h_spike[t] += b · dw[t]
+        let adlif_active = self.adlif_enabled;
+        let mut d_w_carry: Vec<Vec<f32>> = if adlif_active {
+            self.layers
+                .iter()
+                .map(|l| vec![0.0_f32; l.n_hidden])
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let mut total_loss = 0.0_f32;
 
+        let top_n_h = self.layers.last().map(|l| l.n_hidden).unwrap_or(0);
         for t in (0..t_steps).rev() {
-            let d_h_top_spike_from_out = if let Some(d_arr) = d_h_top_pre.as_ref() {
+            let d_h_top_spike_from_out = if let Some(d_flat) = d_h_top_pre.as_ref() {
                 // SDSA path: loss + W_out grad already accounted for in
                 // `backward_top_through_sdsa`. d_h is the SDSA backward
-                // result with residual contribution included.
-                d_arr[t].clone()
+                // result with residual contribution included. Slice the
+                // flat buffer directly — saves a Vec<Vec<f32>> reshape.
+                d_flat[t * top_n_h..(t + 1) * top_n_h].to_vec()
             } else {
                 let (loss_t, d_logits) =
                     cross_entropy_with_grad(&cache.logits[t], targets[t] as usize);
                 total_loss += loss_t;
 
                 let top_layer = n_layers - 1;
-                let active_top_t = active_indices(&cache.layers[top_layer].h_spike[t]);
+                let active_top_t = &cache.layers[top_layer].h_active[t];
 
                 for o in 0..self.n_output {
                     let d = d_logits[o];
@@ -887,7 +955,7 @@ impl MultiLayerGatedSnn {
                     }
                     grads.b_o[o] += d;
                     let row_offset = o * top_hidden;
-                    for &h in &active_top_t {
+                    for &h in active_top_t {
                         grads.w_out[row_offset + h] += d;
                     }
                 }
@@ -906,10 +974,16 @@ impl MultiLayerGatedSnn {
                 let layer_grad = &mut grads.layers[l];
 
                 // Total d_h_spike at step t for layer l =
-                // (from above) + (recurrent feedback from t+1).
-                let d_h_spike_t: Vec<f32> = (0..n_h)
+                // (from above) + (recurrent feedback from t+1)
+                // (+ Sprint 40 AdLIF: ∂w_t/∂spike_t = b · dw_carry).
+                let mut d_h_spike_t: Vec<f32> = (0..n_h)
                     .map(|i| d_h_spike_from_above[i] + d_h_spike_recurrent[l][i])
                     .collect();
+                if adlif_active {
+                    for i in 0..n_h {
+                        d_h_spike_t[i] += ADLIF_B * d_w_carry[l][i];
+                    }
+                }
 
                 // d_h_v_pre[l, t] = d_h_spike[l, t] * surrogate'(h_v_pre)
                 //                 + d_h_v_after_carry[l] (from t+1).
@@ -933,21 +1007,30 @@ impl MultiLayerGatedSnn {
                     layer_grad.d_alpha += d_h_spike_t[i] * (-2.0 * abs_dv / cubic);
                 }
 
+                // Sprint 40 AdLIF carry update: dw[t-1] = ρ·dw[t] − d_v_pre[t].
+                if adlif_active {
+                    for i in 0..n_h {
+                        d_w_carry[l][i] = ADLIF_RHO * d_w_carry[l][i] - d_h_v_pre_t[i];
+                    }
+                }
+
                 // Layer's own input active list (for grad_w_in /
                 // grad_w_gate_in column writes). For layer 0: byte_t.
-                // For layer L>0: active indices of layer L-1's spike
-                // output at THIS timestep.
-                let layer_input_active: Vec<usize> = if l == 0 {
-                    vec![input_tokens[t] as usize]
+                // For layer L>0: cached active indices of layer L-1's
+                // spike output at THIS timestep.
+                let layer_input_one: [usize; 1];
+                let layer_input_active: &[usize] = if l == 0 {
+                    layer_input_one = [input_tokens[t] as usize];
+                    &layer_input_one
                 } else {
-                    active_indices(&cache.layers[l - 1].h_spike[t])
+                    &cache.layers[l - 1].h_active[t]
                 };
                 // Recurrent: previous timestep's spike actives for
-                // this layer.
-                let active_prev = if t == 0 {
-                    active_indices(&cache.layers[l].initial_h_spike)
+                // this layer (cached at forward time).
+                let active_prev: &[usize] = if t == 0 {
+                    &cache.layers[l].initial_h_active
                 } else {
-                    active_indices(&cache.layers[l].h_spike[t - 1])
+                    &cache.layers[l].h_active[t - 1]
                 };
 
                 // grad_b_h, grad_w_in (col additions for active input
@@ -959,11 +1042,11 @@ impl MultiLayerGatedSnn {
                     }
                     layer_grad.b_h[h] += d;
                     let row_in = h * n_in;
-                    for &c in &layer_input_active {
+                    for &c in layer_input_active {
                         layer_grad.w_in[row_in + c] += d;
                     }
                     let row_rec = h * n_h;
-                    for &j in &active_prev {
+                    for &j in active_prev {
                         layer_grad.w_rec[row_rec + j] += d;
                     }
                 }
@@ -989,11 +1072,11 @@ impl MultiLayerGatedSnn {
                     }
                     layer_grad.b_gate[h] += d;
                     let row_in = h * n_in;
-                    for &c in &layer_input_active {
+                    for &c in layer_input_active {
                         layer_grad.w_gate_in[row_in + c] += d;
                     }
                     let row_rec = h * n_h;
-                    for &j in &active_prev {
+                    for &j in active_prev {
                         layer_grad.w_gate_rec[row_rec + j] += d;
                     }
                 }
@@ -1037,10 +1120,20 @@ impl MultiLayerGatedSnn {
             let inv_t = 1.0 / t_steps as f32;
             for (l, layer_cache) in cache.layers.iter().enumerate() {
                 let n_h = self.layers[l].n_hidden;
+                // Accumulate per-neuron firing counts in cache-friendly
+                // order: outer t, inner i — each `row` (size n_h) is
+                // walked sequentially. The original loop nesting was
+                // `for i { for t { row[i] }}`, which strided through
+                // memory with gap n_h and torpedoed the L1 cache for
+                // any reasonable hidden width.
+                let mut rate = vec![0.0_f32; n_h];
+                for row in &layer_cache.h_spike {
+                    for i in 0..n_h {
+                        rate[i] += row[i];
+                    }
+                }
                 for i in 0..n_h {
-                    let rate_i: f32 =
-                        layer_cache.h_spike.iter().map(|row| row[i]).sum::<f32>() * inv_t;
-                    let correction = 2.0 * lambda * (rate_i - target);
+                    let correction = 2.0 * lambda * (rate[i] * inv_t - target);
                     grads.layers[l].b_h[i] += correction;
                 }
             }
@@ -1060,7 +1153,7 @@ impl MultiLayerGatedSnn {
         cache: &MultiLayerCache,
         targets: &[u32],
         grads: &mut MultiLayerGatedGrads,
-    ) -> (Option<Vec<Vec<f32>>>, f32) {
+    ) -> (Option<Vec<f32>>, f32) {
         let sdsa = self.sdsa.as_ref().expect("SDSA enabled");
         let sdsa_cache = cache
             .sdsa
@@ -1097,11 +1190,10 @@ impl MultiLayerGatedSnn {
             d_y_flat[t * n_h..(t + 1) * n_h].copy_from_slice(&d_y_t);
         }
 
-        let h_top_flat: Vec<f32> = cache.layers[top]
-            .h_spike
-            .iter()
-            .flat_map(|r| r.iter().copied())
-            .collect();
+        let mut h_top_flat: Vec<f32> = Vec::with_capacity(t_steps * n_h);
+        for row in &cache.layers[top].h_spike {
+            h_top_flat.extend_from_slice(row);
+        }
         let sdsa_grads = grads
             .sdsa
             .as_mut()
@@ -1114,10 +1206,8 @@ impl MultiLayerGatedSnn {
             sdsa_grads,
         );
 
-        let d_h_per_t: Vec<Vec<f32>> = (0..t_steps)
-            .map(|t| d_h_spike_flat[t * n_h..(t + 1) * n_h].to_vec())
-            .collect();
-        (Some(d_h_per_t), total_loss)
+        let _ = t_steps;
+        (Some(d_h_spike_flat), total_loss)
     }
 
     /// Byte-level wrapper around `backward_lm_tokens_into` (Sprint 26).
@@ -1223,12 +1313,14 @@ impl MultiLayerGatedSnn {
             layer_input_active = active_t;
         }
 
-        let mut logits = self.b_o.clone();
+        let mut logits = Vec::with_capacity(self.n_output);
         for o in 0..self.n_output {
             let row_offset = o * top_hidden;
+            let mut acc = self.b_o[o];
             for &c in &layer_input_active {
-                logits[o] += self.w_out[row_offset + c];
+                acc += self.w_out[row_offset + c];
             }
+            logits.push(acc);
         }
         logits
     }

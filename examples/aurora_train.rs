@@ -71,6 +71,8 @@ struct Cli {
     /// Sprint 39: enable Spike-Driven Self-Attention block.
     /// CPU-only path (Sprint 38 wiring); GPU port = Sprint 40+.
     sdsa: bool,
+    /// Sprint 40: enable AdLIF adaptation current. CPU-only.
+    adlif: bool,
 }
 
 impl Cli {
@@ -86,6 +88,7 @@ impl Cli {
         let mut metrics: Option<PathBuf> = None;
         let mut cpu: bool = false;
         let mut sdsa: bool = false;
+        let mut adlif: bool = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -140,6 +143,10 @@ impl Cli {
                     sdsa = true;
                     i += 1;
                 }
+                "--adlif" => {
+                    adlif = true;
+                    i += 1;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
@@ -160,6 +167,11 @@ impl Cli {
                 "--sdsa currently requires --cpu (GPU SDSA port = Sprint 40+)".into(),
             );
         }
+        if adlif && !cpu {
+            return Err(
+                "--adlif currently requires --cpu (GPU AdLIF port = Sprint 41+)".into(),
+            );
+        }
 
         Ok(Self {
             corpus,
@@ -173,6 +185,7 @@ impl Cli {
             metrics,
             cpu,
             sdsa,
+            adlif,
         })
     }
 }
@@ -232,6 +245,9 @@ fn main() -> ExitCode {
 
     if cli.sdsa {
         net_init.enable_sdsa(&mut rng);
+    }
+    if cli.adlif {
+        net_init.enable_adlif();
     }
 
     enum Backend {

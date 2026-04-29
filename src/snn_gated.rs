@@ -167,6 +167,11 @@ pub struct GatedState {
     /// layer when the network has no `sdsa: Option<SdsaCell>`). For
     /// the top layer with SDSA enabled, sized to that layer's hidden.
     pub attn_state: Vec<f32>,
+    /// Sprint 40: AdLIF adaptation current. `w_t = ρ·w_{t-1} + b·spike_t`
+    /// is subtracted from `v_pre` each timestep — neurons that fire often
+    /// build up `w` and then suppress their own membrane until they cool
+    /// down. Empty `Vec` when AdLIF is not enabled on the network.
+    pub adlif_w: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -310,6 +315,7 @@ impl GatedRecurrentSnn {
             h_v_after: vec![0.0_f32; self.n_hidden],
             h_spike: vec![0.0_f32; self.n_hidden],
             attn_state: Vec::new(),
+            adlif_w: Vec::new(),
         }
     }
 

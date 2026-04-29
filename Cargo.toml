@@ -40,6 +40,10 @@ name = "lm_gpu_speedup"
 harness = false
 required-features = ["gpu"]
 
+[[bench]]
+name = "multi_layer_perf"
+harness = false
+
 [[example]]
 name = "aurora_train"
 required-features = ["gpu"]
