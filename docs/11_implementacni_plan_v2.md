@@ -545,6 +545,152 @@ spekulativní. 7 hodin běhu, 0 dev času, 1 pevný empirický bod.
 
 ---
 
+## Sprint 42 — Activity-dependent neuron pruning ✓ DONE (negative result, 4. v řadě)
+
+**Hypotéza (biologicky inspirovaná):** Per-neuron activity-dependent
+pruning — kill neurons jejichž EMA firing rate klesne pod threshold —
+je **selektivnější regularizace** než dropout / random pruning. Aurora
+trackuje per-neuron rate jako proxy pro „trofickou aktivitu".
+
+**Implementace:** `src/apoptosis.rs` (`ApoptosisConfig`,
+`ApoptosisState`, `ApoptosisMode { Off, Activity, RandomFixed }`).
+Wire-up do `MultiLayerGatedSnn`: dead-mask zerues spike v forward,
+zerues `d_h_spike_t` v backward → všechny gradients (b_h, w_in row,
+w_rec row, w_gate_*, α) na dead neurony jsou 0. Skipped v `RateReg`
+(jinak by se mrtvé neurony probudily). `aurora_train` má 5 nových
+flagů (`--apoptosis off|activity|random` + tuning). Per-chunk EMA
+observation přes nový `forward_backward_batch_tokens_stateful_with_rates`.
+
+**Test:** `tests/apoptosis_smoke.rs` — 3 testy, ověřuje masking semantics
+(dead spike = 0 forward, dead grad = 0 backward, end-to-end Adam stays
+finite). 4 unit testy v `src/apoptosis.rs` na EMA + kill logic.
+
+**Experiment (3-way, 1 seed):** tiny_200k.txt, 1024 BPE, h=128 × 2L,
+3 epochs, CPU, identický seed (`0xC0FFEE`).
+
+| run | val BPB | epoch elapsed | final rates | dead per layer |
+|---|---|---|---|---|
+| baseline | **3.2604** | 8.2 s | 0.31 / 0.41 | 0 / 0 |
+| activity | 3.2622 | 7.9 s | 0.37 / 0.43 | 74 / 66 |
+| random (74,66) | **3.2554** | 5.7 s | 0.17 / 0.27 | 74 / 66 |
+
+**Klíčová pozorování:**
+
+- **Activity neuškodila ani nepomohla.** Δ +0.0018 BPB vs baseline =
+  šum. Surviving neurons fire MÍRNĚ víc (compensace za 57 % loss).
+- **Random pruning překvapivě vyhrál (Δ −0.0050).** Single-shot kill na
+  chunk 30 forced specialization → surviving neurons fire **half** as
+  often (0.17/0.27 vs baseline 0.31/0.41). Sparser net = lepší
+  regularizace na tomto malém korpusu.
+- **Rate-at-death potvrzuje selektivitu activity:** median 0.00075
+  (0.08 % firing rate), max 0.00489 — killed neurons byly už *de
+  facto* mrtvé. Activity tedy nezničila užitečné neurony, ale taky
+  nedosáhla žádné výhody nad random.
+- **Wall time:** random 30 % rychlejší než baseline (sparser path =
+  méně active-indices iterací).
+
+**Interpretace:** *Pruning is good regardless of selection rule, but
+**timing matters more than selectivity** at this scale.* Random kill
+brzy v tréninku = strong implicit regularization. Activity kill
+postupně, po EMA convergence = jen čistí už zhasnuté neurony.
+
+**Negative result, 4. v řadě** (po SDSA, AdLIF, deeper stack). Aurora
+quality plateau na tiny_200k h=128 sedí cca na BPB 3.25 ± 0.01 bez
+ohledu na který biologicky-inspirovaný mechanismus přidáme. Bottleneck
+je pravděpodobně:
+
+1. **Korpus moc malý** — 200K bytes, 65K tokens. Net dosáhne BPB plateau
+   po 1 epoch a pak nemá co se učit. Single-seed BPB delty 0.005 jsou
+   v noise floor.
+2. **Net je over-parameterized** — h=128 × 2L = 256 hidden neurons
+   pro 1024-token vocab; pruning 55 % bez quality loss to potvrzuje.
+
+**Kde toto NEzavírá experiment:** activity vs random na **enwik8_10m
+× h=512 × 8 epoch** by se rozlišil. Tiny corpus je good for
+implementation validation, špatný pro hypothesis testing. Decision pro
+další sprint: nezvyšovat scope apoptosis bez větší evidence base.
+
+**Soubory:** `src/apoptosis.rs` (208 ř.), `src/snn_gated_multi.rs` masking
+(+~30 ř.), `examples/aurora_train.rs` CLI + JSONL events (+~110 ř.),
+`tests/apoptosis_smoke.rs` (3 testy, 116 ř.). Logy v `logs/sprint42/*.jsonl`.
+
+---
+
+## Sprint 43 — Early activity + Trophic signal ✓ DONE (první pozitivní výsledek)
+
+**Pokračování Sprintu 42.** Dvě hypotézy:
+
+**H1 (early-activity):** Activity-dependent pruning ve **vývojovém okně**
+(warmup ≪ Sprint 42's 30 chunků) replikuje biologickou embryonální
+apoptosis lépe než post-convergence pruning. Test na **tiny_600k** (3×
+větší korpus než Sprint 42, kde už je signal-to-noise nezanedbatelný).
+
+**H2 (trophic):** Lepší selektor než firing rate je
+`|∂L/∂W_outgoing[*, i]|_1` — gradient magnitude na výstupních vahách
+neuronu. Mapuje "downstream cares about my output" — bližší
+analog NGF-driven trofického přežívání než pouhá aktivita.
+
+**Implementace:**
+
+1. `ApoptosisMode::Trophic { frac, max_per_check }` v `src/apoptosis.rs`.
+   Threshold = `frac × layer_median(EMA)` (median, ne mean — gradient
+   distribuce má heavy tail). Cap kills/check pro avoid snowball.
+2. `MultiLayerGatedSnn::trophic_signal_from_grads()` —
+   `Σ |grads.W_out[*, i]|` (top) nebo `Σ |grads.W_in_{l+1}[*, i]|`
+   (hidden). Volá se po backward, před `clip_grads`.
+3. `aurora_train` CLI: `--apoptosis trophic`,
+   `--apoptosis-trophic-frac`, `--apoptosis-trophic-max`.
+
+**Experimenty (1 seed, tiny_600k, h=128 × 2L, 3 epoch):**
+
+| run | val BPB | Δ vs baseline | dead/layer |
+|---|---|---|---|
+| baseline | **2.776** | – | 0 / 0 |
+| early-activity (warmup=5, ema=0.3) | 3.279 | +0.50 ⚠️ | 89 / 89 |
+| random-early (matched 89,89) | 3.201 | +0.42 ⚠️ | 89 / 89 |
+| trophic-v2 (frac=0.05, max=2/check) | 2.913 | +0.14 | 50 / 51 |
+| **trophic-mini (frac=0.01, max=1/check, check=50)** | **2.758** | **−0.018** ✓ | 10 / 12 |
+| random-mini (matched 10,12) | 2.796 | +0.020 | 10 / 12 |
+
+**Klíčová zjištění:**
+
+1. **H1 vyvrácena s opačným znamením.** Early-activity je **horší**
+   než late-activity (Sprint 42) i horší než random-early. Důvod: rates
+   v rané fázi jsou *šum* z init noise, ne signál. Activity selektor v
+   této fázi systematicky zabíjí neurony s neforensním init bias →
+   plus snowball effect (87 % všech kills v prvních 50 chunkách).
+
+2. **H2 platí, ale s úzkým operačním oknem.** Trophic při konzervativním
+   pruningu (10 + 12 = 22 kills, 8.6 % capacity) **poprvé porazil
+   random kontrolu** (Δ = 0.038 BPB ve prospěch trophic). Při
+   agresivním pruningu (50+ kills) všechna selectivity kolabuje —
+   capacity je pod tlakem a selectivita nemá co chytit.
+
+3. **Median > mean pro threshold.** Gradient magnitude má power-law
+   distribuci, mean je dominován top-K neurony. Median dává stable
+   per-layer scale.
+
+4. **Snowball je real.** S `frac=0.05, max=2/check` zabilo 50+
+   neuronů — cap se hitnul každý check, threshold měl vždy někoho
+   pod sebou (median-relative threshold *garantuje* attrition).
+
+**Důsledky:**
+
+- **První pozitivní pro biologickou hypotézu** v této řadě (po SDSA,
+  AdLIF, deep stack, late-activity, early-activity, plain trophic — 6
+  null/negative výsledků za sebou).
+- Magnitude `−0.018` je **single-seed** — věrohodnost ~1σ, nedostatek
+  pro publikaci. Vyžaduje multi-seed validation.
+- Současný `max_per_check` je manuálně tuned. Sprint 44 přidá
+  **adaptive cap**: kill rate škáluje s `alive_count`, halt na
+  `max_dead_frac` saturaci.
+
+**Soubory:** `src/apoptosis.rs` (+`Trophic` mode + median threshold),
+`src/snn_gated_multi.rs` (+`trophic_signal_from_grads`),
+`examples/aurora_train.rs` (+3 CLI flags). Logy v `logs/sprint43/*.jsonl`.
+
+---
+
 ## Sprint 33+ — možné větve (rozhodneme po měření 32)
 
 | Větev | Co odemyká | Effort | Zdroj |

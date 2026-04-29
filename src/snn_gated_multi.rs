@@ -361,6 +361,33 @@ impl MultiLayerCache {
             .collect()
     }
 
+    /// Sprint 42: per-layer per-neuron mean firing rate over the
+    /// cached forward pass. Used by the apoptosis EMA. Returns one
+    /// `Vec<f32>` of length `n_h` per layer.
+    #[must_use]
+    pub fn per_neuron_rates(&self) -> Vec<Vec<f32>> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                if layer.h_spike.is_empty() {
+                    return Vec::new();
+                }
+                let n_h = layer.h_spike[0].len();
+                let mut rate = vec![0.0_f32; n_h];
+                for row in &layer.h_spike {
+                    for i in 0..n_h {
+                        rate[i] += row[i];
+                    }
+                }
+                let inv_t = 1.0 / layer.h_spike.len() as f32;
+                for r in &mut rate {
+                    *r *= inv_t;
+                }
+                rate
+            })
+            .collect()
+    }
+
     /// Sprint 31: per-layer (mean, max) of `h_v_pre`. Compared to
     /// threshold θ, this tells you whether the membrane potential is
     /// even reaching firing range — a dead layer fires 0 not because
@@ -472,6 +499,11 @@ pub struct MultiLayerGatedSnn {
     /// for now (no Adam coupling) — make learnable in Sprint 41 if
     /// the A/B test on small CPU run shows quality improvement.
     pub adlif_enabled: bool,
+    /// Sprint 42: per-neuron activity-dependent pruning. When `Some`,
+    /// neurons with `dead_mask[l][i] == true` produce zero spike in
+    /// forward and receive zero gradient in backward — biological
+    /// "trophic withdrawal" applied to the SNN.
+    pub apoptosis: Option<crate::apoptosis::ApoptosisState>,
     grads: MultiLayerGatedGrads,
     adam_t: usize,
     layer_adam: Vec<LayerAdam>,
@@ -522,6 +554,7 @@ impl MultiLayerGatedSnn {
             sdsa: None,
             sdsa_adam: None,
             adlif_enabled: false,
+            apoptosis: None,
             adam_t: 0,
             layer_adam,
             adam_w_out: AdamGroup::zeros(n_output * top_hidden),
@@ -545,6 +578,63 @@ impl MultiLayerGatedSnn {
     /// chunks via `GatedState::adlif_w`. No Adam state — params are
     /// constants this sprint; Sprint 41 makes them learnable if the
     /// CPU A/B shows quality improvement.
+    /// Sprint 43: per-neuron trophic signal — `|∂L/∂W_outgoing[*, i]|_1`
+    /// — measured on the network's current `grads` buffer. Call **after**
+    /// backward but **before** `clip_grads` / `step_adam` so the raw
+    /// magnitudes are preserved.
+    ///
+    /// For neuron `i` in layer `l`:
+    /// - hidden (l < top): sum of `|grads.layers[l+1].w_in[*, i]|`
+    ///   (column i of the next layer's `W_in`)
+    /// - top: sum of `|grads.w_out[*, i]|` (column i of `W_out`)
+    ///
+    /// This is the closest computational analogue to a target-derived
+    /// trophic factor: it measures how strongly the loss "wants" to
+    /// modify the connections that consume neuron `i`'s output. Useless
+    /// neurons receive zero gradient; load-bearing ones receive a lot.
+    #[must_use]
+    pub fn trophic_signal_from_grads(&self) -> Vec<Vec<f32>> {
+        let n_layers = self.layers.len();
+        let mut out: Vec<Vec<f32>> = self
+            .layers
+            .iter()
+            .map(|l| vec![0.0_f32; l.n_hidden])
+            .collect();
+        for l in 0..n_layers {
+            let n_h = self.layers[l].n_hidden;
+            if l + 1 < n_layers {
+                let n_h_next = self.layers[l + 1].n_hidden;
+                let g = &self.grads.layers[l + 1].w_in;
+                for h in 0..n_h_next {
+                    let row = h * n_h;
+                    for i in 0..n_h {
+                        out[l][i] += g[row + i].abs();
+                    }
+                }
+            } else {
+                let n_out = self.n_output;
+                let g = &self.grads.w_out;
+                for o in 0..n_out {
+                    let row = o * n_h;
+                    for i in 0..n_h {
+                        out[l][i] += g[row + i].abs();
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Sprint 42: turn on activity-dependent neuron pruning. The
+    /// network starts with all neurons alive; the apoptosis state's
+    /// EMA must be observed by the trainer (see `observe_rates`) and
+    /// `maybe_kill` called per chunk for the mechanism to actually
+    /// prune anything.
+    pub fn enable_apoptosis(&mut self, config: crate::apoptosis::ApoptosisConfig) {
+        let layer_sizes: Vec<usize> = self.layers.iter().map(|l| l.n_hidden).collect();
+        self.apoptosis = Some(crate::apoptosis::ApoptosisState::new(config, &layer_sizes));
+    }
+
     pub fn enable_adlif(&mut self) {
         self.adlif_enabled = true;
     }
@@ -769,11 +859,23 @@ impl MultiLayerGatedSnn {
                 // Fused spike / h_v_after / active-set scan: three
                 // O(n_h) passes (`map → collect`, `zip-map → collect`,
                 // `active_indices`) compressed into one tight loop.
+                // Sprint 42: dead neurons (apoptosis) have spike forced
+                // to 0 — their membrane still integrates but no output
+                // reaches downstream layers, output projection, or rec.
+                let dead_l: Option<&[bool]> = self
+                    .apoptosis
+                    .as_ref()
+                    .map(|a| a.dead_mask[l].as_slice());
                 let mut h_spike_t: Vec<f32> = Vec::with_capacity(n_h);
                 let mut h_v_after_t: Vec<f32> = Vec::with_capacity(n_h);
                 let mut active_t: Vec<usize> = Vec::new();
                 for (hi, &v) in h_v_pre_t.iter().enumerate() {
-                    let s = self.spike_fn.forward(v);
+                    let mut s = self.spike_fn.forward(v);
+                    if let Some(d) = dead_l {
+                        if d[hi] {
+                            s = 0.0;
+                        }
+                    }
                     h_spike_t.push(s);
                     h_v_after_t.push(v - theta * s);
                     if s != 0.0 {
@@ -988,6 +1090,19 @@ impl MultiLayerGatedSnn {
                     }
                 }
 
+                // Sprint 42: zero spike-derivative for dead neurons —
+                // kills the surrogate path AND the d_alpha contribution.
+                // Combined with the forward spike mask, every weight
+                // touching a dead neuron is frozen (proof: see commit
+                // sprint 42 doc).
+                if let Some(apop) = self.apoptosis.as_ref() {
+                    for i in 0..n_h {
+                        if apop.dead_mask[l][i] {
+                            d_h_spike_t[i] = 0.0;
+                        }
+                    }
+                }
+
                 // d_h_v_pre[l, t] = d_h_spike[l, t] * surrogate'(h_v_pre)
                 //                 + d_h_v_after_carry[l] (from t+1).
                 // Sprint 30 LSG: surrogate uses per-layer learnable α
@@ -1135,7 +1250,14 @@ impl MultiLayerGatedSnn {
                         rate[i] += row[i];
                     }
                 }
+                let dead_l: Option<&[bool]> =
+                    self.apoptosis.as_ref().map(|a| a.dead_mask[l].as_slice());
                 for i in 0..n_h {
+                    if let Some(d) = dead_l {
+                        if d[i] {
+                            continue;
+                        }
+                    }
                     let correction = 2.0 * lambda * (rate[i] * inv_t - target);
                     grads.layers[l].b_h[i] += correction;
                 }
@@ -1299,10 +1421,18 @@ impl MultiLayerGatedSnn {
                     + layer.b_h[hi])
                     .clamp(-MEMBRANE_CLAMP, MEMBRANE_CLAMP);
             }
-            let h_spike: Vec<f32> = h_v_pre
+            let mut h_spike: Vec<f32> = h_v_pre
                 .iter()
                 .map(|&v| self.spike_fn.forward(v))
                 .collect();
+            if let Some(apop) = self.apoptosis.as_ref() {
+                let dead = &apop.dead_mask[l];
+                for (s, d) in h_spike.iter_mut().zip(dead.iter()) {
+                    if *d {
+                        *s = 0.0;
+                    }
+                }
+            }
             let h_v_after: Vec<f32> = h_v_pre
                 .iter()
                 .zip(h_spike.iter())
@@ -1384,6 +1514,70 @@ impl MultiLayerGatedSnn {
             self.grads.add(grads);
         }
         total_loss
+    }
+
+    /// Sprint 42: same as `forward_backward_batch_tokens_stateful`
+    /// but additionally returns per-layer per-neuron mean firing rate
+    /// across the chunk + batch. Used by the apoptosis EMA observer.
+    /// Cost over the plain variant is one extra O(B·T·N) reduction
+    /// per layer per chunk — negligible at our hidden widths.
+    ///
+    /// # Panics
+    /// Panics on length mismatch between `batch_inputs`,
+    /// `batch_targets`, and `states`.
+    pub fn forward_backward_batch_tokens_stateful_with_rates(
+        &mut self,
+        batch_inputs: &[&[u32]],
+        batch_targets: &[&[u32]],
+        states: &mut [Vec<GatedState>],
+    ) -> (f32, Vec<Vec<f32>>) {
+        assert_eq!(batch_inputs.len(), batch_targets.len());
+        assert_eq!(batch_inputs.len(), states.len());
+        let n_layers = self.layers.len();
+        let layer_sizes: Vec<usize> =
+            self.layers.iter().map(|l| l.n_hidden).collect();
+        if batch_inputs.is_empty() {
+            let zeros: Vec<Vec<f32>> =
+                layer_sizes.iter().map(|&n| vec![0.0; n]).collect();
+            return (0.0, zeros);
+        }
+        let weights = &*self;
+        let results: Vec<(f32, MultiLayerGatedGrads, Vec<Vec<f32>>)> = batch_inputs
+            .par_iter()
+            .zip(batch_targets.par_iter())
+            .zip(states.par_iter_mut())
+            .map(|((inputs, targets), state)| {
+                let mut grads = weights.alloc_grads();
+                let cache = weights.forward_lm_tokens_stateful(inputs, state);
+                let loss =
+                    weights.backward_lm_tokens_into(&cache, inputs, targets, &mut grads);
+                let rates = cache.per_neuron_rates();
+                (loss, grads, rates)
+            })
+            .collect();
+        self.zero_grad();
+        let mut total_loss = 0.0_f32;
+        let mut rate_sum: Vec<Vec<f32>> =
+            layer_sizes.iter().map(|&n| vec![0.0; n]).collect();
+        for (loss, grads, rates) in &results {
+            total_loss += loss;
+            self.grads.add(grads);
+            for l in 0..n_layers {
+                if rates[l].is_empty() {
+                    continue;
+                }
+                for i in 0..layer_sizes[l] {
+                    rate_sum[l][i] += rates[l][i];
+                }
+            }
+        }
+        let inv_b = 1.0 / results.len() as f32;
+        for row in &mut rate_sum {
+            for v in row {
+                *v *= inv_b;
+            }
+        }
+        (total_loss, rate_sum)
     }
 
     /// Sprint 26: token-level rayon-parallel batch trainer. Each

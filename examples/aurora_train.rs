@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use aurora::apoptosis::{ApoptosisConfig, ApoptosisMode};
 use aurora::bpe::BpeTokenizer;
 use aurora::checkpoint::{self, Checkpoint};
 use aurora::gpu::snn_gated_gpu_multi::MultiLayerGatedSnnGpu;
@@ -75,6 +76,20 @@ struct Cli {
     /// Sprint 41: stack depth. Default 2 (matches GPU megakernel
     /// constraint). CPU supports any value.
     n_layers: usize,
+    /// Sprint 42: apoptosis mode. `off` (default), `activity`
+    /// (kill neurons with EMA firing rate < threshold), or `random`
+    /// (one-shot kill of fixed counts per layer — control for the
+    /// activity arm of the experiment).
+    apoptosis_mode: String,
+    apop_warmup: usize,
+    apop_ema: f32,
+    apop_threshold: f32,
+    apop_check: usize,
+    /// Comma-separated per-layer kill counts for `--apoptosis random`.
+    apop_counts: Option<String>,
+    /// Sprint 43 trophic mode: kill if EMA < frac × layer_mean.
+    apop_trophic_frac: f32,
+    apop_trophic_max: usize,
 }
 
 impl Cli {
@@ -92,6 +107,14 @@ impl Cli {
         let mut sdsa: bool = false;
         let mut adlif: bool = false;
         let mut n_layers: usize = 2;
+        let mut apoptosis_mode: String = "off".to_string();
+        let mut apop_warmup: usize = 200;
+        let mut apop_ema: f32 = 0.05;
+        let mut apop_threshold: f32 = 0.005;
+        let mut apop_check: usize = 100;
+        let mut apop_counts: Option<String> = None;
+        let mut apop_trophic_frac: f32 = 0.1;
+        let mut apop_trophic_max: usize = 5;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -155,6 +178,38 @@ impl Cli {
                         next()?.parse().map_err(|e| format!("--n-layers: {e}"))?;
                     i += 2;
                 }
+                "--apoptosis" => {
+                    apoptosis_mode = next()?.clone();
+                    i += 2;
+                }
+                "--apoptosis-warmup" => {
+                    apop_warmup = next()?.parse().map_err(|e| format!("--apoptosis-warmup: {e}"))?;
+                    i += 2;
+                }
+                "--apoptosis-ema" => {
+                    apop_ema = next()?.parse().map_err(|e| format!("--apoptosis-ema: {e}"))?;
+                    i += 2;
+                }
+                "--apoptosis-threshold" => {
+                    apop_threshold = next()?.parse().map_err(|e| format!("--apoptosis-threshold: {e}"))?;
+                    i += 2;
+                }
+                "--apoptosis-check" => {
+                    apop_check = next()?.parse().map_err(|e| format!("--apoptosis-check: {e}"))?;
+                    i += 2;
+                }
+                "--apoptosis-counts" => {
+                    apop_counts = Some(next()?.clone());
+                    i += 2;
+                }
+                "--apoptosis-trophic-frac" => {
+                    apop_trophic_frac = next()?.parse().map_err(|e| format!("--apoptosis-trophic-frac: {e}"))?;
+                    i += 2;
+                }
+                "--apoptosis-trophic-max" => {
+                    apop_trophic_max = next()?.parse().map_err(|e| format!("--apoptosis-trophic-max: {e}"))?;
+                    i += 2;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
@@ -190,6 +245,21 @@ impl Cli {
             return Err("--n-layers must be ≥ 1".into());
         }
 
+        match apoptosis_mode.as_str() {
+            "off" | "activity" | "random" | "trophic" => {}
+            other => {
+                return Err(format!(
+                    "--apoptosis must be off|activity|trophic|random, got '{other}'"
+                ))
+            }
+        }
+        if apoptosis_mode != "off" && !cpu {
+            return Err("--apoptosis requires --cpu (Sprint 42 scope)".into());
+        }
+        if apoptosis_mode == "random" && apop_counts.is_none() {
+            return Err("--apoptosis random requires --apoptosis-counts X,Y,…".into());
+        }
+
         Ok(Self {
             corpus,
             vocab,
@@ -204,6 +274,14 @@ impl Cli {
             sdsa,
             adlif,
             n_layers,
+            apoptosis_mode,
+            apop_warmup,
+            apop_ema,
+            apop_threshold,
+            apop_check,
+            apop_counts,
+            apop_trophic_frac,
+            apop_trophic_max,
         })
     }
 }
@@ -266,6 +344,16 @@ fn main() -> ExitCode {
     }
     if cli.adlif {
         net_init.enable_adlif();
+    }
+    let apop_config_opt = match build_apoptosis_config(&cli, cli.n_layers) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("apoptosis config error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(cfg) = apop_config_opt.clone() {
+        net_init.enable_apoptosis(cfg);
     }
 
     enum Backend {
@@ -397,13 +485,65 @@ fn main() -> ExitCode {
                 }
                 Backend::Cpu(net, _) => {
                     net.zero_grad();
-                    let l = net.forward_backward_batch_tokens_stateful(
-                        &inputs_owned,
-                        &targets_owned,
-                        &mut cpu_states,
-                    );
+                    let (l, rates_opt) = if net.apoptosis.is_some() {
+                        let (loss, rates) = net
+                            .forward_backward_batch_tokens_stateful_with_rates(
+                                &inputs_owned,
+                                &targets_owned,
+                                &mut cpu_states,
+                            );
+                        (loss, Some(rates))
+                    } else {
+                        let loss = net.forward_backward_batch_tokens_stateful(
+                            &inputs_owned,
+                            &targets_owned,
+                            &mut cpu_states,
+                        );
+                        (loss, None)
+                    };
+                    // Sprint 43: trophic signal must be read from raw
+                    // grads before clip_grads scales them.
+                    let trophic_opt = match net
+                        .apoptosis
+                        .as_ref()
+                        .map(|a| a.config.mode.clone())
+                    {
+                        Some(aurora::apoptosis::ApoptosisMode::Trophic { .. }) => {
+                            Some(net.trophic_signal_from_grads())
+                        }
+                        _ => None,
+                    };
                     net.clip_grads(GRAD_CLIP);
                     net.step_adam(&adam);
+                    if let Some(apop) = net.apoptosis.as_mut() {
+                        let signal = trophic_opt
+                            .or(rates_opt)
+                            .expect("apoptosis on requires either rates or trophic");
+                        apop.observe_rates(&signal);
+                        apop.tick();
+                        let kills = apop.maybe_kill(&mut rng);
+                        if !kills.is_empty() {
+                            if let Some(m) = metrics.as_mut() {
+                                for k in &kills {
+                                    m.apoptosis_kill(epoch, k);
+                                }
+                            }
+                        }
+                        if !kills.is_empty()
+                            || apop.chunks_seen.is_multiple_of(apop.config.check_interval)
+                        {
+                            let dead: Vec<usize> = (0..apop.dead_mask.len())
+                                .map(|li| apop.dead_count(li))
+                                .collect();
+                            if let Some(m) = metrics.as_mut() {
+                                m.apoptosis_state(
+                                    epoch,
+                                    apop.chunks_seen,
+                                    &dead,
+                                );
+                            }
+                        }
+                    }
                     l
                 }
             };
@@ -518,6 +658,45 @@ fn load_or_train_bpe(
         }
         Ok(tok)
     }
+}
+
+fn build_apoptosis_config(cli: &Cli, n_layers: usize) -> Result<Option<ApoptosisConfig>, String> {
+    let mode = match cli.apoptosis_mode.as_str() {
+        "off" => return Ok(None),
+        "activity" => ApoptosisMode::Activity,
+        "trophic" => ApoptosisMode::Trophic {
+            frac: cli.apop_trophic_frac,
+            max_per_check: cli.apop_trophic_max,
+        },
+        "random" => {
+            let s = cli
+                .apop_counts
+                .as_deref()
+                .ok_or("--apoptosis random needs --apoptosis-counts")?;
+            let counts: Vec<usize> = s
+                .split(',')
+                .map(|p| p.trim().parse::<usize>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("--apoptosis-counts parse: {e}"))?;
+            if counts.len() != n_layers {
+                return Err(format!(
+                    "--apoptosis-counts has {} entries but --n-layers={n_layers}",
+                    counts.len()
+                ));
+            }
+            ApoptosisMode::RandomFixed {
+                per_layer_counts: counts,
+            }
+        }
+        other => return Err(format!("unknown mode '{other}'")),
+    };
+    Ok(Some(ApoptosisConfig {
+        mode,
+        warmup_chunks: cli.apop_warmup,
+        ema_alpha: cli.apop_ema,
+        kill_threshold: cli.apop_threshold,
+        check_interval: cli.apop_check,
+    }))
 }
 
 fn load_or_init_net(
@@ -913,6 +1092,35 @@ impl MetricsWriter {
             v_means = format_array(v_means),
             v_peaks = format_array(v_peaks),
             elapsed = elapsed_s,
+        );
+        let _ = self.out.flush();
+    }
+
+    fn apoptosis_kill(&mut self, epoch: u32, ev: &aurora::apoptosis::KillEvent) {
+        let _ = writeln!(
+            self.out,
+            r#"{{"event":"apoptosis_kill","epoch":{epoch},"chunk":{chunk},"layer":{layer},"neuron":{neuron},"rate":{rate}}}"#,
+            chunk = ev.chunk,
+            layer = ev.layer,
+            neuron = ev.neuron,
+            rate = format_finite(ev.rate_at_death),
+        );
+        let _ = self.out.flush();
+    }
+
+    fn apoptosis_state(&mut self, epoch: u32, chunk: usize, dead_per_layer: &[usize]) {
+        let mut s = String::from("[");
+        for (i, d) in dead_per_layer.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&d.to_string());
+        }
+        s.push(']');
+        let _ = writeln!(
+            self.out,
+            r#"{{"event":"apoptosis_state","epoch":{epoch},"chunk":{chunk},"dead":{dead}}}"#,
+            dead = s,
         );
         let _ = self.out.flush();
     }
