@@ -50,9 +50,6 @@ const DEFAULT_ALPHA: f32 = 4.0;
 /// subtract-on-spike, state polarizes: a few neurons saturate at v=10
 /// (clamp), most atrophy to v ≪ 0. Short memory limits the drift.
 const DEFAULT_A_INIT: f32 = 0.5;
-/// Equilibrium membrane = `b / (1 - a)`. With `a = 0.5`, `b = 0.5`
-/// puts equilibrium at θ = 1.0 — Aurora's gated default ported.
-const DEFAULT_B_INIT: f32 = 0.5;
 
 /// One SSM layer's parameters.
 #[derive(Clone, Debug)]
@@ -70,17 +67,25 @@ pub struct SsmLayer {
 
 impl SsmLayer {
     pub fn new<R: Rng>(n_in: usize, n_hidden: usize, rng: &mut R) -> Self {
-        // He-style for `W_in`. No `W_rec`, no gate weights.
+        Self::new_with_a(n_in, n_hidden, DEFAULT_A_INIT, rng)
+    }
+
+    /// Sprint 47: configurable `a` init for the diagonal decay.
+    /// Equilibrium membrane reaches `b / (1 - a)`; we set
+    /// `b = (1 - a) · θ` so `v_eq = θ` regardless of `a`. Effective
+    /// memory ≈ `1 / (1 - a)` timesteps.
+    pub fn new_with_a<R: Rng>(n_in: usize, n_hidden: usize, a_init: f32, rng: &mut R) -> Self {
         let scale_in = (2.0 / n_in as f32).sqrt();
         let w_in = (0..n_hidden * n_in)
             .map(|_| (rng.random::<f32>() - 0.5) * 2.0 * scale_in)
             .collect();
+        let b_init = (1.0 - a_init).max(1e-3);
         Self {
             n_in,
             n_hidden,
-            a: vec![DEFAULT_A_INIT; n_hidden],
+            a: vec![a_init; n_hidden],
             w_in,
-            b: vec![DEFAULT_B_INIT; n_hidden],
+            b: vec![b_init; n_hidden],
             alpha: DEFAULT_ALPHA,
         }
     }
@@ -328,11 +333,22 @@ impl MultiLayerSsmSnn {
         spike_fn: SpikeFn,
         rng: &mut R,
     ) -> Self {
+        Self::new_with_a(n_input, hidden_dims, n_output, spike_fn, DEFAULT_A_INIT, rng)
+    }
+
+    pub fn new_with_a<R: Rng>(
+        n_input: usize,
+        hidden_dims: &[usize],
+        n_output: usize,
+        spike_fn: SpikeFn,
+        a_init: f32,
+        rng: &mut R,
+    ) -> Self {
         assert!(!hidden_dims.is_empty(), "at least one layer required");
         let mut layers = Vec::with_capacity(hidden_dims.len());
         let mut prev_dim = n_input;
         for &h in hidden_dims {
-            layers.push(SsmLayer::new(prev_dim, h, rng));
+            layers.push(SsmLayer::new_with_a(prev_dim, h, a_init, rng));
             prev_dim = h;
         }
         let top_hidden = prev_dim;
@@ -443,6 +459,18 @@ impl MultiLayerSsmSnn {
     }
 
     /// Stateful sparse LM forward over arbitrary token IDs (u32).
+    /// Sprint 47: scan-based formulation. Within each layer, we
+    /// pre-compute the input-driven term `u[t][i] = b[i] + Σ_{c}
+    /// W_in[i,c]·x[t]` for the entire chunk, then run a per-neuron
+    /// parallel scan on the diagonal recurrence to obtain all
+    /// timesteps' states in one pass. Layers stay sequential (layer
+    /// l's input is layer l-1's spike output), but within a layer the
+    /// time dimension is now scan-able — directly maps to a parallel
+    /// scan kernel on GPU when the port arrives.
+    ///
+    /// Membrane clamp is DROPPED in this formulation — the scan needs
+    /// pure linear recurrence. With `a < 1` and grad-clipped weights,
+    /// state stays bounded naturally.
     pub fn forward_lm_tokens_stateful(
         &self,
         input_tokens: &[u32],
@@ -460,57 +488,92 @@ impl MultiLayerSsmSnn {
         }
         let top_hidden = self.layers.last().unwrap().n_hidden;
 
-        for &tok in input_tokens {
-            let b = tok as usize;
-            debug_assert!(b < self.n_input);
-            // Active inputs into layer l. For layer 0: [byte/token].
-            // For layer l > 0: layer l-1's spike actives at this t.
-            let mut layer_input_active: Vec<usize> = vec![b];
+        // Per-layer per-t input active set. Layer 0: each timestep's
+        // single token. Layer l > 0: previous layer's spike actives.
+        let mut layer_input_active_per_t: Vec<Vec<usize>> = (0..t_steps)
+            .map(|t| vec![input_tokens[t] as usize])
+            .collect();
 
-            for l in 0..n_layers {
-                let layer = &self.layers[l];
-                let n_h = layer.n_hidden;
-                let n_in = layer.n_in;
+        for l in 0..n_layers {
+            let layer = &self.layers[l];
+            let n_h = layer.n_hidden;
+            let n_in = layer.n_in;
 
-                // s[t] = a ⊙ s[t-1] + W_in · x[t] + b
-                let mut s_new = vec![0.0_f32; n_h];
-                for hi in 0..n_h {
-                    let row_in = hi * n_in;
-                    let mut acc = layer.a[hi] * states[l].state[hi] + layer.b[hi];
-                    for &c in &layer_input_active {
-                        acc += layer.w_in[row_in + c];
+            // Step 1: precompute `u[t][i]` for the whole chunk.
+            // Sparse: only sum over active inputs at each t.
+            let mut u_per_t: Vec<Vec<f32>> = (0..t_steps)
+                .map(|_| layer.b.clone())
+                .collect();
+            for t in 0..t_steps {
+                let actives = &layer_input_active_per_t[t];
+                for i in 0..n_h {
+                    let row_in = i * n_in;
+                    let row = &layer.w_in[row_in..row_in + n_in];
+                    let mut delta = 0.0_f32;
+                    for &c in actives {
+                        delta += row[c];
                     }
-                    s_new[hi] = acc.clamp(-MEMBRANE_CLAMP, MEMBRANE_CLAMP);
+                    u_per_t[t][i] += delta;
                 }
-
-                // Spike + active-set scan.
-                let mut spike_t: Vec<f32> = Vec::with_capacity(n_h);
-                let mut active_t: Vec<usize> = Vec::new();
-                for (hi, &v) in s_new.iter().enumerate() {
-                    let s = self.spike_fn.forward(v);
-                    spike_t.push(s);
-                    if s != 0.0 {
-                        active_t.push(hi);
-                    }
-                }
-
-                // Update carry-state for next timestep (no reset on spike).
-                states[l].state.clone_from(&s_new);
-
-                cache.layers[l].state.push(s_new);
-                cache.layers[l].spike.push(spike_t);
-                cache.layers[l].active.push(active_t.clone());
-
-                layer_input_active = active_t;
             }
 
-            // Output projection from top spike (sparse).
-            let top_active = layer_input_active;
+            // Step 2: per-neuron parallel scan over time.
+            // Reuse a single buffer for the per-neuron `u` slice to
+            // keep allocation noise low.
+            let s_init = states[l].state.clone();
+            let mut state_per_t: Vec<Vec<f32>> = (0..t_steps)
+                .map(|_| vec![0.0_f32; n_h])
+                .collect();
+            let mut u_neuron = vec![0.0_f32; t_steps];
+            for i in 0..n_h {
+                for t in 0..t_steps {
+                    u_neuron[t] = u_per_t[t][i];
+                }
+                let s_seq = parallel_scan_diagonal(layer.a[i], &u_neuron, s_init[i]);
+                for t in 0..t_steps {
+                    state_per_t[t][i] = s_seq[t];
+                }
+            }
+
+            // Step 3: spike + active-set scan per timestep.
+            let mut spike_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
+            let mut active_per_t: Vec<Vec<usize>> = Vec::with_capacity(t_steps);
+            for t in 0..t_steps {
+                let mut spike = Vec::with_capacity(n_h);
+                let mut active = Vec::new();
+                for i in 0..n_h {
+                    let s = self.spike_fn.forward(state_per_t[t][i]);
+                    spike.push(s);
+                    if s != 0.0 {
+                        active.push(i);
+                    }
+                }
+                spike_per_t.push(spike);
+                active_per_t.push(active);
+            }
+
+            // Step 4: carry final state into next chunk; cache.
+            states[l]
+                .state
+                .clone_from(state_per_t.last().expect("t_steps ≥ 1"));
+            cache.layers[l].state = state_per_t;
+            cache.layers[l].spike = spike_per_t;
+
+            // Set up input for next layer (clones to satisfy borrow on
+            // active_per_t which we also stash in cache).
+            layer_input_active_per_t = active_per_t.clone();
+            cache.layers[l].active = active_per_t;
+        }
+
+        // Output projection from top spike (sparse, per timestep).
+        let top = n_layers - 1;
+        for t in 0..t_steps {
+            let top_active = &cache.layers[top].active[t];
             let mut logits = Vec::with_capacity(self.n_output);
             for o in 0..self.n_output {
                 let row_offset = o * top_hidden;
                 let mut acc = self.b_o[o];
-                for &c in &top_active {
+                for &c in top_active {
                     acc += self.w_out[row_offset + c];
                 }
                 logits.push(acc);
@@ -528,6 +591,13 @@ impl MultiLayerSsmSnn {
 
     /// Backward over the chunk, accumulating into `grads`. Returns
     /// summed cross-entropy loss.
+    /// Sprint 47: adjoint-scan formulation. Per layer we batch the
+    /// surrogate-gradient evaluation across the entire chunk into a
+    /// single per-neuron pass, then run a parallel adjoint scan on
+    /// each neuron's reverse-time gradient sequence to fold in the
+    /// recurrent contribution `d_state[t] += a · d_state[t+1]`. Layer
+    /// loop stays top→bottom (cross-layer dependency); within a layer
+    /// the time dimension is now scan-able.
     pub fn backward_lm_tokens_into(
         &self,
         cache: &MultiLayerCache,
@@ -538,27 +608,19 @@ impl MultiLayerSsmSnn {
         let t_steps = input_tokens.len();
         debug_assert_eq!(targets.len(), t_steps);
         let n_layers = self.layers.len();
-        let top_hidden = self.layers.last().unwrap().n_hidden;
+        let top = n_layers - 1;
+        let top_hidden = self.layers[top].n_hidden;
         let theta = self.spike_fn.threshold;
 
-        // Per-layer carry: gradient on state at t+1 propagates to t via
-        // d_s_carry[t] = a ⊙ d_s[t+1].
-        let mut d_s_carry: Vec<Vec<f32>> = self
-            .layers
-            .iter()
-            .map(|l| vec![0.0_f32; l.n_hidden])
-            .collect();
-
+        // Step A: top-layer d_spike per timestep (and W_out / b_o grads).
         let mut total_loss = 0.0_f32;
-
-        for t in (0..t_steps).rev() {
+        let mut d_spike_from_above_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
+        for t in 0..t_steps {
             let (loss_t, d_logits) =
                 cross_entropy_with_grad(&cache.logits[t], targets[t] as usize);
             total_loss += loss_t;
 
-            // grad on top-layer spike (and W_out / b_o updates).
-            let top = n_layers - 1;
-            let active_top_t = &cache.layers[top].active[t];
+            let active_top = &cache.layers[top].active[t];
             for o in 0..self.n_output {
                 let d = d_logits[o];
                 if d == 0.0 {
@@ -566,40 +628,62 @@ impl MultiLayerSsmSnn {
                 }
                 grads.b_o[o] += d;
                 let row = o * top_hidden;
-                for &h in active_top_t {
+                for &h in active_top {
                     grads.w_out[row + h] += d;
                 }
             }
-            // d_h_spike from W_out^T · d_logits (dense, length top_hidden).
             let d_top_spike = matvec_transpose(&self.w_out, &d_logits, self.n_output, top_hidden);
+            d_spike_from_above_per_t.push(d_top_spike);
+        }
 
-            // Walk layers top → bottom; d_spike for layer l-1 is built
-            // from layer l's d_input.
-            let mut d_spike_from_above: Vec<f32> = d_top_spike;
+        // Step B: walk layers top → bottom. Within each layer, scan
+        // produces the full d_state sequence in one shot.
+        for l in (0..n_layers).rev() {
+            let layer = &self.layers[l];
+            let n_h = layer.n_hidden;
+            let n_in = layer.n_in;
+            let alpha_l = layer.alpha;
+            let layer_grad = &mut grads.layers[l];
 
-            for l in (0..n_layers).rev() {
-                let layer = &self.layers[l];
-                let n_h = layer.n_hidden;
-                let n_in = layer.n_in;
-                let layer_grad = &mut grads.layers[l];
-
-                // d_state[t] = d_spike[t] · surrogate(state[t] − θ)  +  carry[t+1]
-                // Surrogate: s_grad = 1 / (1 + α|state - θ|)²,
-                //            ∂s_grad/∂α via cubic denom (Sprint 30 LSG).
-                let alpha_l = layer.alpha;
-                let mut d_state_t = vec![0.0_f32; n_h];
+            // B1. Per-step gradient through the surrogate. Also
+            // accumulate `d_alpha` here — the same surrogate evaluation
+            // produces both the path to state and the path to α.
+            let mut d_input_per_t: Vec<Vec<f32>> = (0..t_steps)
+                .map(|_| vec![0.0_f32; n_h])
+                .collect();
+            for t in 0..t_steps {
+                let d_above = &d_spike_from_above_per_t[t];
+                let state_t = &cache.layers[l].state[t];
                 for i in 0..n_h {
-                    let dv = cache.layers[l].state[t][i] - theta;
+                    let dv = state_t[i] - theta;
                     let abs_dv = dv.abs();
                     let denom = 1.0 + alpha_l * abs_dv;
                     let cubic = denom * denom * denom;
                     let s_grad = 1.0 / (denom * denom);
-                    d_state_t[i] = d_spike_from_above[i] * s_grad + d_s_carry[l][i];
-                    // ∂L/∂α += d_spike × ∂surrogate/∂α
-                    layer_grad.d_alpha += d_spike_from_above[i] * (-2.0 * abs_dv / cubic);
+                    d_input_per_t[t][i] = d_above[i] * s_grad;
+                    // ∂L/∂α += d_above · ∂surrogate/∂α
+                    layer_grad.d_alpha += d_above[i] * (-2.0 * abs_dv / cubic);
                 }
+            }
 
-                // Layer's input active set at this t.
+            // B2. Per-neuron adjoint scan: full d_state[*][i].
+            let mut d_state_per_t: Vec<Vec<f32>> = (0..t_steps)
+                .map(|_| vec![0.0_f32; n_h])
+                .collect();
+            let mut d_in_neuron = vec![0.0_f32; t_steps];
+            for i in 0..n_h {
+                for t in 0..t_steps {
+                    d_in_neuron[t] = d_input_per_t[t][i];
+                }
+                let d_state_seq = parallel_scan_diagonal_adjoint(layer.a[i], &d_in_neuron);
+                for t in 0..t_steps {
+                    d_state_per_t[t][i] = d_state_seq[t];
+                }
+            }
+
+            // B3. Accumulate grads to `b`, `W_in`, `a`. Per-t loop
+            // because input-active set varies with `t`.
+            for t in 0..t_steps {
                 let layer_input_one: [usize; 1];
                 let layer_input_active: &[usize] = if l == 0 {
                     layer_input_one = [input_tokens[t] as usize];
@@ -607,17 +691,13 @@ impl MultiLayerSsmSnn {
                 } else {
                     &cache.layers[l - 1].active[t]
                 };
-
-                // grad b: d_state_t[i] adds to b[i]
-                // grad W_in: d_state_t[i] adds to W_in[i, c] for each active input c
-                // grad a: d_state_t[i] · s_prev[i] (where s_prev = state[t-1] or initial_state)
                 let s_prev: &[f32] = if t == 0 {
                     &cache.layers[l].initial_state
                 } else {
                     &cache.layers[l].state[t - 1]
                 };
                 for i in 0..n_h {
-                    let d = d_state_t[i];
+                    let d = d_state_per_t[t][i];
                     if d == 0.0 {
                         continue;
                     }
@@ -628,17 +708,22 @@ impl MultiLayerSsmSnn {
                         layer_grad.w_in[row_in + c] += d;
                     }
                 }
+            }
 
-                // Carry into t-1: d_s_carry[l][i] = a[i] · d_state_t[i]
-                for i in 0..n_h {
-                    d_s_carry[l][i] = layer.a[i] * d_state_t[i];
+            // B4. Cross-layer back-prop to layer l-1 (`d_spike` from
+            // above for the next iteration). For each timestep:
+            // `d_spike_below[t] = W_in_l^T · d_state[t]`.
+            if l > 0 {
+                let mut next_d_spike: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
+                for t in 0..t_steps {
+                    next_d_spike.push(matvec_transpose(
+                        &layer.w_in,
+                        &d_state_per_t[t],
+                        n_h,
+                        n_in,
+                    ));
                 }
-
-                // Cross-layer back-prop: layer l's d_state through W_in
-                // becomes layer l-1's d_spike_from_above.
-                if l > 0 {
-                    d_spike_from_above = matvec_transpose(&layer.w_in, &d_state_t, n_h, n_in);
-                }
+                d_spike_from_above_per_t = next_d_spike;
             }
         }
 
@@ -733,6 +818,89 @@ impl MultiLayerSsmSnn {
         }
         total_loss
     }
+}
+
+/// Sprint 47: Hillis-Steele inclusive prefix scan for the diagonal SSM
+/// recurrence `s[t] = a · s[t-1] + u[t]` with **constant per-neuron**
+/// `a` (the SSM cell does not learn time-varying `a`).
+///
+/// The scan is over the SSM compose operator on (A, U) pairs:
+/// `(A1, U1) ⊕ (A2, U2) = (A1·A2, A2·U1 + U2)`
+/// which is associative — Hillis-Steele applies. After the inclusive
+/// scan, position `t` holds `(a^(t+1), Σ_{k=0}^t a^(t-k) · u[k])` and
+/// the state is recovered as `s[t] = A_acc[t] · s_init + U_acc[t]`.
+///
+/// Cost: `O(T · log₂ T)` work, `O(log₂ T)` depth. Sequential CPU; the
+/// shape is preserved so a future GPU port (parallel rows) is direct.
+///
+/// `a` is a scalar (per-neuron constant). `u` and the returned state
+/// are length-T vectors. `s_init` is the carry-in (state from prior
+/// chunk's last timestep, or zero on a fresh stream).
+#[must_use]
+pub fn parallel_scan_diagonal(a: f32, u: &[f32], s_init: f32) -> Vec<f32> {
+    let t = u.len();
+    if t == 0 {
+        return Vec::new();
+    }
+    // Initialise the (A, U) buffers. Each timestep starts as the
+    // single-step pair `(a, u[t])`.
+    let mut acc_a = vec![a; t];
+    let mut acc_u = u.to_vec();
+    let mut buf_a = vec![0.0_f32; t];
+    let mut buf_u = vec![0.0_f32; t];
+
+    let mut stride = 1usize;
+    while stride < t {
+        // Positions [0, stride) are unchanged at this level.
+        buf_a[..stride].copy_from_slice(&acc_a[..stride]);
+        buf_u[..stride].copy_from_slice(&acc_u[..stride]);
+        for i in stride..t {
+            // Compose left = element at i-stride, right = element at i.
+            // Result: (A_l · A_r, A_r · U_l + U_r).
+            let a_l = acc_a[i - stride];
+            let u_l = acc_u[i - stride];
+            let a_r = acc_a[i];
+            let u_r = acc_u[i];
+            buf_a[i] = a_l * a_r;
+            buf_u[i] = a_r * u_l + u_r;
+        }
+        std::mem::swap(&mut acc_a, &mut buf_a);
+        std::mem::swap(&mut acc_u, &mut buf_u);
+        stride *= 2;
+    }
+
+    let mut s = vec![0.0_f32; t];
+    for i in 0..t {
+        s[i] = acc_a[i] * s_init + acc_u[i];
+    }
+    s
+}
+
+/// Sprint 47: adjoint scan for the SSM backward pass.
+///
+/// Given upstream gradients `d_above[t] = ∂L/∂s[t]` (contributed by
+/// the spike-output path at timestep `t`), the recurrence
+/// `d_total[t] = d_above[t] + a · d_total[t+1]` (with `d_total[T] = 0`)
+/// computes the full gradient on each timestep's state including
+/// recurrent feedback from later timesteps.
+///
+/// This is the same linear recurrence as the forward, just over the
+/// reverse-time sequence. Reuses `parallel_scan_diagonal` after
+/// reversing inputs and reversing the output.
+#[must_use]
+pub fn parallel_scan_diagonal_adjoint(a: f32, d_above: &[f32]) -> Vec<f32> {
+    let t = d_above.len();
+    if t == 0 {
+        return Vec::new();
+    }
+    // Reverse-time view: define τ = T-1-t. The recurrence on d_total
+    // reads, in reverse: d̃[τ=0] = d_above[T-1],
+    // d̃[τ=k] = d_above[T-1-k] + a · d̃[τ=k-1].
+    // That's exactly the forward SSM recurrence with `u_τ` =
+    // d_above[T-1-τ] and zero initial carry.
+    let u_rev: Vec<f32> = d_above.iter().rev().copied().collect();
+    let s_rev = parallel_scan_diagonal(a, &u_rev, 0.0);
+    s_rev.into_iter().rev().collect()
 }
 
 fn matvec_transpose(w: &[f32], v: &[f32], rows: usize, cols: usize) -> Vec<f32> {

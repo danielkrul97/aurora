@@ -99,6 +99,9 @@ struct Cli {
     /// Sprint 46: cell type — `gated` (default, full Aurora pipeline)
     /// or `ssm` (diagonal state-space cell with spike outputs, CPU-only).
     cell: String,
+    /// Sprint 47: SSM diagonal decay init. Effective memory ≈
+    /// `1 / (1 - a)` timesteps. Default 0.5 matches Sprint 46.
+    ssm_a_init: f32,
 }
 
 impl Cli {
@@ -127,6 +130,7 @@ impl Cli {
         let mut apop_trophic_max_dead: f32 = 0.20;
         let mut seed: u64 = 0xC0FFEE;
         let mut cell: String = "gated".to_string();
+        let mut ssm_a_init: f32 = 0.5;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -230,6 +234,13 @@ impl Cli {
                     cell = next()?.clone();
                     i += 2;
                 }
+                "--ssm-a-init" => {
+                    ssm_a_init = next()?.parse().map_err(|e| format!("--ssm-a-init: {e}"))?;
+                    if !(0.0..=0.99).contains(&ssm_a_init) {
+                        return Err(format!("--ssm-a-init must be in [0, 0.99], got {ssm_a_init}"));
+                    }
+                    i += 2;
+                }
                 "--seed" => {
                     let v = next()?;
                     seed = if let Some(rest) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
@@ -330,6 +341,7 @@ impl Cli {
             apop_trophic_max_dead,
             seed,
             cell,
+            ssm_a_init,
         })
     }
 }
@@ -730,11 +742,12 @@ fn run_ssm(
 
     let mut rng = StdRng::seed_from_u64(cli.seed);
     let hidden_dims: Vec<usize> = vec![cli.hidden; cli.n_layers];
-    let mut net = MultiLayerSsmSnn::new(
+    let mut net = MultiLayerSsmSnn::new_with_a(
         actual_vocab,
         &hidden_dims,
         actual_vocab,
         SpikeFn::default(),
+        cli.ssm_a_init,
         &mut rng,
     );
     let backend_name = "CPU SSM (rayon)".to_string();

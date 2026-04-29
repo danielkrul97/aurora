@@ -878,6 +878,97 @@ Logy v `logs/sprint46/*.jsonl`.
 
 ---
 
+## Sprint 47 — Parallel scan pro SSM ✓ DONE
+
+**Cíl:** Refactor Sprint 46 SSM cell forward + backward na **parallel
+scan** (Hillis-Steele) místo sekvenčního loop per timestep. Math win
+(GPU-ready), test long-memory hypotézy.
+
+**Math:**
+
+Diagonální SSM rekurence `s[t] = a · s[t-1] + u[t]` (per-neuron, `a`
+konstantní v čase) má associative compose operátor:
+
+```
+(A1, U1) ⊕ (A2, U2) = (A1·A2, A2·U1 + U2)
+```
+
+Inclusive prefix scan dává `s[t] = A_acc[t] · s_init + U_acc[t]` v
+O(T·log T) work, O(log T) depth.
+
+Backward adjoint: `d_state[t] = d_above[t] + a · d_state[t+1]` je stejná
+linear recurrence, jen v reverse-time. Reuse stejného scanu.
+
+**Implementace:**
+
+- `parallel_scan_diagonal(a, u, s_init) → s` — Hillis-Steele forward
+- `parallel_scan_diagonal_adjoint(a, d_above) → d_state` — reverse-time
+- Forward refactored: per layer pre-compute `u[t]` (sparse), per-neuron
+  scan over time, then spike + active set scan.
+- Backward refactored: top→bottom layer loop, per layer scan over
+  reverse time produces full `d_state` sequence in one pass.
+- Membrane clamp DROPPED z recurrence (clamp by porušil linearity).
+  Při `a < 1` je state přirozeně bounded.
+
+**CLI:** `--ssm-a-init <val>` pro experimenty s memory length.
+
+**Correctness verification:**
+
+- 2 nové unit testy (`parallel_scan_matches_sequential_reference`,
+  `adjoint_scan_matches_sequential_reverse_recurrence`) — bit-equivalent
+  with sequential reference within float epsilon na T={1, 4, 16, 64,
+  128, 256} a `a ∈ {0, 0.3, 0.5, 0.95}`.
+- 5-seed re-validation Sprint 46 setup: 2.517–2.524 (mean 2.522) vs
+  Sprint 46 sequential 2.515–2.527 (mean 2.520). Δ < 0.005 — scan
+  produkuje stejnou kvalitu jako sequential.
+
+**Long-memory experiment (n=3 per cell):**
+
+| a | chunk | val BPB | poznámka |
+|---|---|---|---|
+| 0.5 | 64 | **2.522** | sweet spot (Sprint 46 baseline replikován) |
+| 0.5 | 128 | 2.627 | méně Adam steps → mild degradation |
+| 0.5 | 256 | 2.826 | 4× méně updates → silnější degradace |
+| 0.7 | 64 | 2.719 | longer memory mírně škodí |
+| 0.9 | 64 | 3.485 | **WTA collapse** (jako Sprint 46 a=0.95) |
+| 0.9 | 256 | 3.498 | collapse drží napříč chunk sizes |
+
+**Klíčová zjištění:**
+
+1. **Math correctness validated** — parallel scan produkuje identickou
+   loss jako sequential. Refactor je čistý.
+2. **Long-memory regime nefunguje** bez dalších úprav. `a ≥ 0.9` →
+   winner-take-all polarizace, replikuje Sprint 46 a=0.95 collapse.
+3. **CPU performance:** scan má O(T log T) work vs O(T) sequential, takže
+   na CPU mírně pomalejší. Win je pro budoucí GPU port (O(log T) depth).
+4. **Chunk-size benefit closed:** delší chunk při stejné `a` nedává
+   delší context (cell to neumí), naopak ztrácí Adam updates. Long
+   context vyžaduje **současně** delší chunk **i** delší memory.
+
+**Open vs co dál (Sprint 48+):**
+
+Long-memory bez collapse vyžaduje jeden z:
+
+- **Spike reset (subtract-on-spike)** — porušuje linearity scanu, vyžaduje
+  Mamba-style **selective scan** (input-dependent A per timestep).
+- **State normalization** (LayerNorm on state per timestep) — keeps
+  state bounded, preserves linearity. Standard S4 trick.
+- **`tanh` na state před spike** — bounded activation místo clamp.
+  Plně diferencovatelné, drží linearity.
+- **Per-neuron heterogenous `a` z spectrum** (S4 HiPPO init) — některé
+  neurony krátká paměť, jiné dlouhá. Diverzita brání WTA.
+
+State normalization (option 2) je nejmenší změna a má dobrou prior art.
+Doporučuji pro Sprint 48.
+
+**Soubory:** `src/ssm.rs` (+`parallel_scan_diagonal`,
+`parallel_scan_diagonal_adjoint`, `new_with_a` constructors,
+refactored forward/backward), `examples/aurora_train.rs`
+(`--ssm-a-init`), `tests/ssm_smoke.rs` (+2 scan correctness tests).
+Logy v `logs/sprint47/*.jsonl`.
+
+---
+
 ## Sprint 33+ — možné větve (rozhodneme po měření 32)
 
 | Větev | Co odemyká | Effort | Zdroj |

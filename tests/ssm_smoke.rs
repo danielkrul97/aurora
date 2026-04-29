@@ -7,9 +7,12 @@
 //!    surrogate-mediated forward.
 
 use aurora::optimizer::AdamConfig;
-use aurora::ssm::MultiLayerSsmSnn;
+use aurora::ssm::{
+    parallel_scan_diagonal, parallel_scan_diagonal_adjoint, MultiLayerSsmSnn,
+};
 use aurora::surrogate::SpikeFn;
 use rand::rngs::StdRng;
+use rand::Rng;
 use rand::SeedableRng;
 
 fn build_net(seed: u64, n_in: usize, n_h: usize, n_out: usize) -> MultiLayerSsmSnn {
@@ -63,6 +66,74 @@ fn training_reduces_loss() {
         final_ < initial,
         "loss did not decrease: initial={initial:.3}, final={final_:.3}"
     );
+}
+
+/// Sprint 47: scan helper produces same state sequence as the naive
+/// sequential reference, within float epsilon. The scan composition
+/// is mathematically exact — small float drift expected from
+/// re-association.
+#[test]
+fn parallel_scan_matches_sequential_reference() {
+    let mut rng = StdRng::seed_from_u64(123);
+    for &t_steps in &[1usize, 4, 16, 63, 64, 65, 128, 256] {
+        for &a in &[0.0_f32, 0.3, 0.5, 0.95] {
+            let u: Vec<f32> = (0..t_steps)
+                .map(|_| rng.random::<f32>() * 2.0 - 1.0)
+                .collect();
+            let s_init = rng.random::<f32>() * 2.0 - 1.0;
+
+            let mut s_seq = Vec::with_capacity(t_steps);
+            let mut s = s_init;
+            for &u_t in &u {
+                s = a * s + u_t;
+                s_seq.push(s);
+            }
+
+            let s_scan = parallel_scan_diagonal(a, &u, s_init);
+            assert_eq!(s_scan.len(), t_steps);
+            for t in 0..t_steps {
+                let abs_err = (s_seq[t] - s_scan[t]).abs();
+                let rel_err = abs_err / (s_seq[t].abs() + 1e-6);
+                assert!(
+                    abs_err < 1e-3 || rel_err < 1e-4,
+                    "T={t_steps} a={a} t={t}: seq={:.6}, scan={:.6}, err={abs_err:.6}",
+                    s_seq[t],
+                    s_scan[t]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn adjoint_scan_matches_sequential_reverse_recurrence() {
+    let mut rng = StdRng::seed_from_u64(42);
+    for &t_steps in &[1usize, 8, 64, 200] {
+        for &a in &[0.0_f32, 0.5, 0.9] {
+            let d_above: Vec<f32> = (0..t_steps)
+                .map(|_| rng.random::<f32>() * 2.0 - 1.0)
+                .collect();
+            // Reference: d_total[t] = d_above[t] + a · d_total[t+1].
+            let mut d_total = vec![0.0_f32; t_steps];
+            let mut carry = 0.0_f32;
+            for t in (0..t_steps).rev() {
+                d_total[t] = d_above[t] + a * carry;
+                carry = d_total[t];
+            }
+            let d_scan = parallel_scan_diagonal_adjoint(a, &d_above);
+            assert_eq!(d_scan.len(), t_steps);
+            for t in 0..t_steps {
+                let abs_err = (d_total[t] - d_scan[t]).abs();
+                let rel_err = abs_err / (d_total[t].abs() + 1e-6);
+                assert!(
+                    abs_err < 1e-3 || rel_err < 1e-4,
+                    "T={t_steps} a={a} t={t}: ref={:.6}, scan={:.6}",
+                    d_total[t],
+                    d_scan[t]
+                );
+            }
+        }
+    }
 }
 
 /// Numerical vs analytical gradient on a single bias scalar. With
