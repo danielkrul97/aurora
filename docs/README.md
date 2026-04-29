@@ -18,8 +18,9 @@ Celkem 8 tematických dokumentů pokrývajících celou cestu od matematických 
 | 06 | [06_fine_tuning_a_alignment.md](./06_fine_tuning_a_alignment.md) | **Fine-tuning a alignment** | LoRA, QLoRA, RLHF, DPO, GRPO, Constitutional AI, scheming |
 | 07 | [07_optimalizace_inference.md](./07_optimalizace_inference.md) | **Optimalizace inference** | KV cache, vLLM, PagedAttention, EAGLE, NVFP4, B200, Cerebras |
 | 08 | [08_aplikace_a_trendy.md](./08_aplikace_a_trendy.md) | **Aplikace a trendy 2026** | RAG, GraphRAG, agenti, MCP, computer use, world models |
-| 09 | [09_aurora_neuron.md](./09_aurora_neuron.md) | **Neuron Aurora — návrh** | LIF, dendrity, STDP, neuromodulace, event-driven, sparsity |
-| 10 | [10_implementacni_plan.md](./10_implementacni_plan.md) | **Implementační plán** | Sprinty 0–6, exit kritéria, MNIST jako první benchmark |
+| 10 | [10_implementacni_plan.md](./10_implementacni_plan.md) | **Plán Sprint 0–25 (zamrzlý)** | brzké SNN, MNIST, gated cell, GPU foundation |
+| 11 | [11_implementacni_plan_v2.md](./11_implementacni_plan_v2.md) | **Plán Sprint 26–50 (zamrzlý)** | BPE, multi-layer SNN, SDSA, AdLIF, SSM, CfC LNN |
+| 12 | [12_implementacni_plan_v3.md](./12_implementacni_plan_v3.md) | **Aktivní plán (Sprint 51+)** | LNN-only refactor, GPU port |
 
 ---
 

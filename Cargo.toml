@@ -1,8 +1,8 @@
 [package]
 name = "aurora"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Biologically-inspired spiking neural network"
+description = "Biologically-inspired language model on a closed-form continuous-time (CfC) Liquid Neural Network cell"
 license = "MIT OR Apache-2.0"
 
 [lib]
@@ -25,30 +25,11 @@ default = []
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
 
 [dev-dependencies]
-criterion = "0.5"
 indicatif = "0.18"
 textplots = "0.8"
 
-[[bench]]
-name = "sparsity_scaling"
-harness = false
-
-[[bench]]
-name = "lm_sparse_speedup"
-harness = false
-
-[[bench]]
-name = "lm_gpu_speedup"
-harness = false
-required-features = ["gpu"]
-
-[[bench]]
-name = "multi_layer_perf"
-harness = false
-
 [[example]]
 name = "aurora_train"
-required-features = ["gpu"]
 
 [[example]]
-name = "aurora_lnn_train"
+name = "train_bpe"

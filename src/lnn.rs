@@ -50,19 +50,31 @@ use rand::Rng;
 use rayon::prelude::*;
 
 use crate::optimizer::{adam_apply, bias_correction, AdamConfig, AdamGroup};
-use crate::snn_loss::cross_entropy_with_grad;
+use crate::loss::cross_entropy_with_grad;
 
 const LOG_TAU_CLAMP: f32 = 3.0;
 const DEFAULT_LOG_TAU_INIT: f32 = 0.0;
+/// Memory neurons (M-LTC, Srinivas et al. 2025) get a higher floor on
+/// log_tau to keep their timescale slow. With min = 1.0, τ ≥ 2.7.
+const LOG_TAU_MEM_MIN: f32 = 1.0;
+/// Memory neurons start with τ ≈ 4.5.
+const DEFAULT_LOG_TAU_MEM_INIT: f32 = 1.5;
 
 /// One CfC layer's parameters. Three weight matrices feed three
 /// sub-states (`f`, `g`, `h`); a per-neuron `log_tau` scales the
 /// gating sigmoid argument.
+///
+/// The first `n_memory` neurons are M-LTC memory neurons: periodic
+/// activation (`sin/cos`) on `g`/`h`, and `log_tau` floored at
+/// `LOG_TAU_MEM_MIN`. The remaining `n_hidden - n_memory` neurons are
+/// classic CfC (tanh activation, `log_tau` floored at -LOG_TAU_CLAMP).
 #[derive(Clone, Debug)]
 pub struct LnnLayer {
     pub n_in: usize,
     pub n_hidden: usize,
     pub n_z: usize,
+    /// Number of leading neurons running the M-LTC memory variant.
+    pub n_memory: usize,
     /// `[n_hidden, n_z]` row-major. `f_pre = b_f + W_f · z_t`.
     pub w_f: Vec<f32>,
     pub w_g: Vec<f32>,
@@ -72,6 +84,7 @@ pub struct LnnLayer {
     pub b_h: Vec<f32>,
     /// Per-neuron log-timescale; clamped to `[-LOG_TAU_CLAMP, +LOG_TAU_CLAMP]`
     /// after each Adam step so `tau ∈ [exp(-3), exp(3)] ≈ [0.05, 20]`.
+    /// Memory neurons additionally floor at `LOG_TAU_MEM_MIN`.
     pub log_tau: Vec<f32>,
 }
 
@@ -86,25 +99,47 @@ impl LnnLayer {
         log_tau_init: f32,
         rng: &mut R,
     ) -> Self {
+        Self::new_with_memory(n_in, n_hidden, 0, log_tau_init, DEFAULT_LOG_TAU_MEM_INIT, rng)
+    }
+
+    pub fn new_with_memory<R: Rng>(
+        n_in: usize,
+        n_hidden: usize,
+        n_memory: usize,
+        log_tau_init: f32,
+        log_tau_mem_init: f32,
+        rng: &mut R,
+    ) -> Self {
+        assert!(n_memory <= n_hidden, "n_memory must not exceed n_hidden");
         let n_z = n_in + n_hidden;
         let scale = (2.0 / n_z as f32).sqrt();
         let w_init = |rng: &mut R| (rng.random::<f32>() - 0.5) * 2.0 * scale;
         let w_f: Vec<f32> = (0..n_hidden * n_z).map(|_| w_init(rng)).collect();
         let w_g: Vec<f32> = (0..n_hidden * n_z).map(|_| w_init(rng)).collect();
         let w_h: Vec<f32> = (0..n_hidden * n_z).map(|_| w_init(rng)).collect();
-        let log_tau_clamped = log_tau_init.clamp(-LOG_TAU_CLAMP, LOG_TAU_CLAMP);
+        let log_tau_learn = log_tau_init.clamp(-LOG_TAU_CLAMP, LOG_TAU_CLAMP);
+        let log_tau_mem = log_tau_mem_init.clamp(LOG_TAU_MEM_MIN, LOG_TAU_CLAMP);
+        let log_tau: Vec<f32> = (0..n_hidden)
+            .map(|i| if i < n_memory { log_tau_mem } else { log_tau_learn })
+            .collect();
         Self {
             n_in,
             n_hidden,
             n_z,
+            n_memory,
             w_f,
             w_g,
             w_h,
             b_f: vec![0.0; n_hidden],
             b_g: vec![0.0; n_hidden],
             b_h: vec![0.0; n_hidden],
-            log_tau: vec![log_tau_clamped; n_hidden],
+            log_tau,
         }
+    }
+
+    #[inline]
+    pub const fn is_memory(&self, i: usize) -> bool {
+        i < self.n_memory
     }
 }
 
@@ -262,10 +297,14 @@ impl MultiLayerLnnGrads {
 pub struct LayerCache {
     /// Sigmoid output `f[t][i]`, length `t_steps`.
     pub f: Vec<Vec<f32>>,
-    /// Tanh output `g[t][i]`.
+    /// Activation output `g[t][i]` — `tanh(g_pre)` for learning neurons,
+    /// `sin(g_pre)` for memory neurons.
     pub g: Vec<Vec<f32>>,
-    /// Tanh output `h[t][i]`.
     pub h_act: Vec<Vec<f32>>,
+    /// `dg/d(g_pre)` — `1 - g²` for tanh neurons, `cos(g_pre)` for sin
+    /// neurons. Cached at forward time so backward can stay uniform.
+    pub g_deriv: Vec<Vec<f32>>,
+    pub h_deriv: Vec<Vec<f32>>,
     /// Interpolation weight `alpha[t][i]`.
     pub alpha: Vec<Vec<f32>>,
     /// State `x[t][i]` after the convex combination.
@@ -280,6 +319,8 @@ impl LayerCache {
             f: Vec::with_capacity(t_steps),
             g: Vec::with_capacity(t_steps),
             h_act: Vec::with_capacity(t_steps),
+            g_deriv: Vec::with_capacity(t_steps),
+            h_deriv: Vec::with_capacity(t_steps),
             alpha: Vec::with_capacity(t_steps),
             x: Vec::with_capacity(t_steps),
             initial_state: Vec::new(),
@@ -411,11 +452,46 @@ impl MultiLayerLnnSnn {
         log_tau_init: f32,
         rng: &mut R,
     ) -> Self {
+        Self::new_with_memory(
+            n_input,
+            hidden_dims,
+            &vec![0; hidden_dims.len()],
+            n_output,
+            log_tau_init,
+            DEFAULT_LOG_TAU_MEM_INIT,
+            rng,
+        )
+    }
+
+    /// `n_memory_per_layer[l]` controls how many of layer `l`'s neurons
+    /// are M-LTC memory neurons. Pass an array of zeros to recover the
+    /// classic CfC behavior.
+    pub fn new_with_memory<R: Rng>(
+        n_input: usize,
+        hidden_dims: &[usize],
+        n_memory_per_layer: &[usize],
+        n_output: usize,
+        log_tau_init: f32,
+        log_tau_mem_init: f32,
+        rng: &mut R,
+    ) -> Self {
         assert!(!hidden_dims.is_empty(), "at least one layer required");
+        assert_eq!(
+            hidden_dims.len(),
+            n_memory_per_layer.len(),
+            "n_memory_per_layer must match hidden_dims length"
+        );
         let mut layers = Vec::with_capacity(hidden_dims.len());
         let mut prev_dim = n_input;
-        for &h in hidden_dims {
-            layers.push(LnnLayer::new_with_log_tau(prev_dim, h, log_tau_init, rng));
+        for (l, &h) in hidden_dims.iter().enumerate() {
+            layers.push(LnnLayer::new_with_memory(
+                prev_dim,
+                h,
+                n_memory_per_layer[l],
+                log_tau_init,
+                log_tau_mem_init,
+                rng,
+            ));
             prev_dim = h;
         }
         let top_hidden = *hidden_dims.last().unwrap();
@@ -501,11 +577,13 @@ impl MultiLayerLnnSnn {
                 bc1,
                 bc2,
             );
-            // Keep tau bounded so backward through `exp(log_tau)` does
-            // not overflow and the gating sigmoid does not saturate
-            // permanently.
-            for v in &mut layer.log_tau {
-                *v = v.clamp(-LOG_TAU_CLAMP, LOG_TAU_CLAMP);
+            // Memory neurons get a higher floor so the slow timescale
+            // can't collapse; learning neurons use the standard symmetric
+            // clamp around the log_tau init.
+            let n_mem = layer.n_memory;
+            for (i, v) in layer.log_tau.iter_mut().enumerate() {
+                let lo = if i < n_mem { LOG_TAU_MEM_MIN } else { -LOG_TAU_CLAMP };
+                *v = v.clamp(lo, LOG_TAU_CLAMP);
             }
         }
         adam_apply(
@@ -557,6 +635,8 @@ impl MultiLayerLnnSnn {
             let mut f_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
             let mut g_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
             let mut h_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
+            let mut g_deriv_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
+            let mut h_deriv_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
             let mut alpha_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
             let mut x_per_t: Vec<Vec<f32>> = Vec::with_capacity(t_steps);
 
@@ -618,18 +698,29 @@ impl MultiLayerLnnSnn {
                 let mut f = vec![0.0_f32; n_h];
                 let mut g = vec![0.0_f32; n_h];
                 let mut h_a = vec![0.0_f32; n_h];
+                let mut g_deriv = vec![0.0_f32; n_h];
+                let mut h_deriv = vec![0.0_f32; n_h];
                 let mut alpha = vec![0.0_f32; n_h];
                 let mut x = vec![0.0_f32; n_h];
                 for i in 0..n_h {
                     let f_i = sigmoid(f_pre[i]);
-                    let g_i = g_pre[i].tanh();
-                    let h_i = h_pre[i].tanh();
+                    let (g_i, g_d, h_i, h_d) = if layer.is_memory(i) {
+                        let gp = g_pre[i];
+                        let hp = h_pre[i];
+                        (gp.sin(), gp.cos(), hp.sin(), hp.cos())
+                    } else {
+                        let g_t = g_pre[i].tanh();
+                        let h_t = h_pre[i].tanh();
+                        (g_t, 1.0 - g_t * g_t, h_t, 1.0 - h_t * h_t)
+                    };
                     let tau_i = layer.log_tau[i].exp();
                     let alpha_i = sigmoid(-f_i * tau_i);
                     let x_i = alpha_i * g_i + (1.0 - alpha_i) * h_i;
                     f[i] = f_i;
                     g[i] = g_i;
                     h_a[i] = h_i;
+                    g_deriv[i] = g_d;
+                    h_deriv[i] = h_d;
                     alpha[i] = alpha_i;
                     x[i] = x_i;
                 }
@@ -637,6 +728,8 @@ impl MultiLayerLnnSnn {
                 f_per_t.push(f);
                 g_per_t.push(g);
                 h_per_t.push(h_a);
+                g_deriv_per_t.push(g_deriv);
+                h_deriv_per_t.push(h_deriv);
                 alpha_per_t.push(alpha);
                 x_per_t.push(x);
             }
@@ -645,6 +738,8 @@ impl MultiLayerLnnSnn {
             cache.layers[l].f = f_per_t;
             cache.layers[l].g = g_per_t;
             cache.layers[l].h_act = h_per_t;
+            cache.layers[l].g_deriv = g_deriv_per_t;
+            cache.layers[l].h_deriv = h_deriv_per_t;
             cache.layers[l].alpha = alpha_per_t;
             cache.layers[l].x = x_per_t;
         }
@@ -751,6 +846,8 @@ impl MultiLayerLnnSnn {
                 let f_t = &layer_cache.f[t];
                 let g_t = &layer_cache.g[t];
                 let h_t = &layer_cache.h_act[t];
+                let g_deriv_t = &layer_cache.g_deriv[t];
+                let h_deriv_t = &layer_cache.h_deriv[t];
                 let alpha_t = &layer_cache.alpha[t];
                 let x_prev: &[f32] = if t == 0 {
                     &layer_cache.initial_state
@@ -775,9 +872,10 @@ impl MultiLayerLnnSnn {
                     let d_g = dx_i * alpha_i;
                     let d_h = dx_i * (1.0 - alpha_i);
 
-                    // tanh derivatives
-                    d_g_pre[i] = d_g * (1.0 - g_i * g_i);
-                    d_h_pre[i] = d_h * (1.0 - h_i * h_i);
+                    // Activation deriv: cached at forward time. Tanh =>
+                    // 1 - g², sin => cos(g_pre).
+                    d_g_pre[i] = d_g * g_deriv_t[i];
+                    d_h_pre[i] = d_h * h_deriv_t[i];
 
                     // α = σ(-f·τ): dα/d(arg) = α(1-α);
                     // arg = -f·τ → d(arg)/df = -τ, d(arg)/dτ = -f.
@@ -917,8 +1015,11 @@ impl MultiLayerLnnSnn {
                     h_pre += layer.w_h[row + n_in + j] * v;
                 }
                 let f_i = sigmoid(f_pre);
-                let g_i = g_pre.tanh();
-                let h_i = h_pre.tanh();
+                let (g_i, h_i) = if layer.is_memory(i) {
+                    (g_pre.sin(), h_pre.sin())
+                } else {
+                    (g_pre.tanh(), h_pre.tanh())
+                };
                 let tau_i = layer.log_tau[i].exp();
                 let alpha_i = sigmoid(-f_i * tau_i);
                 x_new[i] = alpha_i * g_i + (1.0 - alpha_i) * h_i;

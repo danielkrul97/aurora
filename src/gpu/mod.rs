@@ -1,18 +1,13 @@
-//! GPU infrastructure for `GatedRecurrentSnn` (Sprint 13, foundation).
+//! GPU infrastructure for LNN-CfC. wgpu over Vulkan/Metal/DX12 backend.
 //!
-//! Backend: wgpu over Vulkan/Metal/DX12 — cross-platform, no CUDA
-//! toolchain required. WGSL compute shaders for sparse matvec and the
-//! gated cell. CPU↔GPU parity is asserted via integration tests in
-//! `tests/gpu_parity.rs`; see also `Sprint 13` in
-//! `docs/10_implementacni_plan.md` for scope and exit criteria.
+//! `GpuContext` holds device + queue. `buffers::GpuBuffer` is a typed
+//! wrapper over `wgpu::Buffer` that handles upload/download for `f32`
+//! slices. `lnn_gpu::MultiLayerLnnSnnGpu` mirrors the CPU
+//! `crate::lnn::MultiLayerLnnSnn` API but keeps weights, activations,
+//! and Adam state resident in VRAM.
 //!
-//! This module is gated by the `gpu` cargo feature. The CPU code path
-//! has no dependency on wgpu and continues to work without it.
-//!
-//! Current status: foundation. `GpuContext` initializes a wgpu device
-//! and queue; `kernels::sparse_matvec_onehot` runs the sparse one-hot
-//! matvec used in the LM forward path. Backward, full forward/backward
-//! integration, and Adam port are tracked in Sprint 13 followups.
+//! Gated by the `gpu` cargo feature. Without the feature, only the CPU
+//! path in `crate::lnn` is compiled.
 
 #![allow(
     clippy::redundant_clone,
@@ -29,11 +24,8 @@
 
 pub mod buffers;
 pub mod context;
-pub mod forward_mega;
-pub mod forward_mega_2layer;
-pub mod kernels;
-pub mod snn_gated_gpu;
-pub mod snn_gated_gpu_multi;
+pub mod kernels_lnn;
+pub mod lnn_gpu;
 
 pub use context::GpuContext;
-pub use snn_gated_gpu::GatedRecurrentSnnGpu;
+pub use lnn_gpu::MultiLayerLnnSnnGpu;

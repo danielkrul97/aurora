@@ -5,10 +5,14 @@ Usage:
     python analysis/diagnostics.py logs/run.jsonl [--out plots/]
 
 Generates four plots into the JSONL's directory (or --out):
-  - bpb.png         train + val BPB over time + epoch boundaries
-  - rates.png       per-layer firing rates over epochs
-  - alphas.png      per-layer LSG α evolution over epochs
-  - membrane.png    per-layer membrane mean/peak over epochs
+  - bpb.png        train + val BPB over time + epoch boundaries
+  - activity.png   per-layer mean |x| (state magnitude) over epochs
+  - alphas.png     per-layer α (CfC interpolation weight) over epochs
+  - tau.png        per-layer mean exp(log_tau) over epochs
+
+Schema: aurora_train.rs writes one JSON object per event, one event per
+line. Events: `run`, `chunk`, `epoch_done`, `checkpoint`. Fields specific
+to the LNN-CfC cell: `activity`, `alpha_means`, `alpha_devs`, `tau_means`.
 
 Requires matplotlib (pip install matplotlib).
 """
@@ -33,7 +37,7 @@ except ImportError:
 def parse_jsonl(path: Path):
     runs = []
     chunks = []  # (epoch, chunk_idx, train_bpb, elapsed_s)
-    epochs = []  # (epoch, train_bpb, val_bpb, rates, alphas, v_means, v_peaks, elapsed_s)
+    epochs = []  # event dicts with activity/alpha_means/alpha_devs/tau_means
     checkpoints = []
     bad_lines = 0
 
@@ -69,11 +73,7 @@ def parse_jsonl(path: Path):
 def plot_bpb(chunks, epochs, out_path: Path):
     fig, ax = plt.subplots(figsize=(10, 5))
 
-    # Per-chunk train BPB (running mean within epoch).
     if chunks:
-        # Cumulative time across all epochs (sum of elapsed_s within epoch
-        # is OK approx for rolling x-axis; chunk's elapsed_s is from
-        # epoch start).
         epoch_offsets = {}
         cum = 0.0
         for ep, _, _, _ in chunks:
@@ -86,12 +86,10 @@ def plot_bpb(chunks, epochs, out_path: Path):
             ys.append(bpb)
         ax.plot(xs, ys, color="tab:blue", alpha=0.5, label="train (per-chunk)", lw=1)
 
-    # Per-epoch train + val BPB.
     if epochs:
         ep_x = [ev["epoch"] + 1 for ev in epochs]
         train = [ev["train_bpb"] for ev in epochs]
         val = [ev["val_bpb"] for ev in epochs]
-        # Use epoch index for these — different x scale, so put on twin axis.
         ax2 = ax.twiny()
         ax2.plot(ep_x, train, "o-", color="tab:blue", label="train (epoch end)", lw=2)
         ax2.plot(ep_x, val, "s-", color="tab:orange", label="val (epoch end)", lw=2)
@@ -109,7 +107,7 @@ def plot_bpb(chunks, epochs, out_path: Path):
     print(f"  → {out_path}")
 
 
-def plot_per_layer(epochs, key, ylabel, title, out_path: Path):
+def plot_per_layer(epochs, key, ylabel, title, out_path: Path, hline=None):
     if not epochs:
         return
     n_layers = len(epochs[0][key])
@@ -118,6 +116,8 @@ def plot_per_layer(epochs, key, ylabel, title, out_path: Path):
     for l in range(n_layers):
         ys = [ev[key][l] for ev in epochs]
         ax.plot(ep_x, ys, "o-", label=f"layer {l}", lw=2)
+    if hline is not None:
+        ax.axhline(hline, color="red", lw=0.5, alpha=0.5, label=f"target ≈ {hline}")
     ax.set_xlabel("epoch")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -129,26 +129,30 @@ def plot_per_layer(epochs, key, ylabel, title, out_path: Path):
     print(f"  → {out_path}")
 
 
-def plot_membrane(epochs, out_path: Path):
+def plot_alpha(epochs, out_path: Path):
+    """Plot α (mean) and α deviation from 0.5 per layer.
+
+    α near 0.5 = balanced fast/slow mix; large deviation = one path
+    dominates (gating saturates).
+    """
     if not epochs:
         return
-    n_layers = len(epochs[0]["v_means"])
+    n_layers = len(epochs[0]["alpha_means"])
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     ep_x = [ev["epoch"] + 1 for ev in epochs]
     for l in range(n_layers):
-        means = [ev["v_means"][l] for ev in epochs]
-        peaks = [ev["v_peaks"][l] for ev in epochs]
+        means = [ev["alpha_means"][l] for ev in epochs]
+        devs = [ev["alpha_devs"][l] for ev in epochs]
         axes[0].plot(ep_x, means, "o-", label=f"layer {l}", lw=2)
-        axes[1].plot(ep_x, peaks, "o-", label=f"layer {l}", lw=2)
-    for ax, sub in zip(axes, ("mean v_pre", "peak v_pre")):
+        axes[1].plot(ep_x, devs, "o-", label=f"layer {l}", lw=2)
+    axes[0].axhline(0.5, color="red", lw=0.5, alpha=0.5, label="balanced (0.5)")
+    for ax, sub in zip(axes, ("mean α", "max |α − 0.5|")):
         ax.set_xlabel("epoch")
         ax.set_ylabel(sub)
         ax.set_title(sub)
         ax.grid(alpha=0.3)
         ax.legend()
-        ax.axhline(1.0, color="red", lw=0.5, alpha=0.5, label="θ")
-    axes[1].set_yscale("symlog")
-    fig.suptitle("Membrane potential per layer (peaks > 100 = runaway risk)")
+    fig.suptitle("CfC gating α: balanced fast/slow mix vs. saturation")
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -161,21 +165,28 @@ def summarize(runs, chunks, epochs):
         r = runs[0]
         print(f"  corpus    : {r['corpus']}  ({r['corpus_bytes']:,} bytes)")
         print(f"  vocab     : {r['vocab']}  ({r['n_tokens']:,} tokens)")
-        print(f"  arch      : {r['hidden']} × 2 layers, chunk {r['chunk']}, lr {r['lr']}")
-        print(f"  gpu       : {r['gpu']}")
         print(
-            f"  epochs    : start {r['start_epoch']} → target {r['epochs']}"
+            f"  arch      : {r['hidden']} × {r['layers']} layers, "
+            f"chunk {r['chunk']}, lr {r['lr']}, log_tau init {r['tau_init']}"
         )
+        print(f"  backend   : {r['backend']}")
+        print(f"  epochs    : target {r['epochs']}")
     print(f"  events    : {len(runs)} runs / {len(chunks)} chunks / {len(epochs)} epochs")
     if epochs:
         last = epochs[-1]
         best_val = min(ev["val_bpb"] for ev in epochs)
         print(f"  last val  : {last['val_bpb']:.3f} BPB (best {best_val:.3f})")
-        print(f"  rates     : {last['rates']}")
-        print(f"  alphas    : {last['alphas']}")
-        print(f"  v peaks   : {last['v_peaks']}")
-        if last["v_peaks"] and max(last["v_peaks"]) > 1000:
-            print("  ⚠ membrane peaks > 1000 — runaway risk for longer runs")
+        print(f"  activity  : {last['activity']}")
+        print(f"  α means   : {last['alpha_means']}")
+        print(f"  α devs    : {last['alpha_devs']}")
+        print(f"  τ means   : {last['tau_means']}")
+        # Saturation warnings.
+        if last["activity"] and max(last["activity"]) > 0.95:
+            print("  ⚠ activity > 0.95 — state saturation, cell may be stuck near ±1")
+        if last["alpha_devs"] and max(last["alpha_devs"]) > 0.45:
+            print(
+                "  ⚠ α deviation > 0.45 — gating saturated; one of fast/slow path dominates"
+            )
 
 
 def main():
@@ -204,19 +215,19 @@ def main():
     plot_bpb(chunks, epochs, out_dir / f"{stem}_bpb.png")
     plot_per_layer(
         epochs,
-        "rates",
-        "firing rate",
-        "Per-layer firing rate (target ≈ 0.10)",
-        out_dir / f"{stem}_rates.png",
+        "activity",
+        "mean |x|",
+        "Per-layer state magnitude (1.0 = saturation)",
+        out_dir / f"{stem}_activity.png",
     )
+    plot_alpha(epochs, out_dir / f"{stem}_alpha.png")
     plot_per_layer(
         epochs,
-        "alphas",
-        "α (LSG width)",
-        "Per-layer LSG surrogate width α",
-        out_dir / f"{stem}_alphas.png",
+        "tau_means",
+        "mean exp(log_τ)",
+        "Per-layer mean timescale τ (clamped to ≈ [0.05, 20])",
+        out_dir / f"{stem}_tau.png",
     )
-    plot_membrane(epochs, out_dir / f"{stem}_membrane.png")
     print()
 
 

@@ -1,25 +1,30 @@
 # Projekt
 
-Cílem projektu Aurora je vytvořit custom LLM, přičemž využije neurobiologicky inspirovanou architekturu 
+Cílem projektu Aurora je vytvořit custom LLM, přičemž využije neurobiologicky inspirovanou architekturu
 umělé neuronové sítě. Projekt je napsán v Rustu. Cílem však NENÍ vytvořit další obecnou LLM.
+
+**Architektura:** Closed-form continuous-time (CfC) Liquid Neural Network cell
+(Hasani et al., Nature MI 2022, arXiv:2106.13898). Inspirovaná C. elegans nervovou soustavou,
+smooth aktivace (sigmoid, tanh, exp) — žádný surrogate gradient, stav `x ∈ [-1, 1]^H` z konstrukce.
 
 ## Hlavní vstupní body
 
-- **Hlavní training example:** `examples/aurora_train.rs` (GPU 2-layer + BPE + checkpointing + auto-resume).
+- **Hlavní training example:** `examples/aurora_train.rs` (GPU default + BPE + checkpointing + auto-resume; `--cpu` fallback).
   Spouštěj přes `scripts/overnight.sh` nebo přímo `cargo run --release --features gpu --example aurora_train -- ...`.
-- **Anti-regrese:** `tests/lm_quality_regression.rs` (CPU byte + BPE BPB threshold + checkpoint round-trip),
-  `tests/gpu_parity.rs` (CPU↔GPU drift < 5e-2). Před commitem oba zkontroluj.
+- **Anti-regrese:** `tests/lnn_smoke.rs` (CPU forward + finite-diff grad checks),
+  `tests/lnn_gpu_parity.rs` (CPU↔GPU forward+backward+Adam drift < 1e-3). Před commitem oba zkontroluj.
 - **Diagnostické grafy:** `python3 analysis/diagnostics.py logs/<run>.jsonl` po skončení tréninku.
 
 ## Konvence
 
-- **Aktivní plán = `docs/11_implementacni_plan_v2.md`.** `docs/10_implementacni_plan.md` je zamrzlý
-  historický záznam (Sprint 0–25, 92 KB), do něj nepiš. Nový sprint dokumentuj v 11; pokud 11 přeroste
-  ~50 KB, založ 12.
-- **JSONL metriky** chodí default do `logs/<ckpt_stem>_<unix_ts>.jsonl`. Schema: `run` / `chunk` /
+- **Aktivní plán = `docs/12_implementacni_plan_v3.md`.** `docs/11_implementacni_plan_v2.md` je zamrzlý
+  historický záznam (Sprint 26–50, SNN+SSM era), do něj nepiš. `10_implementacni_plan.md` je
+  hluboká historie (Sprint 0–25). Nový sprint dokumentuj v 12; pokud 12 přeroste ~50 KB, založ 13.
+- **JSONL metriky** chodí default do `logs/<corpus_stem>_<unix_ts>.jsonl`. Schema: `run` / `chunk` /
   `epoch_done` / `checkpoint` events. Per-event flush — `tail -f` má sub-second lag.
-- **Checkpoint format `AURORA02`** (`src/checkpoint.rs`). Bumpy magic při schema change, drž backward compat
-  pro `AURORA01`.
+  Per-event fields pro CfC: `activity` (mean |x|), `alpha_means`/`alpha_devs` (gating), `tau_means` (timescale).
+- **Checkpoint format `AURORA-LNN01`** (`src/checkpoint.rs`). Bumpy magic při schema change.
+  Žádný backward compat na předchozí SNN formáty (`AURORA01/02`) — jiná architektura, jiný layout.
 - **Korpusy** se stahují přes `scripts/get_corpus.sh <variant>` do `data/`. `data/` a `logs/` jsou v gitignore.
 
 # Code style

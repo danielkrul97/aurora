@@ -1,381 +1,302 @@
-#![cfg(feature = "gpu")]
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::too_many_lines,
-    clippy::large_enum_variant
+    clippy::too_many_lines
 )]
 
-//! Sprint 28: Aurora's primary training example.
+//! Aurora — closed-form continuous-time (CfC) Liquid Neural Network
+//! language-model trainer.
 //!
-//! Combines every speed + quality feature shipped so far:
-//! * GPU 2-layer megakernel (Sprint 25)
-//! * BPE tokenization (Sprint 26)
-//! * Token-level GPU forward/backward (Sprint 28)
-//! * Checkpointing — auto-saves weights at end of every epoch and
-//!   auto-resumes if a checkpoint with matching architecture exists.
-//!
-//! Designed for overnight runs on enwik8/enwik9. Use BPE for quality,
-//! GPU megakernel for speed, and checkpoints so you don't have to
-//! restart from scratch after a power blip or system update.
+//! Default backend: GPU (wgpu over Vulkan/Metal/DX12). Pass `--cpu` to
+//! force the rayon CPU path. Both backends share the same parameter
+//! layout (`crate::lnn::MultiLayerLnnSnn`) and the same `AURORA-LNN01`
+//! checkpoint format, so the GPU run is bit-equivalent to CPU within
+//! FP32 noise (see `tests/lnn_gpu_parity.rs`).
 //!
 //! Usage:
 //!   cargo run --release --features gpu --example aurora_train -- \
-//!     --corpus data/enwik8.txt \
-//!     --vocab 4096 \
-//!     --hidden 512 \
-//!     --epochs 8 \
-//!     --chunk 64 \
-//!     --lr 0.002 \
-//!     --checkpoint data/aurora.ckpt
+//!     --corpus data/tiny_600k.txt \
+//!     --vocab 1024 --hidden 128 --layers 2 \
+//!     --epochs 3 --chunk 64 --lr 0.005 \
+//!     --checkpoint data/tiny_600k_h128.ckpt
 //!
-//! All flags optional; defaults shown above.
+//! All flags optional; defaults are tuned for the tiny_600k smoke
+//! comparison against the Sprint 48 baseline.
 
 use std::env;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use aurora::apoptosis::{ApoptosisConfig, ApoptosisMode};
 use aurora::bpe::BpeTokenizer;
-use aurora::checkpoint::{self, Checkpoint};
-use aurora::gpu::snn_gated_gpu_multi::MultiLayerGatedSnnGpu;
-use aurora::gpu::GpuContext;
+use aurora::checkpoint;
+use aurora::lnn::{LnnState, MultiLayerLnnSnn};
+use aurora::loss::cross_entropy_loss;
 use aurora::optimizer::AdamConfig;
-use aurora::snn_gated_multi::MultiLayerGatedSnn;
-use aurora::surrogate::SpikeFn;
 use aurora::text_io::{bits_per_byte, load_corpus, sample_token};
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use textplots::{Chart, Plot, Shape};
+
+#[cfg(feature = "gpu")]
+use aurora::gpu::{GpuContext, MultiLayerLnnSnnGpu};
 
 const GRAD_CLIP: f32 = 1.0;
 const SAMPLE_LEN: usize = 200;
 const SAMPLE_TEMP: f32 = 0.8;
 const BATCH_SIZE: usize = 16;
+const BOX_WIDTH: usize = 60;
 
 #[derive(Debug, Clone)]
 struct Cli {
     corpus: PathBuf,
     vocab: usize,
     hidden: usize,
+    layers: usize,
     epochs: usize,
     chunk: usize,
     lr: f32,
-    checkpoint: PathBuf,
+    tau_init: f32,
+    /// M-LTC: fraction of *top-layer* neurons that run the memory
+    /// variant (sin/cos activation, log_tau floored at LOG_TAU_MEM_MIN).
+    /// `0.0` (default) reproduces classic CfC.
+    memory_frac: f32,
+    /// Initial log_tau for memory neurons (clamped to ≥ LOG_TAU_MEM_MIN).
+    tau_mem_init: f32,
     bpe_path: Option<PathBuf>,
     metrics: Option<PathBuf>,
-    /// Sprint 39: opt out of GPU and run on CPU. Required for `--sdsa`
-    /// until the GPU SDSA port lands. Only useful for small configs
-    /// (hidden ≤ 256 typically); CPU is ~10× slower than GPU at scale.
-    cpu: bool,
-    /// Sprint 39: enable Spike-Driven Self-Attention block.
-    /// CPU-only path (Sprint 38 wiring); GPU port = Sprint 40+.
-    sdsa: bool,
-    /// Sprint 40: enable AdLIF adaptation current. CPU-only.
-    adlif: bool,
-    /// Sprint 41: stack depth. Default 2 (matches GPU megakernel
-    /// constraint). CPU supports any value.
-    n_layers: usize,
-    /// Sprint 42: apoptosis mode. `off` (default), `activity`
-    /// (kill neurons with EMA firing rate < threshold), or `random`
-    /// (one-shot kill of fixed counts per layer — control for the
-    /// activity arm of the experiment).
-    apoptosis_mode: String,
-    apop_warmup: usize,
-    apop_ema: f32,
-    apop_threshold: f32,
-    apop_check: usize,
-    /// Comma-separated per-layer kill counts for `--apoptosis random`.
-    apop_counts: Option<String>,
-    /// Sprint 43 trophic mode: kill if EMA < frac × layer_median.
-    apop_trophic_frac: f32,
-    /// Sprint 44 adaptive cap: max kills per check = max(1, floor(alive × rate)).
-    apop_trophic_rate: f32,
-    /// Sprint 44 hard ceiling: halt this layer's pruning at this fraction dead.
-    apop_trophic_max_dead: f32,
-    /// Sprint 45: per-run seed override. Default 0xC0FFEE (matches all
-    /// prior sprint baselines for reproducibility).
+    checkpoint: Option<PathBuf>,
     seed: u64,
-    /// Sprint 46: cell type — `gated` (default, full Aurora pipeline)
-    /// or `ssm` (diagonal state-space cell with spike outputs, CPU-only).
-    cell: String,
-    /// Sprint 47: SSM diagonal decay init. Effective memory ≈
-    /// `1 / (1 - a)` timesteps. Default 0.5 matches Sprint 46.
-    ssm_a_init: f32,
-    /// Sprint 48: per-neuron heterogenous `a` spread. Each neuron's
-    /// `a` ~ Uniform[a_init - spread, a_init + spread], clamped to
-    /// [0.05, 0.99]. Default 0 = homogeneous.
-    ssm_a_spread: f32,
-    /// Sprint 48: HiPPO-style log-linear spectrum `a_lo,a_hi`. When
-    /// set, overrides `--ssm-a-init` / spread — neuron i gets
-    /// `a_i = 1 - exp(lerp(log(1-a_lo), log(1-a_hi), i/(N-1)))`.
-    ssm_spectrum: Option<String>,
-    /// Sprint 49: drop the heaviside spike output — inter-layer signal
-    /// is the real-valued state directly. Tests whether 1-bit
-    /// quantization between layers is the quality bottleneck.
-    ssm_continuous: bool,
+    cpu: bool,
 }
 
 impl Cli {
     fn parse() -> Result<Self, String> {
-        let mut corpus: PathBuf = "data/enwik8.txt".into();
-        let mut vocab: usize = 4096;
-        let mut hidden: usize = 512;
-        let mut epochs: usize = 8;
+        let mut corpus: PathBuf = "data/tiny_600k.txt".into();
+        let mut vocab: usize = 1024;
+        let mut hidden: usize = 128;
+        let mut layers: usize = 2;
+        let mut epochs: usize = 3;
         let mut chunk: usize = 64;
-        let mut lr: f32 = 0.002;
-        let mut checkpoint: Option<PathBuf> = None;
+        let mut lr: f32 = 0.005;
+        let mut tau_init: f32 = 0.0;
+        let mut memory_frac: f32 = 0.0;
+        let mut tau_mem_init: f32 = 1.5;
         let mut bpe_path: Option<PathBuf> = None;
         let mut metrics: Option<PathBuf> = None;
-        let mut cpu: bool = false;
-        let mut sdsa: bool = false;
-        let mut adlif: bool = false;
-        let mut n_layers: usize = 2;
-        let mut apoptosis_mode: String = "off".to_string();
-        let mut apop_warmup: usize = 200;
-        let mut apop_ema: f32 = 0.05;
-        let mut apop_threshold: f32 = 0.005;
-        let mut apop_check: usize = 100;
-        let mut apop_counts: Option<String> = None;
-        let mut apop_trophic_frac: f32 = 0.01;
-        let mut apop_trophic_rate: f32 = 0.005;
-        let mut apop_trophic_max_dead: f32 = 0.20;
+        let mut ckpt: Option<PathBuf> = None;
         let mut seed: u64 = 0xC0FFEE;
-        let mut cell: String = "gated".to_string();
-        let mut ssm_a_init: f32 = 0.5;
-        let mut ssm_a_spread: f32 = 0.0;
-        let mut ssm_spectrum: Option<String> = None;
-        let mut ssm_continuous: bool = false;
+        let mut cpu = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
         while i < args.len() {
-            let arg = &args[i];
-            let next = || {
-                args.get(i + 1)
-                    .ok_or_else(|| format!("missing value for {arg}"))
+            let key = &args[i];
+            let want_value = |i: usize| -> Result<&String, String> {
+                args.get(i + 1).ok_or_else(|| format!("{key} needs a value"))
             };
-            match arg.as_str() {
+            match key.as_str() {
                 "--corpus" => {
-                    corpus = next()?.into();
+                    corpus = want_value(i)?.into();
                     i += 2;
                 }
                 "--vocab" => {
-                    vocab = next()?.parse().map_err(|e| format!("--vocab: {e}"))?;
+                    vocab = want_value(i)?.parse().map_err(|e| format!("--vocab: {e}"))?;
                     i += 2;
                 }
                 "--hidden" => {
-                    hidden = next()?.parse().map_err(|e| format!("--hidden: {e}"))?;
+                    hidden = want_value(i)?.parse().map_err(|e| format!("--hidden: {e}"))?;
+                    i += 2;
+                }
+                "--layers" => {
+                    layers = want_value(i)?.parse().map_err(|e| format!("--layers: {e}"))?;
                     i += 2;
                 }
                 "--epochs" => {
-                    epochs = next()?.parse().map_err(|e| format!("--epochs: {e}"))?;
+                    epochs = want_value(i)?.parse().map_err(|e| format!("--epochs: {e}"))?;
                     i += 2;
                 }
                 "--chunk" => {
-                    chunk = next()?.parse().map_err(|e| format!("--chunk: {e}"))?;
+                    chunk = want_value(i)?.parse().map_err(|e| format!("--chunk: {e}"))?;
                     i += 2;
                 }
                 "--lr" => {
-                    lr = next()?.parse().map_err(|e| format!("--lr: {e}"))?;
+                    lr = want_value(i)?.parse().map_err(|e| format!("--lr: {e}"))?;
                     i += 2;
                 }
-                "--checkpoint" => {
-                    checkpoint = Some(next()?.into());
+                "--tau-init" => {
+                    tau_init = want_value(i)?
+                        .parse()
+                        .map_err(|e| format!("--tau-init: {e}"))?;
                     i += 2;
                 }
-                "--bpe" => {
-                    bpe_path = Some(next()?.into());
+                "--memory-frac" => {
+                    memory_frac = want_value(i)?
+                        .parse()
+                        .map_err(|e| format!("--memory-frac: {e}"))?;
+                    i += 2;
+                }
+                "--tau-mem-init" => {
+                    tau_mem_init = want_value(i)?
+                        .parse()
+                        .map_err(|e| format!("--tau-mem-init: {e}"))?;
+                    i += 2;
+                }
+                "--bpe-path" => {
+                    bpe_path = Some(want_value(i)?.into());
                     i += 2;
                 }
                 "--metrics" => {
-                    metrics = Some(next()?.into());
+                    metrics = Some(want_value(i)?.into());
+                    i += 2;
+                }
+                "--checkpoint" => {
+                    ckpt = Some(want_value(i)?.into());
+                    i += 2;
+                }
+                "--seed" => {
+                    seed = want_value(i)?.parse().map_err(|e| format!("--seed: {e}"))?;
                     i += 2;
                 }
                 "--cpu" => {
                     cpu = true;
                     i += 1;
                 }
-                "--sdsa" => {
-                    sdsa = true;
-                    i += 1;
+                "--help" | "-h" => {
+                    print_usage();
+                    std::process::exit(0);
                 }
-                "--adlif" => {
-                    adlif = true;
-                    i += 1;
-                }
-                "--n-layers" => {
-                    n_layers =
-                        next()?.parse().map_err(|e| format!("--n-layers: {e}"))?;
-                    i += 2;
-                }
-                "--apoptosis" => {
-                    apoptosis_mode = next()?.clone();
-                    i += 2;
-                }
-                "--apoptosis-warmup" => {
-                    apop_warmup = next()?.parse().map_err(|e| format!("--apoptosis-warmup: {e}"))?;
-                    i += 2;
-                }
-                "--apoptosis-ema" => {
-                    apop_ema = next()?.parse().map_err(|e| format!("--apoptosis-ema: {e}"))?;
-                    i += 2;
-                }
-                "--apoptosis-threshold" => {
-                    apop_threshold = next()?.parse().map_err(|e| format!("--apoptosis-threshold: {e}"))?;
-                    i += 2;
-                }
-                "--apoptosis-check" => {
-                    apop_check = next()?.parse().map_err(|e| format!("--apoptosis-check: {e}"))?;
-                    i += 2;
-                }
-                "--apoptosis-counts" => {
-                    apop_counts = Some(next()?.clone());
-                    i += 2;
-                }
-                "--apoptosis-trophic-frac" => {
-                    apop_trophic_frac = next()?.parse().map_err(|e| format!("--apoptosis-trophic-frac: {e}"))?;
-                    i += 2;
-                }
-                "--apoptosis-trophic-rate" => {
-                    apop_trophic_rate = next()?.parse().map_err(|e| format!("--apoptosis-trophic-rate: {e}"))?;
-                    i += 2;
-                }
-                "--apoptosis-trophic-max-dead" => {
-                    apop_trophic_max_dead = next()?.parse().map_err(|e| format!("--apoptosis-trophic-max-dead: {e}"))?;
-                    i += 2;
-                }
-                "--cell" => {
-                    cell = next()?.clone();
-                    i += 2;
-                }
-                "--ssm-a-init" => {
-                    ssm_a_init = next()?.parse().map_err(|e| format!("--ssm-a-init: {e}"))?;
-                    if !(0.0..=0.99).contains(&ssm_a_init) {
-                        return Err(format!("--ssm-a-init must be in [0, 0.99], got {ssm_a_init}"));
-                    }
-                    i += 2;
-                }
-                "--ssm-a-spread" => {
-                    ssm_a_spread = next()?.parse().map_err(|e| format!("--ssm-a-spread: {e}"))?;
-                    if ssm_a_spread < 0.0 || ssm_a_spread > 0.5 {
-                        return Err(format!("--ssm-a-spread must be in [0, 0.5], got {ssm_a_spread}"));
-                    }
-                    i += 2;
-                }
-                "--ssm-spectrum" => {
-                    ssm_spectrum = Some(next()?.clone());
-                    i += 2;
-                }
-                "--ssm-continuous" => {
-                    ssm_continuous = true;
-                    i += 1;
-                }
-                "--seed" => {
-                    let v = next()?;
-                    seed = if let Some(rest) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
-                        u64::from_str_radix(rest, 16).map_err(|e| format!("--seed (hex): {e}"))?
-                    } else {
-                        v.parse::<u64>().map_err(|e| format!("--seed: {e}"))?
-                    };
-                    i += 2;
-                }
-                "-h" | "--help" => {
-                    return Err("see file header for usage".into());
-                }
-                other => return Err(format!("unknown flag {other}")),
+                other => return Err(format!("unknown flag: {other}")),
             }
         }
 
-        let checkpoint = checkpoint.unwrap_or_else(|| {
-            let stem = corpus
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("corpus");
-            PathBuf::from(format!("data/{stem}_h{hidden}_v{vocab}.ckpt"))
-        });
-
-        if sdsa && !cpu {
-            return Err(
-                "--sdsa currently requires --cpu (GPU SDSA port = Sprint 40+)".into(),
+        if layers < 1 {
+            return Err("--layers must be ≥ 1".into());
+        }
+        if vocab < 256 {
+            return Err("--vocab must be ≥ 256 (byte-level minimum)".into());
+        }
+        if chunk < 1 {
+            return Err("--chunk must be ≥ 1".into());
+        }
+        if epochs < 1 {
+            return Err("--epochs must be ≥ 1".into());
+        }
+        if !(0.0..=1.0).contains(&memory_frac) {
+            return Err("--memory-frac must be in [0, 1]".into());
+        }
+        // M-LTC currently has no GPU kernel; force CPU when enabled.
+        if memory_frac > 0.0 && !cpu {
+            eprintln!(
+                "note: --memory-frac > 0 forces CPU backend (no GPU kernel for sin/cos cell yet)"
             );
-        }
-        if adlif && !cpu {
-            return Err(
-                "--adlif currently requires --cpu (GPU AdLIF port = Sprint 41+)".into(),
-            );
-        }
-        if n_layers != 2 && !cpu {
-            return Err(format!(
-                "--n-layers {n_layers} requires --cpu \
-                (GPU megakernel hardcoded for 2 layers; deeper GPU = Sprint 42+)"
-            ));
-        }
-        if n_layers == 0 {
-            return Err("--n-layers must be ≥ 1".into());
-        }
-
-        match apoptosis_mode.as_str() {
-            "off" | "activity" | "random" | "trophic" => {}
-            other => {
-                return Err(format!(
-                    "--apoptosis must be off|activity|trophic|random, got '{other}'"
-                ))
-            }
-        }
-        if apoptosis_mode != "off" && !cpu {
-            return Err("--apoptosis requires --cpu (Sprint 42 scope)".into());
-        }
-        if apoptosis_mode == "random" && apop_counts.is_none() {
-            return Err("--apoptosis random requires --apoptosis-counts X,Y,…".into());
-        }
-
-        match cell.as_str() {
-            "gated" | "ssm" => {}
-            other => return Err(format!("--cell must be gated|ssm, got '{other}'")),
-        }
-        if cell == "ssm" {
-            if !cpu {
-                return Err("--cell ssm requires --cpu (Sprint 46 scope)".into());
-            }
-            if sdsa || adlif {
-                return Err("--cell ssm currently incompatible with --sdsa / --adlif".into());
-            }
-            if apoptosis_mode != "off" {
-                return Err("--cell ssm currently incompatible with --apoptosis".into());
-            }
+            cpu = true;
         }
 
         Ok(Self {
             corpus,
             vocab,
             hidden,
+            layers,
             epochs,
             chunk,
             lr,
-            checkpoint,
+            tau_init,
+            memory_frac,
+            tau_mem_init,
             bpe_path,
             metrics,
-            cpu,
-            sdsa,
-            adlif,
-            n_layers,
-            apoptosis_mode,
-            apop_warmup,
-            apop_ema,
-            apop_threshold,
-            apop_check,
-            apop_counts,
-            apop_trophic_frac,
-            apop_trophic_rate,
-            apop_trophic_max_dead,
+            checkpoint: ckpt,
             seed,
-            cell,
-            ssm_a_init,
-            ssm_a_spread,
-            ssm_spectrum,
-            ssm_continuous,
+            cpu,
         })
+    }
+}
+
+fn print_usage() {
+    println!("aurora_train — CfC LNN language-model trainer (GPU default)");
+    println!();
+    println!("flags (all optional):");
+    println!("  --corpus PATH     UTF-8 byte corpus           [default: data/tiny_600k.txt]");
+    println!("  --vocab N         BPE vocab size              [default: 1024]");
+    println!("  --hidden N        per-layer hidden dim        [default: 128, ≤ 1024 on GPU]");
+    println!("  --layers N        number of LNN layers        [default: 2]");
+    println!("  --epochs N        training epochs             [default: 3]");
+    println!("  --chunk N         BPTT chunk length (toks)    [default: 64]");
+    println!("  --lr F            Adam learning rate          [default: 0.005]");
+    println!("  --tau-init F      log_tau init                [default: 0.0]");
+    println!("  --memory-frac F   M-LTC memory fraction in    [default: 0.0; 0 = pure CfC]");
+    println!("                    top layer (forces --cpu)");
+    println!("  --tau-mem-init F  log_tau init for memory     [default: 1.5]");
+    println!("  --bpe-path PATH   cache BPE merges            [default: <corpus>.bpe]");
+    println!("  --metrics PATH    JSONL metrics log           [default: logs/<stem>_<ts>.jsonl]");
+    println!("  --checkpoint PATH binary AURORA-LNN01 ckpt    [default: none]");
+    println!("  --seed N          RNG seed                    [default: 0xC0FFEE]");
+    println!("  --cpu             force CPU (rayon) backend   [default: GPU when feature on]");
+}
+
+/// Backend choice. CPU keeps the network struct directly; GPU keeps a
+/// `MultiLayerLnnSnnGpu` plus a CPU-side mirror for evaluation /
+/// sampling / checkpoint save (refreshed via `to_cpu` once per epoch).
+enum Backend {
+    Cpu(MultiLayerLnnSnn),
+    #[cfg(feature = "gpu")]
+    Gpu(MultiLayerLnnSnnGpu),
+}
+
+impl Backend {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Cpu(_) => "CPU LNN-CfC (rayon)",
+            #[cfg(feature = "gpu")]
+            Self::Gpu(_) => "GPU LNN-CfC (wgpu)",
+        }
+    }
+
+    fn fresh_states(&self) -> Vec<LnnState> {
+        match self {
+            Self::Cpu(net) => net.fresh_states(),
+            #[cfg(feature = "gpu")]
+            Self::Gpu(net) => net.fresh_states(),
+        }
+    }
+
+    fn forward_backward_chunk(
+        &mut self,
+        inputs: &[&[u32]],
+        targets: &[&[u32]],
+        states: &mut [Vec<LnnState>],
+        adam: &AdamConfig,
+    ) -> f32 {
+        match self {
+            Self::Cpu(net) => {
+                net.zero_grad();
+                let loss = net.forward_backward_batch_tokens_stateful(inputs, targets, states);
+                net.clip_grads(GRAD_CLIP);
+                net.step_adam(adam);
+                loss
+            }
+            #[cfg(feature = "gpu")]
+            Self::Gpu(net) => {
+                net.zero_grad();
+                let loss = net.forward_backward_batch_tokens_stateful(inputs, targets, states);
+                net.clip_grads(GRAD_CLIP);
+                net.step_adam(adam);
+                loss
+            }
+        }
+    }
+
+    /// Snapshot CPU view of current weights — for evaluate, generate, save.
+    fn cpu_snapshot(&self) -> MultiLayerLnnSnn {
+        match self {
+            Self::Cpu(net) => net.clone(),
+            #[cfg(feature = "gpu")]
+            Self::Gpu(net) => net.to_cpu(),
+        }
     }
 }
 
@@ -383,113 +304,61 @@ fn main() -> ExitCode {
     let cli = match Cli::parse() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("usage error: {e}");
+            eprintln!("error: {e}");
+            print_usage();
             return ExitCode::FAILURE;
         }
     };
 
-    if cli.hidden > 1024 {
-        eprintln!("hidden must be ≤ 1024 (megakernel workgroup memory budget)");
-        return ExitCode::FAILURE;
-    }
-
     let corpus = match load_corpus(&cli.corpus) {
-        Ok(v) => v,
+        Ok(b) => b,
         Err(e) => {
-            eprintln!("failed to read {}: {e}", cli.corpus.display());
+            eprintln!("failed to load {}: {e}", cli.corpus.display());
             return ExitCode::FAILURE;
         }
     };
 
     let bpe_path = cli.bpe_path.clone().unwrap_or_else(|| {
-        let stem = cli
-            .corpus
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("corpus");
-        PathBuf::from(format!("data/{stem}_{}.bpe", cli.vocab))
+        let mut p = cli.corpus.clone();
+        p.set_extension(format!("v{}.bpe", cli.vocab));
+        p
     });
     let bpe = match load_or_train_bpe(&corpus, cli.vocab, &bpe_path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("BPE error: {e}");
+            eprintln!("BPE failed: {e}");
             return ExitCode::FAILURE;
         }
     };
     let actual_vocab = bpe.vocab_size();
 
-    let t0 = Instant::now();
-    let tokens = bpe.encode(&corpus);
-    let encode_s = t0.elapsed().as_secs_f64();
-    let comp = (corpus.len() as f32) / (tokens.len() as f32);
-
-    let n_train = (tokens.len() * 9) / 10;
-    let train_toks = &tokens[..n_train];
-    let val_toks = &tokens[n_train..];
-
-    if cli.cell == "ssm" {
-        return run_ssm(&cli, corpus.len(), tokens.len(), actual_vocab,
-            train_toks, val_toks, encode_s, comp);
+    let encode_t0 = Instant::now();
+    let tokens: Vec<u32> = bpe.encode(&corpus);
+    let encode_s = encode_t0.elapsed().as_secs_f64();
+    let n_tokens = tokens.len();
+    if n_tokens < (cli.chunk + 1) * BATCH_SIZE * 2 {
+        eprintln!("corpus too short for chunk={} batch={BATCH_SIZE}", cli.chunk);
+        return ExitCode::FAILURE;
     }
+    let split = (n_tokens as f32 * 0.95) as usize;
+    let train_toks = &tokens[..split];
+    let val_toks = &tokens[split..];
+    let comp = corpus.len() as f32 / n_tokens as f32;
 
-    let mut rng = StdRng::seed_from_u64(cli.seed);
-    let (mut net_init, start_epoch) =
-        load_or_init_net(&cli.checkpoint, actual_vocab, cli.hidden, cli.n_layers, &mut rng);
-    let resumed = start_epoch > 0;
-
-    if cli.sdsa {
-        net_init.enable_sdsa(&mut rng);
-    }
-    if cli.adlif {
-        net_init.enable_adlif();
-    }
-    let apop_config_opt = match build_apoptosis_config(&cli, cli.n_layers) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("apoptosis config error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Some(cfg) = apop_config_opt.clone() {
-        net_init.enable_apoptosis(cfg);
-    }
-
-    enum Backend {
-        Gpu(MultiLayerGatedSnnGpu, String),
-        Cpu(MultiLayerGatedSnn, String),
-    }
-    let mut backend = if cli.cpu {
-        Backend::Cpu(net_init, "CPU (rayon)".to_string())
-    } else {
-        let ctx = match GpuContext::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("GPU init failed: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let name = ctx.adapter_info().name;
-        Backend::Gpu(MultiLayerGatedSnnGpu::from_cpu(&net_init, ctx), name)
-    };
-    let backend_name = match &backend {
-        Backend::Gpu(_, n) => n.clone(),
-        Backend::Cpu(_, n) => n.clone(),
-    };
+    // Net + start_epoch (0 unless we resumed from a checkpoint).
+    let (mut backend, start_epoch) = build_backend(&cli, actual_vocab);
 
     let adam = AdamConfig {
         lr: cli.lr,
         ..AdamConfig::default()
     };
 
-    // Sprint 36: structured metrics output. Defaults to
-    // `logs/<ckpt_stem>_<unix_ts>.jsonl`; pass `--metrics path.jsonl`
-    // to override or `/dev/null` to disable.
     let metrics_path = cli.metrics.clone().unwrap_or_else(|| {
         let stem = cli
-            .checkpoint
+            .corpus
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("aurora_train");
+            .unwrap_or("aurora");
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -503,38 +372,38 @@ fn main() -> ExitCode {
             None
         }
     };
+    let backend_name = backend.name();
     if let Some(m) = metrics.as_mut() {
-        m.run_meta(
-            &cli,
-            corpus.len(),
-            tokens.len(),
-            actual_vocab,
-            start_epoch,
-            &backend_name,
-        );
+        m.run_meta(&cli, corpus.len(), n_tokens, actual_vocab, backend_name);
     }
 
     print_header(
         &cli,
         corpus.len(),
-        tokens.len(),
+        n_tokens,
         actual_vocab,
-        n_train,
+        train_toks.len(),
         val_toks.len(),
         encode_s,
+        backend_name,
         start_epoch,
-        resumed,
-        &backend_name,
     );
 
     let total_start = Instant::now();
     let mut best_val = f32::INFINITY;
-    let h = cli.hidden;
-    type StateTuple = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+    let mut train_history: Vec<(f32, f32)> = Vec::new();
+    let mut val_history: Vec<(f32, f32)> = Vec::new();
+    let mut chunks_seen: u64 = 0;
+
+    let bar_template = "  [{bar:32.cyan/blue}] {percent:>3}%  bpb {msg}  ({elapsed:>4} / ETA {eta:>4})";
+    let bar_style = ProgressStyle::with_template(bar_template)
+        .expect("static template parses")
+        .progress_chars("█·");
+
+    let mut rng = StdRng::seed_from_u64(cli.seed);
 
     for epoch in start_epoch..cli.epochs as u32 {
         let epoch_start = Instant::now();
-        epoch_open(epoch);
 
         let stream_len = train_toks.len() / BATCH_SIZE;
         let n_chunks_per_stream = stream_len.saturating_sub(1) / cli.chunk;
@@ -542,21 +411,12 @@ fn main() -> ExitCode {
         let mut total_nats = 0.0_f32;
         let mut total_tokens = 0_usize;
 
-        // Per-backend state allocation. CPU uses `Vec<GatedState>`,
-        // GPU uses a flat 4-tuple (l0_h_v_after, l0_h_spike, l1_h_v_after, l1_h_spike).
-        let mut gpu_states: Vec<StateTuple> = Vec::new();
-        let mut cpu_states: Vec<Vec<aurora::snn_gated::GatedState>> = Vec::new();
-        match &backend {
-            Backend::Gpu(_, _) => {
-                gpu_states = (0..BATCH_SIZE)
-                    .map(|_| (vec![0.0; h], vec![0.0; h], vec![0.0; h], vec![0.0; h]))
-                    .collect();
-            }
-            Backend::Cpu(net, _) => {
-                cpu_states = (0..BATCH_SIZE).map(|_| net.fresh_states()).collect();
-            }
-        }
+        println!("\n  epoch {}/{}", epoch + 1, cli.epochs);
+        let pb = ProgressBar::new(n_chunks_per_stream as u64).with_style(bar_style.clone());
+        pb.set_message("·");
 
+        let mut states: Vec<Vec<LnnState>> =
+            (0..BATCH_SIZE).map(|_| backend.fresh_states()).collect();
         let mut inputs_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
         let mut targets_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
 
@@ -569,156 +429,187 @@ fn main() -> ExitCode {
                 inputs_owned.push(&train_toks[p..p + cli.chunk]);
                 targets_owned.push(&train_toks[p + 1..p + cli.chunk + 1]);
             }
-            let loss = match &mut backend {
-                Backend::Gpu(net_gpu, _) => {
-                    net_gpu.zero_grad_gpu();
-                    let l = net_gpu.forward_backward_batch_gpu_multi_fused_tokens(
-                        &inputs_owned,
-                        &targets_owned,
-                        &mut gpu_states,
-                    );
-                    net_gpu.clip_grads_gpu(GRAD_CLIP);
-                    net_gpu.step_adam_gpu(&adam);
-                    l
-                }
-                Backend::Cpu(net, _) => {
-                    net.zero_grad();
-                    let (l, rates_opt) = if net.apoptosis.is_some() {
-                        let (loss, rates) = net
-                            .forward_backward_batch_tokens_stateful_with_rates(
-                                &inputs_owned,
-                                &targets_owned,
-                                &mut cpu_states,
-                            );
-                        (loss, Some(rates))
-                    } else {
-                        let loss = net.forward_backward_batch_tokens_stateful(
-                            &inputs_owned,
-                            &targets_owned,
-                            &mut cpu_states,
-                        );
-                        (loss, None)
-                    };
-                    // Sprint 43: trophic signal must be read from raw
-                    // grads before clip_grads scales them.
-                    let trophic_opt = match net
-                        .apoptosis
-                        .as_ref()
-                        .map(|a| a.config.mode.clone())
-                    {
-                        Some(aurora::apoptosis::ApoptosisMode::Trophic { .. }) => {
-                            Some(net.trophic_signal_from_grads())
-                        }
-                        _ => None,
-                    };
-                    net.clip_grads(GRAD_CLIP);
-                    net.step_adam(&adam);
-                    if let Some(apop) = net.apoptosis.as_mut() {
-                        let signal = trophic_opt
-                            .or(rates_opt)
-                            .expect("apoptosis on requires either rates or trophic");
-                        apop.observe_rates(&signal);
-                        apop.tick();
-                        let kills = apop.maybe_kill(&mut rng);
-                        if !kills.is_empty() {
-                            if let Some(m) = metrics.as_mut() {
-                                for k in &kills {
-                                    m.apoptosis_kill(epoch, k);
-                                }
-                            }
-                        }
-                        if !kills.is_empty()
-                            || apop.chunks_seen.is_multiple_of(apop.config.check_interval)
-                        {
-                            let dead: Vec<usize> = (0..apop.dead_mask.len())
-                                .map(|li| apop.dead_count(li))
-                                .collect();
-                            if let Some(m) = metrics.as_mut() {
-                                m.apoptosis_state(
-                                    epoch,
-                                    apop.chunks_seen,
-                                    &dead,
-                                );
-                            }
-                        }
-                    }
-                    l
-                }
-            };
+            let loss = backend.forward_backward_chunk(
+                &inputs_owned,
+                &targets_owned,
+                &mut states,
+                &adam,
+            );
             total_nats += loss;
             total_tokens += cli.chunk * BATCH_SIZE;
+            chunks_seen += 1;
+            pb.inc(1);
 
-            if (chunk_idx + 1).is_multiple_of(report_every) {
-                let frac = (chunk_idx + 1) as f64 / n_chunks_per_stream as f64;
+            if (chunk_idx + 1) % report_every == 0 {
                 let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
+                pb.set_message(format!("{bpb:.3}"));
                 let elapsed = epoch_start.elapsed().as_secs_f64();
-                epoch_progress(frac, bpb, elapsed);
+                train_history.push((chunks_seen as f32, bpb));
                 if let Some(m) = metrics.as_mut() {
                     m.chunk(epoch, chunk_idx + 1, bpb, elapsed);
+                }
+                if pb.is_hidden() {
+                    let pct = ((chunk_idx + 1) as f64 / n_chunks_per_stream as f64) * 100.0;
+                    println!("  [{pct:>5.1}%]  bpb {bpb:.3}  ({elapsed:>5.1}s)");
                 }
             }
         }
 
-        let train_bpb =
-            bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
-        let net_snapshot = match &backend {
-            Backend::Gpu(net_gpu, _) => net_gpu.to_cpu(),
-            Backend::Cpu(net, _) => net.clone(),
-        };
-        let (val_bpb, rates, mem) = evaluate(&net_snapshot, val_toks, cli.chunk, comp);
+        let train_bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
+        pb.finish_with_message(format!("{train_bpb:.3}"));
+
+        // Snapshot CPU view for evaluation / sampling / checkpointing.
+        let net_cpu = backend.cpu_snapshot();
+        let (val_bpb, activity, alpha_stats) = evaluate_lnn(&net_cpu, val_toks, cli.chunk, comp);
         if val_bpb < best_val {
             best_val = val_bpb;
         }
+        val_history.push((chunks_seen as f32, val_bpb));
         let epoch_elapsed = epoch_start.elapsed().as_secs_f64();
-        epoch_done(train_bpb, val_bpb, epoch_elapsed);
-        let alphas: Vec<f32> = net_snapshot.layers.iter().map(|l| l.alpha).collect();
-        epoch_diagnostics(&rates, &alphas, &mem);
+        let tau_means: Vec<f32> = net_cpu
+            .layers
+            .iter()
+            .map(|l| {
+                let n = l.log_tau.len() as f32;
+                if n == 0.0 {
+                    0.0
+                } else {
+                    l.log_tau.iter().map(|v| v.exp()).sum::<f32>() / n
+                }
+            })
+            .collect();
+        println!(
+            "  done — train {train_bpb:.3}  val {val_bpb:.3}  ({epoch_elapsed:.1}s)"
+        );
+        epoch_diagnostics(&activity, &alpha_stats, &tau_means);
+        render_bpb_chart(&train_history, &val_history, chunks_seen);
 
         if let Some(m) = metrics.as_mut() {
-            let v_means: Vec<f32> = mem.iter().map(|(m, _)| *m).collect();
-            let v_peaks: Vec<f32> = mem.iter().map(|(_, p)| *p).collect();
+            let alpha_means: Vec<f32> = alpha_stats.iter().map(|(m, _)| *m).collect();
+            let alpha_devs: Vec<f32> = alpha_stats.iter().map(|(_, d)| *d).collect();
             m.epoch_done(
                 epoch,
                 train_bpb,
                 val_bpb,
-                &rates,
-                &alphas,
-                &v_means,
-                &v_peaks,
+                &activity,
+                &alpha_means,
+                &alpha_devs,
+                &tau_means,
                 epoch_elapsed,
             );
         }
 
-        if let Err(e) = checkpoint::save(&cli.checkpoint, &net_snapshot, epoch + 1) {
-            eprintln!("⚠ checkpoint save failed: {e}");
-        } else {
-            println!(
-                "{}",
-                line(&format!(" checkpoint saved → {}", cli.checkpoint.display()))
-            );
-            if let Some(m) = metrics.as_mut() {
-                m.checkpoint(epoch + 1, &cli.checkpoint);
+        if let Some(ckpt_path) = cli.checkpoint.as_ref() {
+            if let Err(e) = checkpoint::save(ckpt_path, &net_cpu, epoch + 1) {
+                eprintln!("⚠ checkpoint save failed ({e})");
+            } else {
+                println!("  ckpt → {} (epoch {})", ckpt_path.display(), epoch + 1);
+                if let Some(m) = metrics.as_mut() {
+                    m.checkpoint(epoch + 1, ckpt_path);
+                }
             }
         }
-        epoch_close();
 
         let seed_tokens: Vec<u32> = val_toks.iter().take(16).copied().collect();
-        let sample_tokens = generate(
-            &net_snapshot,
-            &seed_tokens,
-            SAMPLE_LEN,
-            SAMPLE_TEMP,
-            actual_vocab,
-            &mut rng,
-        );
+        if seed_tokens.is_empty() {
+            continue;
+        }
+        let sample_tokens =
+            generate(&net_cpu, &seed_tokens, SAMPLE_LEN, SAMPLE_TEMP, actual_vocab, &mut rng);
         let seed_bytes = bpe.decode(&seed_tokens);
         let sample_bytes = bpe.decode(&sample_tokens);
         sample_block(&seed_bytes, &sample_bytes);
     }
 
-    let val_bytes_est = corpus.len().saturating_sub(n_train * corpus.len() / tokens.len());
+    let val_bytes_est = corpus.len().saturating_sub(split * corpus.len() / n_tokens);
     print_footer(best_val, total_start.elapsed().as_secs_f64(), val_bytes_est);
     ExitCode::SUCCESS
+}
+
+fn build_backend(cli: &Cli, actual_vocab: usize) -> (Backend, u32) {
+    let mut rng = StdRng::seed_from_u64(cli.seed);
+    let hidden_dims = vec![cli.hidden; cli.layers];
+    // M-LTC: only the *top* layer gets memory neurons. Lower layers stay
+    // as fast/sensory CfC.
+    let n_mem_top = ((cli.hidden as f32) * cli.memory_frac).round() as usize;
+    let mut n_memory_per_layer = vec![0_usize; cli.layers];
+    if cli.memory_frac > 0.0 {
+        if let Some(last) = n_memory_per_layer.last_mut() {
+            *last = n_mem_top.min(cli.hidden);
+        }
+    }
+    let n_memory_per_layer_for_closure = n_memory_per_layer.clone();
+    let mut fresh_net = || {
+        MultiLayerLnnSnn::new_with_memory(
+            actual_vocab,
+            &hidden_dims,
+            &n_memory_per_layer_for_closure,
+            actual_vocab,
+            cli.tau_init,
+            cli.tau_mem_init,
+            &mut rng,
+        )
+    };
+
+    let (cpu_net, start_epoch) = match cli.checkpoint.as_ref().filter(|p| p.exists()) {
+        Some(path) => match checkpoint::load(path) {
+            Ok(c) => {
+                let arch_ok = c.net.n_input == actual_vocab
+                    && c.net.n_output == actual_vocab
+                    && c.net.layers.len() == cli.layers
+                    && c.net.layers.iter().all(|l| l.n_hidden == cli.hidden);
+                if arch_ok {
+                    println!("loaded checkpoint {} (epoch {})", path.display(), c.epoch);
+                    (c.net, c.epoch)
+                } else {
+                    eprintln!(
+                        "⚠ checkpoint at {} has different architecture; starting fresh",
+                        path.display()
+                    );
+                    (fresh_net(), 0)
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠ checkpoint at {} failed to load ({e}); starting fresh",
+                    path.display()
+                );
+                (fresh_net(), 0)
+            }
+        },
+        None => (fresh_net(), 0),
+    };
+
+    if cli.cpu {
+        return (Backend::Cpu(cpu_net), start_epoch);
+    }
+
+    #[cfg(feature = "gpu")]
+    {
+        match GpuContext::new() {
+            Ok(ctx) => {
+                let info = ctx.adapter_info();
+                println!(
+                    "GPU adapter: {} ({:?}, {:?})",
+                    info.name, info.device_type, info.backend
+                );
+                return (
+                    Backend::Gpu(MultiLayerLnnSnnGpu::from_cpu(&cpu_net, ctx)),
+                    start_epoch,
+                );
+            }
+            Err(e) => {
+                eprintln!("⚠ GPU init failed ({e}); falling back to CPU");
+                return (Backend::Cpu(cpu_net), start_epoch);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    {
+        eprintln!("note: built without `gpu` feature — using CPU backend");
+        (Backend::Cpu(cpu_net), start_epoch)
+    }
 }
 
 fn load_or_train_bpe(
@@ -758,191 +649,8 @@ fn load_or_train_bpe(
     }
 }
 
-/// Sprint 46: SSM training path — minimal mirror of the gated path
-/// that runs `MultiLayerSsmSnn`. No checkpointing, no sampling, no
-/// SDSA/AdLIF/apoptosis — focused on the cell-architecture A/B.
-fn run_ssm(
-    cli: &Cli,
-    corpus_bytes: usize,
-    n_tokens: usize,
-    actual_vocab: usize,
-    train_toks: &[u32],
-    val_toks: &[u32],
-    encode_s: f64,
-    comp: f32,
-) -> ExitCode {
-    use aurora::ssm::{MultiLayerSsmSnn, SsmState};
-
-    let mut rng = StdRng::seed_from_u64(cli.seed);
-    let hidden_dims: Vec<usize> = vec![cli.hidden; cli.n_layers];
-    let mut net = if let Some(spec) = &cli.ssm_spectrum {
-        let parts: Vec<&str> = spec.split(',').collect();
-        if parts.len() != 2 {
-            eprintln!("--ssm-spectrum expects 'a_lo,a_hi', got '{spec}'");
-            return ExitCode::FAILURE;
-        }
-        let a_lo: f32 = match parts[0].trim().parse() {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("--ssm-spectrum a_lo parse: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let a_hi: f32 = match parts[1].trim().parse() {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("--ssm-spectrum a_hi parse: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        MultiLayerSsmSnn::new_with_spectrum(
-            actual_vocab,
-            &hidden_dims,
-            actual_vocab,
-            SpikeFn::default(),
-            a_lo,
-            a_hi,
-            &mut rng,
-        )
-    } else {
-        MultiLayerSsmSnn::new_with_a_spread(
-            actual_vocab,
-            &hidden_dims,
-            actual_vocab,
-            SpikeFn::default(),
-            cli.ssm_a_init,
-            cli.ssm_a_spread,
-            &mut rng,
-        )
-    };
-    net.continuous = cli.ssm_continuous;
-    let backend_name = "CPU SSM (rayon)".to_string();
-
-    let adam = AdamConfig {
-        lr: cli.lr,
-        ..AdamConfig::default()
-    };
-
-    let metrics_path = cli.metrics.clone().unwrap_or_else(|| {
-        let stem = cli
-            .checkpoint
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("aurora_train_ssm");
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        PathBuf::from(format!("logs/{stem}_{ts}.jsonl"))
-    });
-    let mut metrics = match MetricsWriter::open(&metrics_path) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            eprintln!("⚠ metrics log open failed ({e}); continuing without metrics");
-            None
-        }
-    };
-    if let Some(m) = metrics.as_mut() {
-        m.run_meta(cli, corpus_bytes, n_tokens, actual_vocab, 0, &backend_name);
-    }
-
-    print_header(
-        cli,
-        corpus_bytes,
-        n_tokens,
-        actual_vocab,
-        train_toks.len(),
-        val_toks.len(),
-        encode_s,
-        0,
-        false,
-        &backend_name,
-    );
-
-    let total_start = Instant::now();
-    let mut best_val = f32::INFINITY;
-
-    for epoch in 0..cli.epochs as u32 {
-        let epoch_start = Instant::now();
-        epoch_open(epoch);
-
-        let stream_len = train_toks.len() / BATCH_SIZE;
-        let n_chunks_per_stream = stream_len.saturating_sub(1) / cli.chunk;
-        let report_every = (n_chunks_per_stream / 50).max(1);
-        let mut total_nats = 0.0_f32;
-        let mut total_tokens = 0_usize;
-
-        let mut states: Vec<Vec<SsmState>> =
-            (0..BATCH_SIZE).map(|_| net.fresh_states()).collect();
-        let mut inputs_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
-        let mut targets_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
-
-        for chunk_idx in 0..n_chunks_per_stream {
-            inputs_owned.clear();
-            targets_owned.clear();
-            for b in 0..BATCH_SIZE {
-                let stream_start = b * stream_len;
-                let p = stream_start + chunk_idx * cli.chunk;
-                inputs_owned.push(&train_toks[p..p + cli.chunk]);
-                targets_owned.push(&train_toks[p + 1..p + cli.chunk + 1]);
-            }
-            net.zero_grad();
-            let loss = net.forward_backward_batch_tokens_stateful(
-                &inputs_owned,
-                &targets_owned,
-                &mut states,
-            );
-            net.clip_grads(GRAD_CLIP);
-            net.step_adam(&adam);
-            total_nats += loss;
-            total_tokens += cli.chunk * BATCH_SIZE;
-
-            if (chunk_idx + 1).is_multiple_of(report_every) {
-                let frac = (chunk_idx + 1) as f64 / n_chunks_per_stream as f64;
-                let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
-                let elapsed = epoch_start.elapsed().as_secs_f64();
-                epoch_progress(frac, bpb, elapsed);
-                if let Some(m) = metrics.as_mut() {
-                    m.chunk(epoch, chunk_idx + 1, bpb, elapsed);
-                }
-            }
-        }
-
-        let train_bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
-        let (val_bpb, rates, mem) = evaluate_ssm(&net, val_toks, cli.chunk, comp);
-        if val_bpb < best_val {
-            best_val = val_bpb;
-        }
-        let epoch_elapsed = epoch_start.elapsed().as_secs_f64();
-        epoch_done(train_bpb, val_bpb, epoch_elapsed);
-        let alphas: Vec<f32> = net.layers.iter().map(|l| l.alpha).collect();
-        epoch_diagnostics(&rates, &alphas, &mem);
-
-        if let Some(m) = metrics.as_mut() {
-            let v_means: Vec<f32> = mem.iter().map(|(m, _)| *m).collect();
-            let v_peaks: Vec<f32> = mem.iter().map(|(_, p)| *p).collect();
-            m.epoch_done(
-                epoch,
-                train_bpb,
-                val_bpb,
-                &rates,
-                &alphas,
-                &v_means,
-                &v_peaks,
-                epoch_elapsed,
-            );
-        }
-        epoch_close();
-    }
-
-    let val_bytes_est = corpus_bytes
-        .saturating_sub(((train_toks.len()) * corpus_bytes) / n_tokens);
-    print_footer(best_val, total_start.elapsed().as_secs_f64(), val_bytes_est);
-    ExitCode::SUCCESS
-}
-
-fn evaluate_ssm(
-    net: &aurora::ssm::MultiLayerSsmSnn,
+fn evaluate_lnn(
+    net: &MultiLayerLnnSnn,
     val_toks: &[u32],
     chunk: usize,
     comp: f32,
@@ -957,8 +665,8 @@ fn evaluate_ssm(
     let mut states = net.fresh_states();
     let mut total_nats = 0.0_f32;
     let mut total_tokens = 0_usize;
-    let mut rate_acc = vec![0.0_f32; net.layers.len()];
-    let mut mem_acc: Vec<(f32, f32)> = vec![(0.0, f32::NEG_INFINITY); net.layers.len()];
+    let mut activity_acc = vec![0.0_f32; net.layers.len()];
+    let mut alpha_acc: Vec<(f32, f32)> = vec![(0.0, 0.0); net.layers.len()];
     let mut chunks_seen = 0_usize;
     let mut pos = 0;
     while pos + chunk < val_toks.len() {
@@ -966,188 +674,40 @@ fn evaluate_ssm(
         let targets = &val_toks[pos + 1..pos + chunk + 1];
         let cache = net.forward_lm_tokens_stateful(inputs, &mut states);
         for (logits_t, &target) in cache.logits.iter().zip(targets.iter()) {
-            let max = logits_t.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let log_sum_exp =
-                max + logits_t.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
-            total_nats += log_sum_exp - logits_t[target as usize];
+            total_nats += cross_entropy_loss(logits_t, target as usize);
         }
-        for (acc, r) in rate_acc.iter_mut().zip(cache.firing_rates()) {
-            *acc += r;
+        for (acc, a) in activity_acc.iter_mut().zip(cache.activity()) {
+            *acc += a;
         }
-        for (acc, (m, p)) in mem_acc.iter_mut().zip(cache.membrane_stats()) {
+        for (acc, (m, d)) in alpha_acc.iter_mut().zip(cache.alpha_stats()) {
             acc.0 += m;
-            if p > acc.1 {
-                acc.1 = p;
+            if d > acc.1 {
+                acc.1 = d;
             }
         }
         chunks_seen += 1;
         total_tokens += chunk;
         pos += chunk;
     }
-    let mean_rates: Vec<f32> = rate_acc
+    let mean_activity: Vec<f32> = activity_acc
         .into_iter()
         .map(|s| if chunks_seen == 0 { 0.0 } else { s / chunks_seen as f32 })
         .collect();
-    let mean_mem: Vec<(f32, f32)> = mem_acc
+    let mean_alpha: Vec<(f32, f32)> = alpha_acc
         .into_iter()
-        .map(|(m, p)| {
+        .map(|(m, d)| {
             (
                 if chunks_seen == 0 { 0.0 } else { m / chunks_seen as f32 },
-                p,
+                d,
             )
         })
         .collect();
     let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
-    (bpb, mean_rates, mean_mem)
-}
-
-fn build_apoptosis_config(cli: &Cli, n_layers: usize) -> Result<Option<ApoptosisConfig>, String> {
-    let mode = match cli.apoptosis_mode.as_str() {
-        "off" => return Ok(None),
-        "activity" => ApoptosisMode::Activity,
-        "trophic" => ApoptosisMode::Trophic {
-            frac: cli.apop_trophic_frac,
-            kill_rate: cli.apop_trophic_rate,
-            max_dead_frac: cli.apop_trophic_max_dead,
-        },
-        "random" => {
-            let s = cli
-                .apop_counts
-                .as_deref()
-                .ok_or("--apoptosis random needs --apoptosis-counts")?;
-            let counts: Vec<usize> = s
-                .split(',')
-                .map(|p| p.trim().parse::<usize>())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("--apoptosis-counts parse: {e}"))?;
-            if counts.len() != n_layers {
-                return Err(format!(
-                    "--apoptosis-counts has {} entries but --n-layers={n_layers}",
-                    counts.len()
-                ));
-            }
-            ApoptosisMode::RandomFixed {
-                per_layer_counts: counts,
-            }
-        }
-        other => return Err(format!("unknown mode '{other}'")),
-    };
-    Ok(Some(ApoptosisConfig {
-        mode,
-        warmup_chunks: cli.apop_warmup,
-        ema_alpha: cli.apop_ema,
-        kill_threshold: cli.apop_threshold,
-        check_interval: cli.apop_check,
-    }))
-}
-
-fn load_or_init_net(
-    path: &Path,
-    vocab: usize,
-    hidden: usize,
-    n_layers: usize,
-    rng: &mut StdRng,
-) -> (MultiLayerGatedSnn, u32) {
-    if path.exists() {
-        match checkpoint::load(path) {
-            Ok(Checkpoint { net, epoch }) => {
-                let arch_ok = net.n_input == vocab
-                    && net.n_output == vocab
-                    && net.layers.len() == n_layers
-                    && net.layers.iter().all(|l| l.n_hidden == hidden);
-                if arch_ok {
-                    println!(
-                        "resumed from {} (completed epochs: {epoch})",
-                        path.display()
-                    );
-                    return (net, epoch);
-                }
-                eprintln!(
-                    "checkpoint at {} has different architecture; starting fresh",
-                    path.display()
-                );
-            }
-            Err(e) => {
-                eprintln!("checkpoint load failed: {e}; starting fresh");
-            }
-        }
-    }
-    let hidden_dims: Vec<usize> = vec![hidden; n_layers];
-    let net = MultiLayerGatedSnn::new(
-        vocab,
-        &hidden_dims,
-        vocab,
-        SpikeFn::default(),
-        rng,
-    );
-    (net, 0)
-}
-
-fn evaluate(
-    net: &MultiLayerGatedSnn,
-    val_toks: &[u32],
-    chunk: usize,
-    comp: f32,
-) -> (f32, Vec<f32>, Vec<(f32, f32)>) {
-    if val_toks.len() < chunk + 1 {
-        return (
-            f32::INFINITY,
-            vec![0.0; net.layers.len()],
-            vec![(0.0, 0.0); net.layers.len()],
-        );
-    }
-    // Stateful eval: carry hidden state across val chunks so the
-    // firing-rate measurement reflects accumulated dynamics, not just
-    // the first 64 timesteps from a cold start.
-    let mut states = net.fresh_states();
-    let mut total_nats = 0.0_f32;
-    let mut total_tokens = 0_usize;
-    let mut rate_acc = vec![0.0_f32; net.layers.len()];
-    let mut mem_acc: Vec<(f32, f32)> = vec![(0.0, f32::NEG_INFINITY); net.layers.len()];
-    let mut chunks_seen = 0_usize;
-    let mut pos = 0;
-    while pos + chunk < val_toks.len() {
-        let inputs = &val_toks[pos..pos + chunk];
-        let targets = &val_toks[pos + 1..pos + chunk + 1];
-        let cache = net.forward_lm_tokens_stateful(inputs, &mut states);
-        for (logits_t, &target) in cache.logits.iter().zip(targets.iter()) {
-            let max = logits_t.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let log_sum_exp =
-                max + logits_t.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
-            total_nats += log_sum_exp - logits_t[target as usize];
-        }
-        for (acc, r) in rate_acc.iter_mut().zip(cache.firing_rates()) {
-            *acc += r;
-        }
-        for (acc, (m, p)) in mem_acc.iter_mut().zip(cache.membrane_stats()) {
-            acc.0 += m;
-            if p > acc.1 {
-                acc.1 = p;
-            }
-        }
-        chunks_seen += 1;
-        total_tokens += chunk;
-        pos += chunk;
-    }
-    let mean_rates: Vec<f32> = rate_acc
-        .into_iter()
-        .map(|s| if chunks_seen == 0 { 0.0 } else { s / chunks_seen as f32 })
-        .collect();
-    let mean_mem: Vec<(f32, f32)> = mem_acc
-        .into_iter()
-        .map(|(m, p)| {
-            (
-                if chunks_seen == 0 { 0.0 } else { m / chunks_seen as f32 },
-                p,
-            )
-        })
-        .collect();
-    let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
-    (bpb, mean_rates, mean_mem)
+    (bpb, mean_activity, mean_alpha)
 }
 
 fn generate(
-    net: &MultiLayerGatedSnn,
+    net: &MultiLayerLnnSnn,
     seed: &[u32],
     n: usize,
     temperature: f32,
@@ -1171,8 +731,6 @@ fn generate(
     out
 }
 
-const BOX_WIDTH: usize = 60;
-
 #[allow(clippy::too_many_arguments)]
 fn print_header(
     cli: &Cli,
@@ -1182,18 +740,13 @@ fn print_header(
     n_train: usize,
     n_val: usize,
     encode_s: f64,
-    start_epoch: u32,
-    resumed: bool,
     backend: &str,
+    start_epoch: u32,
 ) {
     let bar_h = "═".repeat(BOX_WIDTH);
     println!("╔{bar_h}╗");
-    let title = if cli.sdsa {
-        "Aurora · 2-layer gated SNN · BPE · SDSA"
-    } else {
-        "Aurora · 2-layer gated SNN · BPE"
-    };
-    println!("{}", center(title));
+    let title = format!("Aurora · {}-layer LNN-CfC · BPE", cli.layers);
+    println!("{}", center(&title));
     println!("╠{bar_h}╣");
     println!("{}", kv("backend", backend));
     println!(
@@ -1218,9 +771,9 @@ fn print_header(
         kv("split", &format!("{n_train} train / {n_val} val toks"))
     );
     let arch = format!(
-        "{vocab} → ({hidden} × {n_layers} layers) → {vocab}",
+        "{vocab} → ({hidden} × {layers} layers) → {vocab}",
         hidden = cli.hidden,
-        n_layers = cli.n_layers,
+        layers = cli.layers,
     );
     println!("{}", kv("architecture", &arch));
     println!("{}", kv("chunk (BPTT toks)", &format!("{}", cli.chunk)));
@@ -1233,12 +786,25 @@ fn print_header(
     );
     println!(
         "{}",
-        kv(
-            "epochs",
-            &format!("{start_epoch} → {} ({})", cli.epochs, if resumed { "resumed" } else { "fresh" })
-        )
+        kv("tau init", &format!("log_tau = {:.2}", cli.tau_init))
     );
-    println!("{}", kv("checkpoint", &cli.checkpoint.display().to_string()));
+    if cli.memory_frac > 0.0 {
+        let n_mem = ((cli.hidden as f32) * cli.memory_frac).round() as usize;
+        println!(
+            "{}",
+            kv(
+                "M-LTC top layer",
+                &format!(
+                    "{n_mem}/{} memory neurons (sin), log_tau_mem = {:.2}",
+                    cli.hidden, cli.tau_mem_init
+                )
+            )
+        );
+    }
+    println!(
+        "{}",
+        kv("epochs", &format!("{} → {}", start_epoch, cli.epochs))
+    );
     println!("╚{bar_h}╝");
 }
 
@@ -1260,55 +826,41 @@ fn print_footer(best_val: f32, elapsed_s: f64, val_bytes_est: usize) {
     println!("╚{bar_h}╝");
 }
 
-fn epoch_open(epoch: u32) {
-    let label = format!(" epoch {epoch} ");
-    let dashes = BOX_WIDTH.saturating_sub(label.chars().count());
-    println!("\n┌{label}{}┐", "─".repeat(dashes));
-}
-fn epoch_close() {
-    println!("└{}┘", "─".repeat(BOX_WIDTH));
-}
-fn epoch_progress(frac: f64, bpb: f32, elapsed: f64) {
-    let bar = render_bar(frac, 16);
-    let body = format!(
-        " {bar} {:>5.1}%  bpb {:>5.3}  ({:>5.1}s)",
-        frac * 100.0,
-        bpb,
-        elapsed
-    );
-    println!("{}", line(&body));
-}
-fn epoch_done(train: f32, val: f32, elapsed: f64) {
-    let body = format!(
-        " epoch done — train bpb {train:>5.3}  val bpb {val:>5.3}  ({elapsed:>5.1}s)"
-    );
-    println!("{}", line(&body));
-}
-
-/// Sprint 30/31: per-layer health diagnostics. Healthy rates land in
-/// 0.05–0.20; if `mem` peak stays well below θ=1.0, the layer is dead
-/// (gradient signal blocked at the surrogate).
-fn epoch_diagnostics(rates: &[f32], alphas: &[f32], mem: &[(f32, f32)]) {
-    let rates_s = rates
+fn epoch_diagnostics(activity: &[f32], alpha_stats: &[(f32, f32)], tau_means: &[f32]) {
+    let act_s = activity
         .iter()
         .map(|r| format!("{r:.4}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let alphas_s = alphas
+    let alpha_s = alpha_stats
         .iter()
-        .map(|a| format!("{a:.2}"))
+        .map(|(m, d)| format!("{m:.3}±{d:.2}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let mem_s = mem
+    let tau_s = tau_means
         .iter()
-        .map(|(m, p)| format!("{m:+.3}/{p:+.2}"))
+        .map(|t| format!("{t:.2}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let body = format!(" rates [{rates_s}]  α [{alphas_s}]");
-    println!("{}", line(&body));
-    let body2 = format!(" v mean/peak [{mem_s}]");
-    println!("{}", line(&body2));
+    println!("  |x| [{act_s}]  α [{alpha_s}]  τ [{tau_s}]");
 }
+
+fn render_bpb_chart(
+    train_history: &[(f32, f32)],
+    val_history: &[(f32, f32)],
+    chunks_seen: u64,
+) {
+    if train_history.len() < 2 {
+        return;
+    }
+    let x_max = chunks_seen.max(1) as f32;
+    println!("  bpb history (— train, • val per epoch)");
+    Chart::new(72, 20, 0.0, x_max)
+        .lineplot(&Shape::Lines(train_history))
+        .lineplot(&Shape::Points(val_history))
+        .display();
+}
+
 fn sample_block(seed: &[u8], generated: &[u8]) {
     let bar_h = "─".repeat(BOX_WIDTH);
     println!("┌{bar_h}┐");
@@ -1339,28 +891,10 @@ fn center(text: &str) -> String {
     let right = width.saturating_sub(len + left);
     format!("║{}{text}{}║", " ".repeat(left), " ".repeat(right))
 }
-fn render_bar(frac: f64, width: usize) -> String {
-    let filled = ((frac * width as f64).round() as usize).min(width);
-    let mut s = String::with_capacity(width + 2);
-    s.push('[');
-    for i in 0..width {
-        s.push(if i < filled { '█' } else { '·' });
-    }
-    s.push(']');
-    s
-}
 
 // =====================================================================
-// Sprint 36: structured metrics writer (JSON Lines).
-//
-// One JSON object per line. Schema is hand-rolled to avoid a serde_json
-// dep — strings are static (no escaping needed beyond `\n` in samples)
-// and numbers are float-formatted with `{}` (NaN/Inf become "NaN"/"inf"
-// strings, deliberately invalid JSON so analysis script flags them).
+// Hand-rolled JSONL metrics writer (no serde_json dep).
 // =====================================================================
-
-use std::fs::File;
-use std::io::{BufWriter, Write};
 
 struct MetricsWriter {
     out: BufWriter<File>,
@@ -1383,19 +917,21 @@ impl MetricsWriter {
         corpus_bytes: usize,
         n_tokens: usize,
         actual_vocab: usize,
-        start_epoch: u32,
-        gpu_name: &str,
+        backend: &str,
     ) {
         let _ = writeln!(
             self.out,
-            r#"{{"event":"run","corpus":{corpus:?},"corpus_bytes":{corpus_bytes},"n_tokens":{n_tokens},"vocab":{actual_vocab},"hidden":{hidden},"chunk":{chunk},"lr":{lr},"epochs":{epochs},"start_epoch":{start_epoch},"checkpoint":{ckpt:?},"gpu":{gpu:?}}}"#,
+            r#"{{"event":"run","cell":"lnn-cfc","corpus":{corpus:?},"corpus_bytes":{corpus_bytes},"n_tokens":{n_tokens},"vocab":{actual_vocab},"hidden":{hidden},"layers":{layers},"chunk":{chunk},"lr":{lr},"tau_init":{tau_init},"memory_frac":{memory_frac},"tau_mem_init":{tau_mem_init},"epochs":{epochs},"seed":{seed},"backend":{backend:?}}}"#,
             corpus = cli.corpus.display().to_string(),
             hidden = cli.hidden,
+            layers = cli.layers,
             chunk = cli.chunk,
             lr = format_finite(cli.lr),
+            tau_init = format_finite(cli.tau_init),
+            memory_frac = format_finite(cli.memory_frac),
+            tau_mem_init = format_finite(cli.tau_mem_init),
             epochs = cli.epochs,
-            ckpt = cli.checkpoint.display().to_string(),
-            gpu = gpu_name,
+            seed = cli.seed,
         );
         let _ = self.out.flush();
     }
@@ -1407,8 +943,6 @@ impl MetricsWriter {
             bpb = format_finite(train_bpb),
             elapsed = elapsed_s,
         );
-        // Flush so `tail -f` reflects training progress with sub-second
-        // lag and SIGTERM-killed runs leave a usable JSONL trail.
         let _ = self.out.flush();
     }
 
@@ -1418,51 +952,22 @@ impl MetricsWriter {
         epoch: u32,
         train_bpb: f32,
         val_bpb: f32,
-        rates: &[f32],
-        alphas: &[f32],
-        v_means: &[f32],
-        v_peaks: &[f32],
+        activity: &[f32],
+        alpha_means: &[f32],
+        alpha_devs: &[f32],
+        tau_means: &[f32],
         elapsed_s: f64,
     ) {
         let _ = writeln!(
             self.out,
-            r#"{{"event":"epoch_done","epoch":{epoch},"train_bpb":{train},"val_bpb":{val},"rates":{rates},"alphas":{alphas},"v_means":{v_means},"v_peaks":{v_peaks},"elapsed_s":{elapsed:.3}}}"#,
+            r#"{{"event":"epoch_done","epoch":{epoch},"train_bpb":{train},"val_bpb":{val},"activity":{activity},"alpha_means":{alpha_means},"alpha_devs":{alpha_devs},"tau_means":{tau_means},"elapsed_s":{elapsed:.3}}}"#,
             train = format_finite(train_bpb),
             val = format_finite(val_bpb),
-            rates = format_array(rates),
-            alphas = format_array(alphas),
-            v_means = format_array(v_means),
-            v_peaks = format_array(v_peaks),
+            activity = format_array(activity),
+            alpha_means = format_array(alpha_means),
+            alpha_devs = format_array(alpha_devs),
+            tau_means = format_array(tau_means),
             elapsed = elapsed_s,
-        );
-        let _ = self.out.flush();
-    }
-
-    fn apoptosis_kill(&mut self, epoch: u32, ev: &aurora::apoptosis::KillEvent) {
-        let _ = writeln!(
-            self.out,
-            r#"{{"event":"apoptosis_kill","epoch":{epoch},"chunk":{chunk},"layer":{layer},"neuron":{neuron},"rate":{rate}}}"#,
-            chunk = ev.chunk,
-            layer = ev.layer,
-            neuron = ev.neuron,
-            rate = format_finite(ev.rate_at_death),
-        );
-        let _ = self.out.flush();
-    }
-
-    fn apoptosis_state(&mut self, epoch: u32, chunk: usize, dead_per_layer: &[usize]) {
-        let mut s = String::from("[");
-        for (i, d) in dead_per_layer.iter().enumerate() {
-            if i > 0 {
-                s.push(',');
-            }
-            s.push_str(&d.to_string());
-        }
-        s.push(']');
-        let _ = writeln!(
-            self.out,
-            r#"{{"event":"apoptosis_state","epoch":{epoch},"chunk":{chunk},"dead":{dead}}}"#,
-            dead = s,
         );
         let _ = self.out.flush();
     }
@@ -1481,8 +986,6 @@ fn format_finite(v: f32) -> String {
     if v.is_finite() {
         format!("{v}")
     } else {
-        // Deliberately emit invalid JSON token so the parser fails
-        // loudly. Typical SNN training failure: NaN loss after runaway.
         format!("\"{v}\"")
     }
 }

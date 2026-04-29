@@ -256,3 +256,127 @@ fn w_f_recurrent_gradient_matches_finite_difference() {
         |n, v| n.layers[0].w_f[idx] = v,
     );
 }
+
+fn build_mltc_net(seed: u64) -> MultiLayerLnnSnn {
+    // 8-vocab, two h=4 layers, the second has 2 memory neurons (M-LTC).
+    let mut rng = StdRng::seed_from_u64(seed);
+    MultiLayerLnnSnn::new_with_memory(8, &[4, 4], &[0, 2], 8, 0.0, 1.5, &mut rng)
+}
+
+#[test]
+fn mltc_b_g_memory_neuron_grad_matches_finite_difference() {
+    // Memory neuron (layer 1, i=0): activation is sin(g_pre); deriv is
+    // cos(g_pre). This test would fail if backward used 1-g² for it.
+    let mut net = build_mltc_net(101);
+    let inputs: Vec<u32> = (0..12).map(|t| (t % 8) as u32).collect();
+    let targets: Vec<u32> = inputs.iter().map(|&t| (t + 1) % 8).collect();
+    check_grad(
+        "b_g[1][0] (memory neuron)",
+        &mut net,
+        &inputs,
+        &targets,
+        |n| n.layers[1].b_g[0],
+        |g| g.layers[1].b_g[0],
+        |n, v| n.layers[1].b_g[0] = v,
+    );
+}
+
+#[test]
+fn mltc_b_h_memory_neuron_grad_matches_finite_difference() {
+    let mut net = build_mltc_net(103);
+    let inputs: Vec<u32> = (0..12).map(|t| (t % 8) as u32).collect();
+    let targets: Vec<u32> = inputs.iter().map(|&t| (t + 1) % 8).collect();
+    check_grad(
+        "b_h[1][1] (memory neuron)",
+        &mut net,
+        &inputs,
+        &targets,
+        |n| n.layers[1].b_h[1],
+        |g| g.layers[1].b_h[1],
+        |n, v| n.layers[1].b_h[1] = v,
+    );
+}
+
+#[test]
+fn mltc_b_g_learning_neuron_grad_still_matches() {
+    // Sanity that adding memory neurons didn't break the tanh path.
+    let mut net = build_mltc_net(107);
+    let inputs: Vec<u32> = (0..12).map(|t| (t % 8) as u32).collect();
+    let targets: Vec<u32> = inputs.iter().map(|&t| (t + 1) % 8).collect();
+    check_grad(
+        "b_g[1][3] (learning neuron in M-LTC layer)",
+        &mut net,
+        &inputs,
+        &targets,
+        |n| n.layers[1].b_g[3],
+        |g| g.layers[1].b_g[3],
+        |n, v| n.layers[1].b_g[3] = v,
+    );
+}
+
+#[test]
+fn mltc_log_tau_memory_neuron_grad_matches() {
+    let mut net = build_mltc_net(109);
+    let inputs: Vec<u32> = (0..12).map(|t| (t % 8) as u32).collect();
+    let targets: Vec<u32> = inputs.iter().map(|&t| (t + 1) % 8).collect();
+    check_grad(
+        "log_tau[1][0] (memory neuron)",
+        &mut net,
+        &inputs,
+        &targets,
+        |n| n.layers[1].log_tau[0],
+        |g| g.layers[1].log_tau[0],
+        |n, v| n.layers[1].log_tau[0] = v,
+    );
+}
+
+#[test]
+fn mltc_state_remains_bounded() {
+    let net = build_mltc_net(113);
+    let tokens: Vec<u32> = (0..32).map(|t| (t % 8) as u32).collect();
+    let cache = net.forward_lm_tokens(&tokens);
+    for (l, layer) in cache.layers.iter().enumerate() {
+        for (t, row) in layer.x.iter().enumerate() {
+            for (i, &v) in row.iter().enumerate() {
+                assert!(
+                    v.abs() <= 1.0 + 1e-5,
+                    "layer {l} t {t} neuron {i}: x = {v} outside [-1, 1]"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mltc_log_tau_memory_floor_holds_after_adam() {
+    // Even with high lr pushing log_tau down, memory neurons must stay
+    // above LOG_TAU_MEM_MIN = 1.0.
+    let mut net = build_mltc_net(127);
+    let inputs_owned: Vec<Vec<u32>> = (0..4)
+        .map(|b| (0..16).map(|t| ((t + b) % 8) as u32).collect())
+        .collect();
+    let targets_owned: Vec<Vec<u32>> = (0..4)
+        .map(|b| (0..16).map(|t| ((t + b + 1) % 8) as u32).collect())
+        .collect();
+    let inputs: Vec<&[u32]> = inputs_owned.iter().map(Vec::as_slice).collect();
+    let targets: Vec<&[u32]> = targets_owned.iter().map(Vec::as_slice).collect();
+    let mut states: Vec<Vec<LnnState>> = (0..4).map(|_| net.fresh_states()).collect();
+    let adam = AdamConfig {
+        lr: 0.1,
+        ..AdamConfig::default()
+    };
+    for _ in 0..40 {
+        net.zero_grad();
+        let _ = net.forward_backward_batch_tokens_stateful(&inputs, &targets, &mut states);
+        net.clip_grads(1.0);
+        net.step_adam(&adam);
+    }
+    let mem_layer = &net.layers[1];
+    for i in 0..mem_layer.n_memory {
+        assert!(
+            mem_layer.log_tau[i] >= 1.0 - 1e-5,
+            "memory neuron {i}: log_tau = {} dropped below floor",
+            mem_layer.log_tau[i]
+        );
+    }
+}

@@ -8,12 +8,19 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
     exps.iter().map(|&e| e / sum).collect()
 }
 
+/// Allocation-free cross-entropy via log-sum-exp. Numerically stable
+/// even when the target probability underflows `f32`.
+#[must_use]
+pub fn cross_entropy_loss(logits: &[f32], target: usize) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = max + logits.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
+    lse - logits[target]
+}
+
 #[must_use]
 pub fn cross_entropy_with_grad(logits: &[f32], target: usize) -> (f32, Vec<f32>) {
-    let probs = softmax(logits);
-    let p_target = probs[target].max(1e-12);
-    let loss = -p_target.ln();
-    let mut grad = probs;
+    let loss = cross_entropy_loss(logits, target);
+    let mut grad = softmax(logits);
     grad[target] -= 1.0;
     (loss, grad)
 }
