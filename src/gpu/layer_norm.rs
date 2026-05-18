@@ -79,6 +79,13 @@ fn main(
 }
 ";
 
+// d_gamma / d_beta accumulate across T rows on the same address — use
+// f32 atomic-add via CAS on a bit-cast u32 view. Eliminates the per-row
+// [T × D] scratch + separate row_reduce dispatch that the previous design
+// needed (~13 LN bwds per train step × 2 × T × D extra global writes).
+//
+// Caller must pre-zero d_gamma/d_beta (the model's `g_*_gamma`/`g_*_beta`
+// buffers are zeroed by `zero_grad()` once per step before LN bwd runs).
 const LN_BACKWARD_WGSL: &str = "
 struct P { t: u32, d: u32, _pad0: u32, _pad1: u32 };
 @group(0) @binding(0) var<storage, read>       dy: array<f32>;
@@ -86,14 +93,34 @@ struct P { t: u32, d: u32, _pad0: u32, _pad1: u32 };
 @group(0) @binding(2) var<storage, read>       x_hat: array<f32>;
 @group(0) @binding(3) var<storage, read>       inv_std: array<f32>;
 @group(0) @binding(4) var<storage, read_write> dx: array<f32>;
-@group(0) @binding(5) var<storage, read_write> d_gamma: array<f32>;
-@group(0) @binding(6) var<storage, read_write> d_beta: array<f32>;
+@group(0) @binding(5) var<storage, read_write> d_gamma: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> d_beta: array<atomic<u32>>;
 var<push_constant> p: P;
 
 var<workgroup> sh_a: array<f32, 256>;
 var<workgroup> sh_b: array<f32, 256>;
 var<workgroup> sh_sum_g: f32;
 var<workgroup> sh_sum_gx: f32;
+
+fn atomic_add_d_gamma(idx: u32, val: f32) {
+    if (val == 0.0) { return; }
+    loop {
+        let old_u = atomicLoad(&d_gamma[idx]);
+        let new_u = bitcast<u32>(bitcast<f32>(old_u) + val);
+        let r = atomicCompareExchangeWeak(&d_gamma[idx], old_u, new_u);
+        if (r.exchanged) { break; }
+    }
+}
+
+fn atomic_add_d_beta(idx: u32, val: f32) {
+    if (val == 0.0) { return; }
+    loop {
+        let old_u = atomicLoad(&d_beta[idx]);
+        let new_u = bitcast<u32>(bitcast<f32>(old_u) + val);
+        let r = atomicCompareExchangeWeak(&d_beta[idx], old_u, new_u);
+        if (r.exchanged) { break; }
+    }
+}
 
 @compute @workgroup_size(256)
 fn main(
@@ -141,18 +168,11 @@ fn main(
     loop {
         if (i >= p.d) { break; }
         let xh = x_hat[base + i];
-        let g = dy[base + i] * gamma[i];
+        let dy_i = dy[base + i];
+        let g = dy_i * gamma[i];
         dx[base + i] = s * (g - inv_d * (sh_sum_g + xh * sh_sum_gx));
-        // d_gamma / d_beta need atomic-add since each row contributes to
-        // the same per-feature column. Without `atomic<>`, use a simple
-        // per-row buffer + final reduction kernel — but since rows ≤ T
-        // are typically modest (≤ 256), we do non-atomic and rely on
-        // the host to call this kernel sequentially per row. So write
-        // to row-tagged temp storage:
-        // Here we adopt a simpler strategy: emit per-row d_gamma/d_beta
-        // into a `[T, D]` shaped buffer; the host accumulates after.
-        d_gamma[row * p.d + i] = dy[base + i] * xh;
-        d_beta[row * p.d + i] = dy[base + i];
+        atomic_add_d_gamma(i, dy_i * xh);
+        atomic_add_d_beta(i, dy_i);
         i = i + 256u;
     }
 }
@@ -177,8 +197,8 @@ struct LnBackwardParams {
 }
 
 pub struct LayerNormForwardKernel {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bgl: Arc<wgpu::BindGroupLayout>,
+    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
 }
 
 impl LayerNormForwardKernel {
@@ -268,11 +288,52 @@ impl LayerNormForwardKernel {
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(t, 1, 1);
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_bind(
+        &self,
+        ctx: &GpuContext,
+        x: &GpuBuffer,
+        gamma: &GpuBuffer,
+        beta: &GpuBuffer,
+        y: &GpuBuffer,
+        mean: &GpuBuffer,
+        inv_std: &GpuBuffer,
+        x_hat: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora ln fwd bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: x.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: gamma.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: beta.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: y.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: mean.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: inv_std.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: x_hat.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        t: u32,
+        d: u32,
+        eps: f32,
+    ) {
+        let p = LnForwardParams { t, d, eps, _pad: 0 };
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(t, 1, 1);
+    }
 }
 
 pub struct LayerNormBackwardKernel {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bgl: Arc<wgpu::BindGroupLayout>,
+    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
 }
 
 impl LayerNormBackwardKernel {
@@ -324,9 +385,10 @@ impl LayerNormBackwardKernel {
         }
     }
 
-    /// Backward LayerNorm. `d_gamma_per_row` and `d_beta_per_row` are
-    /// shaped `[T, D]` — caller is responsible for the final reduction
-    /// over T into per-feature gradients.
+    /// Backward LayerNorm. `d_gamma` and `d_beta` are per-feature `[D]`
+    /// buffers; the kernel atomically accumulates into them. Caller must
+    /// pre-zero them (model grad buffers are zeroed by `zero_grad()` once
+    /// per step).
     pub fn dispatch_into(
         &self,
         ctx: &GpuContext,
@@ -336,8 +398,8 @@ impl LayerNormBackwardKernel {
         x_hat: &GpuBuffer,
         inv_std: &GpuBuffer,
         dx: &GpuBuffer,
-        d_gamma_per_row: &GpuBuffer,
-        d_beta_per_row: &GpuBuffer,
+        d_gamma: &GpuBuffer,
+        d_beta: &GpuBuffer,
         t: u32,
         d: u32,
     ) {
@@ -351,8 +413,8 @@ impl LayerNormBackwardKernel {
                 wgpu::BindGroupEntry { binding: 2, resource: x_hat.inner.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: inv_std.inner.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: dx.inner.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: d_gamma_per_row.inner.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: d_beta_per_row.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: d_gamma.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: d_beta.inner.as_entire_binding() },
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -361,6 +423,46 @@ impl LayerNormBackwardKernel {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(t, 1, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_bind(
+        &self,
+        ctx: &GpuContext,
+        dy: &GpuBuffer,
+        gamma: &GpuBuffer,
+        x_hat: &GpuBuffer,
+        inv_std: &GpuBuffer,
+        dx: &GpuBuffer,
+        d_gamma: &GpuBuffer,
+        d_beta: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora ln bwd bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dy.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: gamma.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: x_hat.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: inv_std.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: dx.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: d_gamma.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: d_beta.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        t: u32,
+        d: u32,
+    ) {
+        let p = LnBackwardParams { t, d, _pad0: 0, _pad1: 0 };
+        pass.set_bind_group(0, bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(t, 1, 1);
     }

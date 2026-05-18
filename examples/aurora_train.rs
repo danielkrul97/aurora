@@ -38,11 +38,16 @@ use aurora::gpu::{DecoderTransformerGpu, GpuContext};
 use aurora::optimizer::AdamWConfig;
 use aurora::text_io::{bits_per_byte, load_corpus, sample_token};
 use aurora::transformer::loss::softmax;
+#[cfg(feature = "viz")]
+use aurora::transformer::ForwardCache;
 use aurora::transformer::{
     cosine_warmup, DecoderTransformer, ModelGrads, TransformerConfig,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+
+#[cfg(feature = "viz")]
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct Cli {
@@ -67,6 +72,7 @@ struct Cli {
     sample_len: usize,
     sample_temp: f32,
     gpu: bool,
+    viz: bool,
 }
 
 impl Cli {
@@ -92,6 +98,7 @@ impl Cli {
         let mut sample_len: usize = 128;
         let mut sample_temp: f32 = 0.8;
         let mut gpu: bool = false;
+        let mut viz: bool = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -192,6 +199,10 @@ impl Cli {
                     gpu = true;
                     i += 1;
                 }
+                "--viz" => {
+                    viz = true;
+                    i += 1;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
@@ -233,8 +244,28 @@ impl Cli {
             sample_len,
             sample_temp,
             gpu,
+            viz,
         })
     }
+}
+
+struct TrainCtx {
+    cli: Cli,
+    model: DecoderTransformer,
+    #[cfg(feature = "gpu")]
+    gpu_backend: Option<DecoderTransformerGpu>,
+    backend_name: String,
+    tokens: Vec<u32>,
+    n_train: usize,
+    actual_vocab: usize,
+    corpus_bytes: usize,
+    bpe: BpeTokenizer,
+    comp: f32,
+    metrics_path: PathBuf,
+    start_epoch: u32,
+    step: u64,
+    #[cfg(feature = "viz")]
+    snapshot: Option<aurora::viz::SnapshotArc>,
 }
 
 fn main() -> ExitCode {
@@ -253,6 +284,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let corpus_bytes = corpus.len();
 
     let bpe_path = cli.bpe_path.clone().unwrap_or_else(|| {
         let stem = cli
@@ -275,15 +307,14 @@ fn main() -> ExitCode {
     let tokens = bpe.encode(&corpus);
     let encode_s = t_encode.elapsed().as_secs_f64();
     let comp = (corpus.len() as f32) / (tokens.len() as f32);
+    drop(corpus);
 
     let n_train = (tokens.len() * 9) / 10;
-    let train_toks = &tokens[..n_train];
-    let val_toks = &tokens[n_train..];
 
     let mut rng = StdRng::seed_from_u64(cli.seed);
 
     // Load checkpoint if compatible, else fresh init.
-    let (mut model, start_epoch, mut step) = match checkpoint::load(&cli.checkpoint) {
+    let (model, start_epoch, step) = match checkpoint::load(&cli.checkpoint) {
         Ok(ckpt) => {
             if ckpt.model.config.vocab == actual_vocab
                 && ckpt.model.config.d_model == cli.d_model
@@ -354,6 +385,7 @@ fn main() -> ExitCode {
         }
         "CPU".to_string()
     };
+
     let metrics_path = cli.metrics.clone().unwrap_or_else(|| {
         let stem = cli
             .checkpoint
@@ -366,7 +398,89 @@ fn main() -> ExitCode {
             .unwrap_or(0);
         PathBuf::from(format!("logs/{stem}_{ts}.jsonl"))
     });
-    let mut metrics = match MetricsWriter::open(&metrics_path) {
+
+    let val_len = tokens.len() - n_train;
+    print_header(
+        &cli,
+        corpus_bytes,
+        tokens.len(),
+        actual_vocab,
+        n_train,
+        val_len,
+        encode_s,
+        start_epoch,
+        &backend_name,
+        model.param_count(),
+    );
+
+    let viz_requested = cli.viz;
+
+    #[cfg(not(feature = "viz"))]
+    if viz_requested {
+        eprintln!(
+            "⚠ --viz given but binary was built without `--features viz`; running headless"
+        );
+    }
+
+    #[cfg(feature = "viz")]
+    let snapshot: Option<aurora::viz::SnapshotArc> = if viz_requested {
+        Some(aurora::viz::new_snapshot(
+            model.config.n_layer,
+            cli.epochs as u32,
+            backend_name.clone(),
+            model.param_count(),
+        ))
+    } else {
+        None
+    };
+
+    let ctx = TrainCtx {
+        cli,
+        model,
+        #[cfg(feature = "gpu")]
+        gpu_backend,
+        backend_name,
+        tokens,
+        n_train,
+        actual_vocab,
+        corpus_bytes,
+        bpe,
+        comp,
+        metrics_path,
+        start_epoch,
+        step,
+        #[cfg(feature = "viz")]
+        snapshot: snapshot.as_ref().map(Arc::clone),
+    };
+
+    #[cfg(feature = "viz")]
+    if let Some(snap) = snapshot {
+        let n_layer = ctx.model.config.n_layer;
+        let train_handle = std::thread::spawn(move || {
+            run_training_loop(ctx);
+        });
+        aurora::viz::run_window(snap, n_layer);
+        // Window closed — training continues; this main thread blocks
+        // until the worker finishes (so the user can interrupt with C-c
+        // if they want to abort).
+        if !train_handle.is_finished() {
+            println!(
+                "\n(viz window closed — training continues headless; press Ctrl-C to abort)"
+            );
+        }
+        let _ = train_handle.join();
+        return ExitCode::SUCCESS;
+    }
+
+    run_training_loop(ctx);
+    ExitCode::SUCCESS
+}
+
+fn run_training_loop(mut ctx: TrainCtx) {
+    let train_toks = &ctx.tokens[..ctx.n_train];
+    let val_toks = &ctx.tokens[ctx.n_train..];
+
+    let mut metrics = match MetricsWriter::open(&ctx.metrics_path) {
         Ok(w) => Some(w),
         Err(e) => {
             eprintln!("⚠ metrics log open failed ({e}); continuing without metrics");
@@ -374,42 +488,31 @@ fn main() -> ExitCode {
         }
     };
 
-    print_header(
-        &cli,
-        corpus.len(),
-        tokens.len(),
-        actual_vocab,
-        n_train,
-        val_toks.len(),
-        encode_s,
-        start_epoch,
-        &backend_name,
-        model.param_count(),
-    );
-
-    let stream_len = train_toks.len() / cli.batch_size;
-    let max_chunk_advance = cli.seq_len.max(1);
+    let stream_len = train_toks.len() / ctx.cli.batch_size;
+    let max_chunk_advance = ctx.cli.seq_len.max(1);
     let n_chunks_per_stream = stream_len.saturating_sub(1) / max_chunk_advance;
-    let total_steps_planned = (cli.epochs - start_epoch as usize) * n_chunks_per_stream;
-    let total_steps_for_lr = (cli.epochs * n_chunks_per_stream).max(1);
+    let total_steps_planned =
+        (ctx.cli.epochs - ctx.start_epoch as usize) * n_chunks_per_stream;
+    let total_steps_for_lr = (ctx.cli.epochs * n_chunks_per_stream).max(1);
 
     if let Some(m) = metrics.as_mut() {
         m.run_meta(
-            &cli,
-            corpus.len(),
-            tokens.len(),
-            actual_vocab,
-            start_epoch,
-            &backend_name,
-            model.param_count(),
+            &ctx.cli,
+            ctx.corpus_bytes,
+            ctx.tokens.len(),
+            ctx.actual_vocab,
+            ctx.start_epoch,
+            &ctx.backend_name,
+            ctx.model.param_count(),
         );
     }
 
-    let mut grads = ModelGrads::zeros(&model.config);
+    let mut grads = ModelGrads::zeros(&ctx.model.config);
     let total_start = Instant::now();
     let mut best_val = f32::INFINITY;
+    let mut rng = StdRng::seed_from_u64(ctx.cli.seed.wrapping_add(0xBADC0FFEE0DDF00D));
 
-    for epoch in start_epoch..cli.epochs as u32 {
+    for epoch in ctx.start_epoch..ctx.cli.epochs as u32 {
         let epoch_start = Instant::now();
         println!("\n── epoch {epoch} ───────────────────────────────");
 
@@ -420,81 +523,133 @@ fn main() -> ExitCode {
         for chunk_idx in 0..n_chunks_per_stream {
             // Compute LR.
             let lr_t = cosine_warmup(
-                step as usize,
-                cli.warmup_steps,
+                ctx.step as usize,
+                ctx.cli.warmup_steps,
                 total_steps_for_lr,
-                cli.lr,
-                cli.min_lr,
+                ctx.cli.lr,
+                ctx.cli.min_lr,
             );
             let adam = AdamWConfig {
                 lr: lr_t,
-                weight_decay: cli.weight_decay,
+                weight_decay: ctx.cli.weight_decay,
                 ..AdamWConfig::default()
             };
 
             // Build the batch: one window per stream.
             let mut batch_loss = 0.0_f32;
             let grad_norm: f32;
+            #[cfg(feature = "viz")]
+            let mut last_cache: Option<ForwardCache> = None;
+            #[cfg(feature = "viz")]
+            let mut last_input: Vec<u32> = Vec::new();
+            #[cfg(feature = "viz")]
+            let mut last_target: Vec<u32> = Vec::new();
+            #[cfg(feature = "viz")]
+            let mut last_logits: Vec<f32> = Vec::new();
 
             #[cfg(feature = "gpu")]
-            if let Some(gpu) = gpu_backend.as_mut() {
+            if let Some(gpu) = ctx.gpu_backend.as_mut() {
                 gpu.zero_grad();
-                for b in 0..cli.batch_size {
+                for b in 0..ctx.cli.batch_size {
                     let stream_start = b * stream_len;
-                    let p = stream_start + chunk_idx * cli.seq_len;
-                    let input = &train_toks[p..p + cli.seq_len];
-                    let target = &train_toks[p + 1..p + cli.seq_len + 1];
+                    let p = stream_start + chunk_idx * ctx.cli.seq_len;
+                    let input = &train_toks[p..p + ctx.cli.seq_len];
+                    let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
                     let loss = gpu.train_step(input, target);
                     batch_loss += loss;
+                    #[cfg(feature = "viz")]
+                    if b + 1 == ctx.cli.batch_size {
+                        last_input = input.to_vec();
+                        last_target = target.to_vec();
+                    }
                 }
                 // train_step accumulates batch_size separate calls. Average grads.
-                gpu.clip_grads(cli.grad_clip * cli.batch_size as f32);
-                grad_norm = gpu.grad_norm();
+                grad_norm = gpu.clip_grads(ctx.cli.grad_clip * ctx.cli.batch_size as f32);
                 gpu.step_adamw(&adam);
-                step += 1;
+                ctx.step += 1;
             } else {
                 grads.zero();
-                for b in 0..cli.batch_size {
+                for b in 0..ctx.cli.batch_size {
                     let stream_start = b * stream_len;
-                    let p = stream_start + chunk_idx * cli.seq_len;
-                    let input = &train_toks[p..p + cli.seq_len];
-                    let target = &train_toks[p + 1..p + cli.seq_len + 1];
-                    let (_logits, cache) = model.forward(input);
-                    let loss = model.backward(&cache, target, &mut grads);
+                    let p = stream_start + chunk_idx * ctx.cli.seq_len;
+                    let input = &train_toks[p..p + ctx.cli.seq_len];
+                    let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
+                    let (logits, cache) = ctx.model.forward(input);
+                    let loss = ctx.model.backward(&cache, target, &mut grads);
                     batch_loss += loss;
+                    #[cfg(feature = "viz")]
+                    if b + 1 == ctx.cli.batch_size {
+                        last_cache = Some(cache);
+                        last_input = input.to_vec();
+                        last_target = target.to_vec();
+                        last_logits = logits;
+                    }
+                    #[cfg(not(feature = "viz"))]
+                    let _ = logits;
                 }
-                grads.scale(1.0 / cli.batch_size as f32);
-                grad_norm = DecoderTransformer::clip_grads(&mut grads, cli.grad_clip);
-                model.step_adamw(&grads, &adam);
-                step += 1;
+                grads.scale(1.0 / ctx.cli.batch_size as f32);
+                grad_norm = DecoderTransformer::clip_grads(&mut grads, ctx.cli.grad_clip);
+                ctx.model.step_adamw(&grads, &adam);
+                ctx.step += 1;
             }
             #[cfg(not(feature = "gpu"))]
             {
                 grads.zero();
-                for b in 0..cli.batch_size {
+                for b in 0..ctx.cli.batch_size {
                     let stream_start = b * stream_len;
-                    let p = stream_start + chunk_idx * cli.seq_len;
-                    let input = &train_toks[p..p + cli.seq_len];
-                    let target = &train_toks[p + 1..p + cli.seq_len + 1];
-                    let (_logits, cache) = model.forward(input);
-                    let loss = model.backward(&cache, target, &mut grads);
+                    let p = stream_start + chunk_idx * ctx.cli.seq_len;
+                    let input = &train_toks[p..p + ctx.cli.seq_len];
+                    let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
+                    let (logits, cache) = ctx.model.forward(input);
+                    let loss = ctx.model.backward(&cache, target, &mut grads);
                     batch_loss += loss;
+                    #[cfg(feature = "viz")]
+                    if b + 1 == ctx.cli.batch_size {
+                        last_cache = Some(cache);
+                        last_input = input.to_vec();
+                        last_target = target.to_vec();
+                        last_logits = logits;
+                    }
+                    #[cfg(not(feature = "viz"))]
+                    let _ = logits;
                 }
-                grads.scale(1.0 / cli.batch_size as f32);
-                grad_norm = DecoderTransformer::clip_grads(&mut grads, cli.grad_clip);
-                model.step_adamw(&grads, &adam);
-                step += 1;
+                grads.scale(1.0 / ctx.cli.batch_size as f32);
+                grad_norm = DecoderTransformer::clip_grads(&mut grads, ctx.cli.grad_clip);
+                ctx.model.step_adamw(&grads, &adam);
+                ctx.step += 1;
             }
 
-            let avg_loss = batch_loss / cli.batch_size as f32;
-            total_nats += avg_loss * cli.seq_len as f32;
-            total_tokens += cli.seq_len;
+            let avg_loss = batch_loss / ctx.cli.batch_size as f32;
+            total_nats += avg_loss * ctx.cli.seq_len as f32;
+            total_tokens += ctx.cli.seq_len;
+
+            let bpb_running =
+                bits_per_byte(total_nats, (total_tokens as f32 * ctx.comp) as usize);
+            #[cfg(feature = "viz")]
+            {
+                let elapsed_running = total_start.elapsed().as_secs_f64();
+                publish_snapshot(
+                    &ctx,
+                    epoch,
+                    avg_loss,
+                    bpb_running,
+                    lr_t,
+                    grad_norm,
+                    elapsed_running,
+                    last_cache.as_ref(),
+                    &grads,
+                    &last_input,
+                    &last_target,
+                    &last_logits,
+                );
+            }
 
             if (chunk_idx + 1).is_multiple_of(report_every) {
-                let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
+                let bpb = bpb_running;
                 let elapsed = epoch_start.elapsed().as_secs_f64();
                 println!(
-                    "  step {step:>7}  chunk {:>5}/{:<5}  loss {:.3}  bpb {:.3}  lr {:.2e}  gn {:.2}  {:>6.1}s",
+                    "  step {:>7}  chunk {:>5}/{:<5}  loss {:.3}  bpb {:.3}  lr {:.2e}  gn {:.2}  {:>6.1}s",
+                    ctx.step,
                     chunk_idx + 1,
                     n_chunks_per_stream,
                     avg_loss,
@@ -504,7 +659,7 @@ fn main() -> ExitCode {
                     elapsed
                 );
                 if let Some(m) = metrics.as_mut() {
-                    m.step(epoch, step, avg_loss, bpb, lr_t, grad_norm, elapsed);
+                    m.step(epoch, ctx.step, avg_loss, bpb, lr_t, grad_norm, elapsed);
                 }
             }
         }
@@ -512,12 +667,12 @@ fn main() -> ExitCode {
         // If GPU backend is active, snapshot weights back to CPU model
         // before validation + checkpoint.
         #[cfg(feature = "gpu")]
-        if let Some(gpu) = gpu_backend.as_ref() {
-            model = gpu.to_cpu();
+        if let Some(gpu) = ctx.gpu_backend.as_ref() {
+            ctx.model = gpu.to_cpu();
         }
 
-        let train_bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
-        let val_bpb = evaluate(&model, val_toks, cli.seq_len, comp);
+        let train_bpb = bits_per_byte(total_nats, (total_tokens as f32 * ctx.comp) as usize);
+        let val_bpb = evaluate(&ctx.model, val_toks, ctx.cli.seq_len, ctx.comp);
         if val_bpb < best_val {
             best_val = val_bpb;
         }
@@ -529,20 +684,26 @@ fn main() -> ExitCode {
             m.epoch_done(epoch, train_bpb, val_bpb, epoch_elapsed);
         }
 
-        if let Err(e) = checkpoint::save(&cli.checkpoint, &model, epoch + 1, step) {
+        if let Err(e) = checkpoint::save(&ctx.cli.checkpoint, &ctx.model, epoch + 1, ctx.step) {
             eprintln!("⚠ checkpoint save failed: {e}");
         } else {
-            println!("  checkpoint → {}", cli.checkpoint.display());
+            println!("  checkpoint → {}", ctx.cli.checkpoint.display());
             if let Some(m) = metrics.as_mut() {
-                m.checkpoint(epoch + 1, step, &cli.checkpoint);
+                m.checkpoint(epoch + 1, ctx.step, &ctx.cli.checkpoint);
             }
         }
 
         // Sample generation.
         let seed_tokens: Vec<u32> = val_toks.iter().take(8).copied().collect();
-        let sample = generate(&model, &seed_tokens, cli.sample_len, cli.sample_temp, &mut rng);
-        let seed_text = bpe.decode(&seed_tokens);
-        let sample_text = bpe.decode(&sample);
+        let sample = generate(
+            &ctx.model,
+            &seed_tokens,
+            ctx.cli.sample_len,
+            ctx.cli.sample_temp,
+            &mut rng,
+        );
+        let seed_text = ctx.bpe.decode(&seed_tokens);
+        let sample_text = ctx.bpe.decode(&sample);
         println!(
             "  sample:\n    seed: {:?}\n    cont: {:?}",
             String::from_utf8_lossy(&seed_text),
@@ -555,7 +716,151 @@ fn main() -> ExitCode {
         "\nTotal time {:.1}s   best val bpb {:.3}   steps planned {}",
         total_elapsed, best_val, total_steps_planned
     );
-    ExitCode::SUCCESS
+
+    #[cfg(feature = "viz")]
+    if let Some(snap) = ctx.snapshot.as_ref() {
+        if let Ok(mut s) = snap.lock() {
+            s.finished = true;
+        }
+    }
+}
+
+#[cfg(feature = "viz")]
+#[allow(clippy::too_many_arguments)]
+fn publish_snapshot(
+    ctx: &TrainCtx,
+    epoch: u32,
+    loss: f32,
+    bpb: f32,
+    lr: f32,
+    grad_norm: f32,
+    elapsed_s: f64,
+    cache: Option<&ForwardCache>,
+    grads: &ModelGrads,
+    last_input: &[u32],
+    last_target: &[u32],
+    last_logits: &[f32],
+) {
+    let Some(snap) = ctx.snapshot.as_ref() else {
+        return;
+    };
+    let Ok(mut s) = snap.try_lock() else {
+        return;
+    };
+
+    s.step = ctx.step;
+    s.epoch = epoch;
+    s.loss = loss;
+    s.bpb = bpb;
+    s.lr = lr;
+    s.grad_norm = grad_norm;
+    s.elapsed_s = elapsed_s;
+    s.step_tick = s.step_tick.wrapping_add(1);
+    s.push_history(ctx.step, loss, bpb);
+
+    // Layer health: read from per-stage caches when available, else
+    // fall back to grad norms only.
+    let n_layer = ctx.model.config.n_layer;
+    let total_stages = n_layer + 2;
+    if s.layers.len() != total_stages {
+        s.layers = aurora::viz::TrainingSnapshot::initial(
+            n_layer,
+            s.total_epochs,
+            s.backend.clone(),
+            s.params,
+        )
+        .layers;
+    }
+
+    let embed_g = aurora::viz::l2_norm(&grads.embed.d_w_tok)
+        .hypot(aurora::viz::l2_norm(&grads.embed.d_w_pos));
+    s.layers[0].grad_norm = embed_g;
+    if let Some(c) = cache {
+        if let Some(blk0) = c.blocks.first() {
+            let denom = blk0.x_in.len().max(1) as f32;
+            s.layers[0].act_norm = aurora::viz::l2_norm(&blk0.x_in) / denom.sqrt();
+            s.layers[0].act_max_abs = aurora::viz::max_abs(&blk0.x_in);
+            s.layers[0].health =
+                aurora::viz::health_from_norm(s.layers[0].act_norm, s.layers[0].act_max_abs);
+        }
+    }
+
+    // Two-pass: bars are relative to the max layer-grad so even small
+    // absolute gradients still use the full bar range.
+    let mut raw: Vec<(f32, f32)> = Vec::with_capacity(grads.blocks.len());
+    let mut max_g: f32 = 1e-6;
+    for blk in &grads.blocks {
+        let mha_g = (aurora::viz::l2_norm(&blk.d_mha.d_w_q.d_w).powi(2)
+            + aurora::viz::l2_norm(&blk.d_mha.d_w_k.d_w).powi(2)
+            + aurora::viz::l2_norm(&blk.d_mha.d_w_v.d_w).powi(2)
+            + aurora::viz::l2_norm(&blk.d_mha.d_w_o.d_w).powi(2))
+        .sqrt();
+        let ffn_g = aurora::viz::l2_norm(&blk.d_ffn.d_w_fc.d_w)
+            .hypot(aurora::viz::l2_norm(&blk.d_ffn.d_w_proj.d_w));
+        max_g = max_g.max(mha_g).max(ffn_g);
+        raw.push((mha_g, ffn_g));
+    }
+
+    for (i, (mha_g, ffn_g)) in raw.iter().copied().enumerate() {
+        let stage = i + 1;
+        s.layers[stage].grad_norm = (mha_g * mha_g + ffn_g * ffn_g).sqrt();
+        // Per-step relative bars: 0..1 with the largest layer at 1.0,
+        // plus a 0.18 floor so even the quietest layer shows a sliver.
+        s.layers[stage].attn_bar = (0.18 + 0.82 * mha_g / max_g).clamp(0.0, 1.0);
+        s.layers[stage].ffn_bar = (0.18 + 0.82 * ffn_g / max_g).clamp(0.0, 1.0);
+
+        if let Some(c) = cache {
+            if let Some(bc) = c.blocks.get(i) {
+                let denom = bc.post_attn.len().max(1) as f32;
+                s.layers[stage].act_norm = aurora::viz::l2_norm(&bc.post_attn) / denom.sqrt();
+                s.layers[stage].act_max_abs = aurora::viz::max_abs(&bc.post_attn);
+                s.layers[stage].health = aurora::viz::health_from_norm(
+                    s.layers[stage].act_norm,
+                    s.layers[stage].act_max_abs,
+                );
+            }
+        }
+    }
+
+    // LM head stage = final LN + tied head; the tied head has no grad of its own.
+    let head_stage = n_layer + 1;
+    s.layers[head_stage].grad_norm = aurora::viz::l2_norm(&grads.final_ln.d_gamma)
+        .hypot(aurora::viz::l2_norm(&grads.final_ln.d_beta));
+    if let Some(c) = cache {
+        let denom = c.h_final.len().max(1) as f32;
+        s.layers[head_stage].act_norm = aurora::viz::l2_norm(&c.h_final) / denom.sqrt();
+        s.layers[head_stage].act_max_abs = aurora::viz::max_abs(&c.h_final);
+        s.layers[head_stage].health = aurora::viz::health_from_norm(
+            s.layers[head_stage].act_norm,
+            s.layers[head_stage].act_max_abs,
+        );
+    }
+
+    // Input / prediction preview.
+    if !last_input.is_empty() {
+        let take = last_input.len().min(16);
+        let preview_tokens: Vec<u32> = last_input.iter().rev().take(take).rev().copied().collect();
+        let bytes = ctx.bpe.decode(&preview_tokens);
+        s.input_preview = String::from_utf8_lossy(&bytes).into_owned();
+    }
+    if !last_logits.is_empty() && !last_target.is_empty() {
+        let v = ctx.model.config.vocab;
+        let t = last_input.len();
+        if t > 0 && last_logits.len() >= t * v {
+            let last_row = &last_logits[(t - 1) * v..t * v];
+            let mut argmax = 0_u32;
+            let mut best = f32::NEG_INFINITY;
+            for (idx, &val) in last_row.iter().enumerate() {
+                if val > best {
+                    best = val;
+                    argmax = idx as u32;
+                }
+            }
+            let bytes = ctx.bpe.decode(&[argmax]);
+            s.pred_preview = String::from_utf8_lossy(&bytes).into_owned();
+            s.pred_correct = Some(argmax == *last_target.last().unwrap_or(&u32::MAX));
+        }
+    }
 }
 
 fn load_or_train_bpe(

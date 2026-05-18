@@ -71,8 +71,8 @@ struct AdamWParams {
 }
 
 pub struct AdamWKernel {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bgl: Arc<wgpu::BindGroupLayout>,
+    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
 }
 
 impl AdamWKernel {
@@ -177,5 +177,65 @@ impl AdamWKernel {
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         let groups = n.div_ceil(256);
         pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    pub fn build_bind(
+        &self,
+        ctx: &GpuContext,
+        params: &GpuBuffer,
+        grads: &GpuBuffer,
+        m1: &GpuBuffer,
+        m2: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora adamw bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: grads.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: m1.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: m2.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// Issue an AdamW step on an existing pass with a pre-built bind group.
+    /// Caller must `set_pipeline(&kernel.pipeline)` once before the first call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        n: u32,
+        apply_wd: bool,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        bc1: f32,
+        bc2: f32,
+        weight_decay: f32,
+    ) {
+        let p = AdamWParams {
+            n,
+            apply_wd: u32::from(apply_wd),
+            _p0: 0,
+            _p1: 0,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            one_minus_b1: 1.0 - beta1,
+            one_minus_b2: 1.0 - beta2,
+            bc1,
+            bc2,
+            weight_decay,
+            _p2: 0.0,
+            _p3: 0.0,
+            _p4: 0.0,
+        };
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
     }
 }

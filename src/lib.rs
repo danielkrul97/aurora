@@ -12,3 +12,5 @@ pub mod linalg;
 pub mod optimizer;
 pub mod text_io;
 pub mod transformer;
+#[cfg(feature = "viz")]
+pub mod viz;

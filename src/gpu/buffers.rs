@@ -93,6 +93,62 @@ impl GpuBuffer {
             .write_buffer(&self.inner, 0, bytemuck::cast_slice(data));
     }
 
+    /// Upload up to the first `data.len()` elements without resizing.
+    /// Lets callers reuse a max-sized buffer for variable-length payloads.
+    pub fn upload_prefix(&self, ctx: &GpuContext, data: &[f32]) {
+        debug_assert!(data.len() <= self.len);
+        ctx.queue
+            .write_buffer(&self.inner, 0, bytemuck::cast_slice(data));
+    }
+
+    /// Same as `upload_prefix` for `u32` payloads (token IDs).
+    pub fn upload_u32_prefix(&self, ctx: &GpuContext, data: &[u32]) {
+        debug_assert!(data.len() <= self.len);
+        ctx.queue
+            .write_buffer(&self.inner, 0, bytemuck::cast_slice(data));
+    }
+
+    /// Download only the first `n` elements (must be ≤ `self.len`).
+    /// Useful for cached max-sized buffers used with variable `t`.
+    ///
+    /// # Panics
+    /// Panics if `n > self.len` or the GPU readback fails.
+    #[must_use]
+    pub fn download_prefix(&self, ctx: &GpuContext, n: usize) -> Vec<f32> {
+        assert!(n <= self.len);
+        let bytes = (n * std::mem::size_of::<f32>()) as u64;
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("aurora gpu download_prefix staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("aurora gpu download_prefix encoder"),
+            });
+        encoder.copy_buffer_to_buffer(&self.inner, 0, &staging, 0, bytes);
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        let _ = ctx.device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .expect("map_async sender dropped")
+            .expect("map_async failed");
+
+        let mapped = slice.get_mapped_range();
+        let out: Vec<f32> = bytemuck::cast_slice(&mapped).to_vec();
+        drop(mapped);
+        staging.unmap();
+        out
+    }
+
     /// Download to CPU. Issues a staging-buffer copy + map + readback.
     /// Synchronous via pollster.
     ///

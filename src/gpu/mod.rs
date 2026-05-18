@@ -33,7 +33,7 @@ pub mod transformer;
 
 pub use attention::{CausalMhaBackwardKernel, CausalMhaForwardKernel};
 pub use context::GpuContext;
-pub use elementwise::{ScaleBufferKernel, VectorAddKernel, ZeroBufferKernel};
+pub use elementwise::{VectorAddKernel, ZeroBufferKernel};
 pub use embedding::{EmbedScatterAddKernel, TokenPosEmbedKernel};
 pub use gelu::{GeluBackwardKernel, GeluKernel};
 pub use kv_cache::{KvBlockGpu, KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
@@ -41,7 +41,8 @@ pub use layer_norm::{LayerNormBackwardKernel, LayerNormForwardKernel};
 pub use matmul::{cpu_gemm, cpu_gemm_transpose_b, GemmKernel, GemmTransposeBKernel};
 pub use optimizer::AdamWKernel;
 pub use reduce::{
-    EmbedScatterReduceKernel, GradNormSqReduceKernel, OuterProductAccumKernel, RowReduceAddKernel,
+    EmbedScatterReduceKernel, GradNormFinalizeKernel, GradNormSqReduceKernel,
+    OuterProductAccumKernel, RowReduceAddKernel, ScaleByBufferKernel,
 };
 pub use softmax_ce::SoftmaxCrossEntropyKernel;
 pub use transformer::DecoderTransformerGpu;

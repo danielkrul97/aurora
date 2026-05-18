@@ -14,12 +14,14 @@ v overnight runu (nano-GPT scale ~10M params, GTX 1650).
 ## Hlavní vstupní body
 
 - **Hlavní training example:** `examples/aurora_train.rs`. CPU default,
-  `--gpu` opt-in (vyžaduje `--features gpu`). CLI flags:
-  `--d-model --n-layer --n-head --d-ff --seq-len --batch-size --epochs
-  --lr --warmup-steps --weight-decay --grad-clip --checkpoint --bpe
-  --metrics --seed --sample-len --sample-temp`. Spouštěj přes
-  `scripts/overnight.sh` nebo přímo `cargo run --release [--features gpu]
-  --example aurora_train -- ...`.
+  `--gpu` opt-in (vyžaduje `--features gpu`), `--viz` opt-in (vyžaduje
+  `--features viz` — Bevy 0.18 okno s real-time pipeline vizualizací,
+  implementace v `src/viz/`). CLI flags: `--d-model --n-layer --n-head
+  --d-ff --seq-len --batch-size --epochs --lr --warmup-steps
+  --weight-decay --grad-clip --checkpoint --bpe --metrics --seed
+  --sample-len --sample-temp --gpu --viz`. Spouštěj přes
+  `scripts/overnight.sh` nebo přímo `cargo run --release
+  [--features gpu,viz] --example aurora_train -- ...`.
 - **Anti-regrese před commitem:**
   - `tests/transformer_primitives.rs` — numerické gradient checks (CPU)
   - `tests/transformer_smoke.rs` — copy task convergence (CPU)
@@ -49,6 +51,13 @@ v overnight runu (nano-GPT scale ~10M params, GTX 1650).
   stále převážně v `clip_grads` (per-tensor partials download) a v
   jednotlivých dispatch overhead. Sprint 61+ může fuzí přes encoder
   reduce dál; KV cache je zatím CPU-only (GPU port = Sprint 61).
+- **Live viz** (`--features viz --viz`) je čistě additivní — kompiluje
+  Bevy 0.18 jako optional dep, default build/CI nezasahuje. Viz thread
+  čte `Arc<Mutex<TrainingSnapshot>>` přes `try_lock`, trénink píše
+  jednou per micro-step. Bary v UI jsou per-step relativní normalizace
+  grad norem (max layer = 1.0, floor 0.18) — víc viditelné než absolutní
+  scaling. Mesh2d + `bevy::sprite_render::ColorMaterial` všude pro
+  kreslení (Sprite::from_color v 0.18 renderuje nic).
 
 # Code style
 

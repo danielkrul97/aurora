@@ -60,8 +60,8 @@ struct EmbedParams {
 }
 
 pub struct TokenPosEmbedKernel {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bgl: Arc<wgpu::BindGroupLayout>,
+    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
 }
 
 impl TokenPosEmbedKernel {
@@ -144,6 +144,41 @@ impl TokenPosEmbedKernel {
         let groups = (t * d).div_ceil(256);
         pass.dispatch_workgroups(groups, 1, 1);
     }
+
+    pub fn build_bind(
+        &self,
+        ctx: &GpuContext,
+        tokens: &GpuBuffer,
+        w_tok: &GpuBuffer,
+        w_pos: &GpuBuffer,
+        out: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora embed fwd bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: tokens.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: w_tok.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: w_pos.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        t: u32,
+        d: u32,
+        vocab: u32,
+        seq_max: u32,
+    ) {
+        let p = EmbedParams { t, d, vocab, seq_max };
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups((t * d).div_ceil(256), 1, 1);
+    }
 }
 
 /// Scatter-add gradient back into per-position buffer + positional table.
@@ -151,8 +186,8 @@ impl TokenPosEmbedKernel {
 /// done on the host because GPU atomics are inconvenient here and T is
 /// tiny.
 pub struct EmbedScatterAddKernel {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bgl: Arc<wgpu::BindGroupLayout>,
+    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
 }
 
 impl EmbedScatterAddKernel {
@@ -237,5 +272,43 @@ impl EmbedScatterAddKernel {
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         let groups = (t * d).div_ceil(256);
         pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    pub fn build_bind(
+        &self,
+        ctx: &GpuContext,
+        tokens: &GpuBuffer,
+        dy: &GpuBuffer,
+        d_w_tok_per_pos: &GpuBuffer,
+        d_w_pos: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora embed bwd bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: tokens.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dy.inner.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: d_w_tok_per_pos.inner.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry { binding: 3, resource: d_w_pos.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        t: u32,
+        d: u32,
+        vocab: u32,
+        seq_max: u32,
+    ) {
+        let p = EmbedParams { t, d, vocab, seq_max };
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups((t * d).div_ceil(256), 1, 1);
     }
 }

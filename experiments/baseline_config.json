@@ -1,0 +1,26 @@
+{
+  "label": "aurora-research-baseline-v1",
+  "comment": "Frozen config for autonomous research loop. ~12M params, 1 epoch enwik8_10m, GTX 1650.",
+  "cli_args": [
+    "--corpus", "data/enwik8_10m.txt",
+    "--bpe", "data/enwik8_10m_4096.bpe",
+    "--vocab", "4096",
+    "--d-model", "384",
+    "--n-layer", "6",
+    "--n-head", "6",
+    "--d-ff", "1536",
+    "--seq-len", "256",
+    "--batch-size", "16",
+    "--epochs", "1",
+    "--lr", "6e-4",
+    "--min-lr", "6e-5",
+    "--warmup-steps", "200",
+    "--weight-decay", "0.1",
+    "--grad-clip", "1.0",
+    "--seed", "42",
+    "--gpu"
+  ],
+  "features": ["gpu"],
+  "expected_runtime_min": 22,
+  "win_threshold_delta_bpb": -0.02
+}

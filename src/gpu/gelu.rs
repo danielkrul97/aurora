@@ -55,8 +55,8 @@ struct GeluParams {
 }
 
 pub struct GeluKernel {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bgl: Arc<wgpu::BindGroupLayout>,
+    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
 }
 
 impl GeluKernel {
@@ -127,11 +127,34 @@ impl GeluKernel {
         let groups = n.div_ceil(256);
         pass.dispatch_workgroups(groups, 1, 1);
     }
+
+    pub fn build_bind(&self, ctx: &GpuContext, x: &GpuBuffer, y: &GpuBuffer) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora gelu fwd bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: x.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: y.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        n: u32,
+    ) {
+        let p = GeluParams { n, _p0: 0, _p1: 0, _p2: 0 };
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+    }
 }
 
 pub struct GeluBackwardKernel {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bgl: Arc<wgpu::BindGroupLayout>,
+    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
 }
 
 impl GeluBackwardKernel {
@@ -207,5 +230,35 @@ impl GeluBackwardKernel {
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         let groups = n.div_ceil(256);
         pass.dispatch_workgroups(groups, 1, 1);
+    }
+
+    pub fn build_bind(
+        &self,
+        ctx: &GpuContext,
+        x: &GpuBuffer,
+        dy: &GpuBuffer,
+        dx: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora gelu bwd bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: x.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dy.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dx.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        n: u32,
+    ) {
+        let p = GeluParams { n, _p0: 0, _p1: 0, _p2: 0 };
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
     }
 }

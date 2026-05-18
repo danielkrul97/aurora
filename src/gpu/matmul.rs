@@ -10,7 +10,13 @@ use super::buffers::GpuBuffer;
 use super::softmax_ce::storage_entry;
 use super::GpuContext;
 
-const TILE: u32 = 16;
+// Tile geometry — 64×64 workgroup output tile, 16-wide K tile, 4×4
+// register tile per thread (256 threads/workgroup = 16×16). Each thread
+// computes 16 output elements out of its register tile, hiding shared-
+// memory latency behind FMA throughput. ~5–10× the per-thread arithmetic
+// of the previous 1-element-per-thread layout.
+const WG_M: u32 = 64;
+const WG_N: u32 = 64;
 
 const GEMM_WGSL: &str = "
 struct G {
@@ -22,41 +28,93 @@ struct G {
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 var<push_constant> p: G;
 
-var<workgroup> ta: array<f32, 256>;
-var<workgroup> tb: array<f32, 256>;
+var<workgroup> ta: array<f32, 1024>;  // [WG_M=64, WG_K=16]
+var<workgroup> tb: array<f32, 1024>;  // [WG_K=16, WG_N=64]
 
 @compute @workgroup_size(16, 16)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wgid: vec3<u32>,
 ) {
-    let lr = lid.y;
-    let lc = lid.x;
-    let gr = wgid.y * 16u + lr;
-    let gc = wgid.x * 16u + lc;
-    var acc: f32 = 0.0;
+    let tx = lid.x;
+    let ty = lid.y;
+    let tid = ty * 16u + tx;
+    let row0 = wgid.y * 64u + ty * 4u;
+    let col0 = wgid.x * 64u + tx * 4u;
+
+    var acc: array<f32, 16>;
+    for (var i: u32 = 0u; i < 16u; i = i + 1u) { acc[i] = 0.0; }
+
     let n_tiles = (p.k + 15u) / 16u;
-    for (var ti: u32 = 0u; ti < n_tiles; ti = ti + 1u) {
-        let ka = ti * 16u + lc;
-        let kb = ti * 16u + lr;
-        if (gr < p.m && ka < p.k) {
-            ta[lr * 16u + lc] = a[gr * p.k + ka];
-        } else {
-            ta[lr * 16u + lc] = 0.0;
+    for (var t_idx: u32 = 0u; t_idx < n_tiles; t_idx = t_idx + 1u) {
+        let k_off = t_idx * 16u;
+
+        // Cooperatively load 64×16 A-tile (1024 floats, 4 per thread).
+        for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+            let flat = tid * 4u + l;
+            let r = flat / 16u;
+            let kk = flat % 16u;
+            let g_row = wgid.y * 64u + r;
+            let g_col = k_off + kk;
+            if (g_row < p.m && g_col < p.k) {
+                ta[r * 16u + kk] = a[g_row * p.k + g_col];
+            } else {
+                ta[r * 16u + kk] = 0.0;
+            }
         }
-        if (kb < p.k && gc < p.n) {
-            tb[lr * 16u + lc] = b[kb * p.n + gc];
-        } else {
-            tb[lr * 16u + lc] = 0.0;
+        // Cooperatively load 16×64 B-tile.
+        for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+            let flat = tid * 4u + l;
+            let kk = flat / 64u;
+            let cc = flat % 64u;
+            let g_row = k_off + kk;
+            let g_col = wgid.x * 64u + cc;
+            if (g_row < p.k && g_col < p.n) {
+                tb[kk * 64u + cc] = b[g_row * p.n + g_col];
+            } else {
+                tb[kk * 64u + cc] = 0.0;
+            }
         }
         workgroupBarrier();
+
+        // 4×4 register-tile multiply-accumulate.
         for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
-            acc = acc + ta[lr * 16u + kk] * tb[kk * 16u + lc];
+            let a0 = ta[(ty * 4u + 0u) * 16u + kk];
+            let a1 = ta[(ty * 4u + 1u) * 16u + kk];
+            let a2 = ta[(ty * 4u + 2u) * 16u + kk];
+            let a3 = ta[(ty * 4u + 3u) * 16u + kk];
+            let b0 = tb[kk * 64u + tx * 4u + 0u];
+            let b1 = tb[kk * 64u + tx * 4u + 1u];
+            let b2 = tb[kk * 64u + tx * 4u + 2u];
+            let b3 = tb[kk * 64u + tx * 4u + 3u];
+            acc[0]  = acc[0]  + a0 * b0;
+            acc[1]  = acc[1]  + a0 * b1;
+            acc[2]  = acc[2]  + a0 * b2;
+            acc[3]  = acc[3]  + a0 * b3;
+            acc[4]  = acc[4]  + a1 * b0;
+            acc[5]  = acc[5]  + a1 * b1;
+            acc[6]  = acc[6]  + a1 * b2;
+            acc[7]  = acc[7]  + a1 * b3;
+            acc[8]  = acc[8]  + a2 * b0;
+            acc[9]  = acc[9]  + a2 * b1;
+            acc[10] = acc[10] + a2 * b2;
+            acc[11] = acc[11] + a2 * b3;
+            acc[12] = acc[12] + a3 * b0;
+            acc[13] = acc[13] + a3 * b1;
+            acc[14] = acc[14] + a3 * b2;
+            acc[15] = acc[15] + a3 * b3;
         }
         workgroupBarrier();
     }
-    if (gr < p.m && gc < p.n) {
-        c[gr * p.n + gc] = acc;
+
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+            let r = row0 + i;
+            let cc = col0 + j;
+            if (r < p.m && cc < p.n) {
+                c[r * p.n + cc] = acc[i * 4u + j];
+            }
+        }
     }
 }
 ";
@@ -71,42 +129,91 @@ struct G {
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 var<push_constant> p: G;
 
-var<workgroup> ta: array<f32, 256>;
-var<workgroup> tb: array<f32, 256>;
+var<workgroup> ta: array<f32, 1024>;
+var<workgroup> tb: array<f32, 1024>;
 
 @compute @workgroup_size(16, 16)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wgid: vec3<u32>,
 ) {
-    let lr = lid.y;
-    let lc = lid.x;
-    let gr = wgid.y * 16u + lr;
-    let gc = wgid.x * 16u + lc;
-    var acc: f32 = 0.0;
+    let tx = lid.x;
+    let ty = lid.y;
+    let tid = ty * 16u + tx;
+    let row0 = wgid.y * 64u + ty * 4u;
+    let col0 = wgid.x * 64u + tx * 4u;
+
+    var acc: array<f32, 16>;
+    for (var i: u32 = 0u; i < 16u; i = i + 1u) { acc[i] = 0.0; }
+
     let n_tiles = (p.k + 15u) / 16u;
-    for (var ti: u32 = 0u; ti < n_tiles; ti = ti + 1u) {
-        let ka = ti * 16u + lc;
-        let kb = ti * 16u + lr;
-        if (gr < p.m && ka < p.k) {
-            ta[lr * 16u + lc] = a[gr * p.k + ka];
-        } else {
-            ta[lr * 16u + lc] = 0.0;
+    for (var t_idx: u32 = 0u; t_idx < n_tiles; t_idx = t_idx + 1u) {
+        let k_off = t_idx * 16u;
+
+        for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+            let flat = tid * 4u + l;
+            let r = flat / 16u;
+            let kk = flat % 16u;
+            let g_row = wgid.y * 64u + r;
+            let g_col = k_off + kk;
+            if (g_row < p.m && g_col < p.k) {
+                ta[r * 16u + kk] = a[g_row * p.k + g_col];
+            } else {
+                ta[r * 16u + kk] = 0.0;
+            }
         }
-        // B is [n, k] row-major; we need B^T[k, n] → reading b[gc * k + kb]
-        if (gc < p.n && kb < p.k) {
-            tb[lr * 16u + lc] = b[gc * p.k + kb];
-        } else {
-            tb[lr * 16u + lc] = 0.0;
+        // B is [n, k] row-major; B^T[k, n] requires reading b[col * k + kk].
+        for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+            let flat = tid * 4u + l;
+            let kk = flat / 64u;
+            let cc = flat % 64u;
+            let g_row = k_off + kk;
+            let g_col = wgid.x * 64u + cc;
+            if (g_row < p.k && g_col < p.n) {
+                tb[kk * 64u + cc] = b[g_col * p.k + g_row];
+            } else {
+                tb[kk * 64u + cc] = 0.0;
+            }
         }
         workgroupBarrier();
+
         for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
-            acc = acc + ta[lr * 16u + kk] * tb[kk * 16u + lc];
+            let a0 = ta[(ty * 4u + 0u) * 16u + kk];
+            let a1 = ta[(ty * 4u + 1u) * 16u + kk];
+            let a2 = ta[(ty * 4u + 2u) * 16u + kk];
+            let a3 = ta[(ty * 4u + 3u) * 16u + kk];
+            let b0 = tb[kk * 64u + tx * 4u + 0u];
+            let b1 = tb[kk * 64u + tx * 4u + 1u];
+            let b2 = tb[kk * 64u + tx * 4u + 2u];
+            let b3 = tb[kk * 64u + tx * 4u + 3u];
+            acc[0]  = acc[0]  + a0 * b0;
+            acc[1]  = acc[1]  + a0 * b1;
+            acc[2]  = acc[2]  + a0 * b2;
+            acc[3]  = acc[3]  + a0 * b3;
+            acc[4]  = acc[4]  + a1 * b0;
+            acc[5]  = acc[5]  + a1 * b1;
+            acc[6]  = acc[6]  + a1 * b2;
+            acc[7]  = acc[7]  + a1 * b3;
+            acc[8]  = acc[8]  + a2 * b0;
+            acc[9]  = acc[9]  + a2 * b1;
+            acc[10] = acc[10] + a2 * b2;
+            acc[11] = acc[11] + a2 * b3;
+            acc[12] = acc[12] + a3 * b0;
+            acc[13] = acc[13] + a3 * b1;
+            acc[14] = acc[14] + a3 * b2;
+            acc[15] = acc[15] + a3 * b3;
         }
         workgroupBarrier();
     }
-    if (gr < p.m && gc < p.n) {
-        c[gr * p.n + gc] = acc;
+
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+        for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+            let r = row0 + i;
+            let cc = col0 + j;
+            if (r < p.m && cc < p.n) {
+                c[r * p.n + cc] = acc[i * 4u + j];
+            }
+        }
     }
 }
 ";
@@ -121,8 +228,8 @@ struct GemmParams {
 }
 
 pub struct GemmKernel {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bind_group_layout: Arc<wgpu::BindGroupLayout>,
+    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bind_group_layout: Arc<wgpu::BindGroupLayout>,
 }
 
 impl GemmKernel {
@@ -208,8 +315,42 @@ impl GemmKernel {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
-        let groups_x = n.div_ceil(TILE);
-        let groups_y = m.div_ceil(TILE);
+        let groups_x = n.div_ceil(WG_N);
+        let groups_y = m.div_ceil(WG_M);
+        pass.dispatch_workgroups(groups_x, groups_y, 1);
+    }
+
+    pub fn build_bind(
+        &self,
+        ctx: &GpuContext,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        c: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora gemm bind"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: a.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: c.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) {
+        let p = GemmParams { m, n, k, _pad: 0 };
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        let groups_x = n.div_ceil(WG_N);
+        let groups_y = m.div_ceil(WG_M);
         pass.dispatch_workgroups(groups_x, groups_y, 1);
     }
 }
@@ -239,6 +380,31 @@ impl GemmTransposeBKernel {
         k: u32,
     ) {
         self.inner.dispatch_into(ctx, encoder, a, b, c, m, n, k);
+    }
+
+    pub fn build_bind(
+        &self,
+        ctx: &GpuContext,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        c: &GpuBuffer,
+    ) -> wgpu::BindGroup {
+        self.inner.build_bind(ctx, a, b, c)
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) {
+        self.inner.dispatch_with_bind(pass, bind, m, n, k);
+    }
+
+    pub(crate) fn pipeline(&self) -> &wgpu::ComputePipeline {
+        &self.inner.pipeline
     }
 }
 

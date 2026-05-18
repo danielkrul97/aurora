@@ -232,26 +232,19 @@ impl SingleTokenEmbedKernel {
 //   k_history  : [max_len * d_model] (only first t_total rows valid)
 //   v_history  : [max_len * d_model]
 // Output:
-//   out        : [d_model] (filled for this head's slice)
+//   out        : [d_model] (filled for all heads in one dispatch)
 //
-// Parallel three-phase kernel, one workgroup per head, 64 threads
-// cooperating:
-//   Phase 1: stride-loop score compute (Q·K[j]·scale) + per-thread max
-//            → workgroup-shared max reduction → row_max broadcast
-//   Phase 2: stride-loop exp(s - row_max) + per-thread sum
-//            → workgroup-shared sum reduction → inv broadcast
-//   Phase 3: one thread per output feature `c` accumulates over j
-//
-// External scratch buffer holds per-position scores (sized to at most
-// `max_len`); workgroup-shared memory only carries the small reduction
-// arrays. Causal mask trivially satisfied: query is the newest position.
+// Workgroup per head (wg.y = head_idx), 64 threads stride-loop over j.
+// Scratch is `[n_head * max_len]` so heads don't race on the score row.
+// Phases 1-3: cooperative max → exp/sum → V-output, identical structure
+// to the training-path forward MHA but for a single query position.
 
 const MHA_KV_CACHE_WGSL: &str = "
 struct P {
     t_total: u32,
     d_head: u32,
     n_head: u32,
-    head_idx: u32,
+    max_len: u32,
     scale: f32,
     _p0: u32,
     _p1: u32,
@@ -271,10 +264,15 @@ var<workgroup> sh_row_max: f32;
 var<workgroup> sh_sum_e: f32;
 
 @compute @workgroup_size(64)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let head_idx = wgid.y;
     let tid = lid.x;
     let d_model = p.d_head * p.n_head;
-    let h_off = p.head_idx * p.d_head;
+    let h_off = head_idx * p.d_head;
+    let scratch_base = head_idx * p.max_len;
 
     // Phase 1: parallel score compute + local max reduction.
     var local_max: f32 = -3.4028235e38;
@@ -286,7 +284,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             s = s + q_new[h_off + c] * k_history[j * d_model + h_off + c];
         }
         s = s * p.scale;
-        scratch[j] = s;
+        scratch[scratch_base + j] = s;
         if (s > local_max) { local_max = s; }
         j = j + 64u;
     }
@@ -311,8 +309,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     j = tid;
     loop {
         if (j >= p.t_total) { break; }
-        let e = exp(scratch[j] - row_max);
-        scratch[j] = e;
+        let e = exp(scratch[scratch_base + j] - row_max);
+        scratch[scratch_base + j] = e;
         local_sum = local_sum + e;
         j = j + 64u;
     }
@@ -339,7 +337,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         if (c >= p.d_head) { break; }
         var acc: f32 = 0.0;
         for (var jj: u32 = 0u; jj < p.t_total; jj = jj + 1u) {
-            acc = acc + scratch[jj] * inv * v_history[jj * d_model + h_off + c];
+            acc = acc + scratch[scratch_base + jj] * inv * v_history[jj * d_model + h_off + c];
         }
         out[h_off + c] = acc;
         c = c + 64u;
@@ -353,7 +351,7 @@ struct MhaKvParams {
     t_total: u32,
     d_head: u32,
     n_head: u32,
-    head_idx: u32,
+    max_len: u32,
     scale: f32,
     _p0: u32,
     _p1: u32,
@@ -412,6 +410,8 @@ impl MhaKvCacheKernel {
         }
     }
 
+    /// One dispatch fires all `n_head` heads. `scratch` must be sized
+    /// `n_head * max_len`.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_into(
         &self,
@@ -425,14 +425,14 @@ impl MhaKvCacheKernel {
         t_total: u32,
         n_head: u32,
         d_head: u32,
-        head_idx: u32,
+        max_len: u32,
     ) {
         let scale = (d_head as f32).sqrt().recip();
         let p = MhaKvParams {
             t_total,
             d_head,
             n_head,
-            head_idx,
+            max_len,
             scale,
             _p0: 0,
             _p1: 0,
@@ -456,6 +456,6 @@ impl MhaKvCacheKernel {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
-        pass.dispatch_workgroups(1, 1, 1);
+        pass.dispatch_workgroups(1, n_head, 1);
     }
 }

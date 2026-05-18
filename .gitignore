@@ -29,3 +29,10 @@ logs/
 
 # Claude Code local session state
 .claude/
+/screenshots/
+
+# Autonomous research loop — worktrees, checkpoints, machine-specific baseline
+experiments/wt/
+experiments/*.ckpt
+experiments/baseline.jsonl
+experiments/results/*/*.ckpt

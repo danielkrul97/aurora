@@ -13,15 +13,14 @@ use aurora::attention::{
 use aurora::gpu::buffers::GpuBuffer;
 use aurora::gpu::{
     cpu_gemm, cpu_gemm_transpose_b, CausalMhaBackwardKernel, CausalMhaForwardKernel,
-    EmbedScatterAddKernel, GeluBackwardKernel, GeluKernel, GemmKernel, GemmTransposeBKernel,
-    GpuContext, GradNormSqReduceKernel, LayerNormBackwardKernel, LayerNormForwardKernel,
+    GeluBackwardKernel, GeluKernel, GemmKernel, GemmTransposeBKernel, GpuContext,
+    GradNormSqReduceKernel, LayerNormBackwardKernel, LayerNormForwardKernel,
     OuterProductAccumKernel, RowReduceAddKernel, TokenPosEmbedKernel,
 };
 use aurora::linalg::{gelu, gelu_backward};
 use aurora::transformer::attention::{causal_mha_forward, MhaWeights};
 use aurora::transformer::embedding::{
-    embed_backward, embed_forward, tied_lm_head_backward, tied_lm_head_forward, EmbedGrads,
-    EmbedWeights,
+    embed_forward, tied_lm_head_backward, tied_lm_head_forward, EmbedGrads, EmbedWeights,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -180,8 +179,9 @@ fn layer_norm_forward_backward_matches_cpu() {
     let x_hat_gpu = GpuBuffer::zeros(&ctx, "x_hat", t * d);
     let dy_gpu = GpuBuffer::from_slice(&ctx, "dy", &dy);
     let dx_gpu = GpuBuffer::zeros(&ctx, "dx", t * d);
-    let dg_pr_gpu = GpuBuffer::zeros(&ctx, "dg_pr", t * d);
-    let db_pr_gpu = GpuBuffer::zeros(&ctx, "db_pr", t * d);
+    // d_gamma/d_beta are accumulated atomically — start at zero, kernel adds.
+    let dg_gpu = GpuBuffer::zeros(&ctx, "dg", d);
+    let db_gpu = GpuBuffer::zeros(&ctx, "db", d);
 
     let mut enc = ctx
         .device
@@ -191,24 +191,15 @@ fn layer_norm_forward_backward_matches_cpu() {
         &x_hat_gpu, t as u32, d as u32, ln.eps,
     );
     bwd.dispatch_into(
-        &ctx, &mut enc, &dy_gpu, &gamma_gpu, &x_hat_gpu, &inv_std_gpu, &dx_gpu, &dg_pr_gpu,
-        &db_pr_gpu, t as u32, d as u32,
+        &ctx, &mut enc, &dy_gpu, &gamma_gpu, &x_hat_gpu, &inv_std_gpu, &dx_gpu, &dg_gpu,
+        &db_gpu, t as u32, d as u32,
     );
     ctx.queue.submit(Some(enc.finish()));
 
     let gpu_y = y_gpu.download(&ctx);
     let gpu_dx = dx_gpu.download(&ctx);
-    let gpu_dg_pr = dg_pr_gpu.download(&ctx);
-    let gpu_db_pr = db_pr_gpu.download(&ctx);
-    // Reduce per-row → per-feature on host
-    let mut gpu_dgamma = vec![0.0_f32; d];
-    let mut gpu_dbeta = vec![0.0_f32; d];
-    for row in 0..t {
-        for c in 0..d {
-            gpu_dgamma[c] += gpu_dg_pr[row * d + c];
-            gpu_dbeta[c] += gpu_db_pr[row * d + c];
-        }
-    }
+    let gpu_dgamma = dg_gpu.download(&ctx);
+    let gpu_dbeta = db_gpu.download(&ctx);
 
     let err_y = max_rel_err(&cpu_y, &gpu_y);
     let err_dx = max_rel_err(&cpu_dx, &gpu_dx);
@@ -234,35 +225,31 @@ fn causal_mha_forward_matches_cpu() {
         let x = random_vec(t * d_model, &mut rng);
         let (cpu_y, cpu_cache) = causal_mha_forward(&w, &x);
 
-        // We compare per-head SDPA outputs by isolating heads_out from
-        // CPU cache vs running GPU once per head.
+        // Single dispatch handles all heads via wg.y = head_idx.
         let q_gpu = GpuBuffer::from_slice(&ctx, "q", &cpu_cache.q);
         let k_gpu = GpuBuffer::from_slice(&ctx, "k", &cpu_cache.k);
         let v_gpu = GpuBuffer::from_slice(&ctx, "v", &cpu_cache.v);
         let out_gpu = GpuBuffer::zeros(&ctx, "out", t * d_model);
-        let probs_gpu = GpuBuffer::zeros(&ctx, "probs", t * t);
+        let probs_gpu = GpuBuffer::zeros(&ctx, "probs", n_head * t * t);
 
-        for h in 0..n_head {
-            let mut enc = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("mha fwd"),
-                });
-            fwd.dispatch_into(
-                &ctx,
-                &mut enc,
-                &q_gpu,
-                &k_gpu,
-                &v_gpu,
-                &out_gpu,
-                &probs_gpu,
-                t as u32,
-                n_head as u32,
-                d_head as u32,
-                h as u32,
-            );
-            ctx.queue.submit(Some(enc.finish()));
-        }
+        let mut enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mha fwd"),
+            });
+        fwd.dispatch_into(
+            &ctx,
+            &mut enc,
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            &out_gpu,
+            &probs_gpu,
+            t as u32,
+            n_head as u32,
+            d_head as u32,
+        );
+        ctx.queue.submit(Some(enc.finish()));
         // Compare GPU heads_out vs CPU heads_out (before output projection).
         let gpu_heads_out = out_gpu.download(&ctx);
         let err = max_rel_err(&cpu_cache.heads_out, &gpu_heads_out);
@@ -301,28 +288,26 @@ fn causal_mha_backward_matches_cpu() {
     let k_gpu = GpuBuffer::from_slice(&ctx, "k", &cache.k);
     let v_gpu = GpuBuffer::from_slice(&ctx, "v", &cache.v);
     let out_gpu = GpuBuffer::zeros(&ctx, "out", t * d_model);
-    let probs_gpu = GpuBuffer::zeros(&ctx, "probs", t * t);
+    let probs_gpu = GpuBuffer::zeros(&ctx, "probs", n_head * t * t);
     let dout_gpu = GpuBuffer::from_slice(&ctx, "dout", &d_heads_out);
     let dq_gpu = GpuBuffer::zeros(&ctx, "dq", t * d_model);
     let dk_gpu = GpuBuffer::zeros(&ctx, "dk", t * d_model);
     let dv_gpu = GpuBuffer::zeros(&ctx, "dv", t * d_model);
-    let d_scores = GpuBuffer::zeros(&ctx, "d_scores", t * t);
+    let d_scores = GpuBuffer::zeros(&ctx, "d_scores", n_head * t * t);
 
-    for h in 0..n_head {
-        let mut enc = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mha bwd") });
-        fwd.dispatch_into(
-            &ctx, &mut enc, &q_gpu, &k_gpu, &v_gpu, &out_gpu, &probs_gpu,
-            t as u32, n_head as u32, d_head as u32, h as u32,
-        );
-        bwd.dispatch_into(
-            &ctx, &mut enc, &q_gpu, &k_gpu, &v_gpu, &probs_gpu, &dout_gpu,
-            &dq_gpu, &dk_gpu, &dv_gpu, &d_scores,
-            t as u32, n_head as u32, d_head as u32, h as u32,
-        );
-        ctx.queue.submit(Some(enc.finish()));
-    }
+    let mut enc = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mha bwd") });
+    fwd.dispatch_into(
+        &ctx, &mut enc, &q_gpu, &k_gpu, &v_gpu, &out_gpu, &probs_gpu,
+        t as u32, n_head as u32, d_head as u32,
+    );
+    bwd.dispatch_into(
+        &ctx, &mut enc, &q_gpu, &k_gpu, &v_gpu, &probs_gpu, &dout_gpu,
+        &dq_gpu, &dk_gpu, &dv_gpu, &d_scores,
+        t as u32, n_head as u32, d_head as u32,
+    );
+    ctx.queue.submit(Some(enc.finish()));
     let gpu_dq = dq_gpu.download(&ctx);
     let gpu_dk = dk_gpu.download(&ctx);
     let gpu_dv = dv_gpu.download(&ctx);

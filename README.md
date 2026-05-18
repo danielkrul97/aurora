@@ -57,7 +57,8 @@ WGSL, Vulkan/Metal/DX12).
 ### Tréninková infrastruktura
 - **`aurora_train` example** — hlavní entry point. CLI: `--d-model`,
   `--n-layer`, `--n-head`, `--d-ff`, `--seq-len`, `--batch-size`, `--lr`,
-  `--warmup-steps`, `--weight-decay`, `--grad-clip`, `--gpu` (opt-in).
+  `--warmup-steps`, `--weight-decay`, `--grad-clip`, `--gpu` (opt-in),
+  `--viz` (opt-in).
 - **JSONL structured metrics** (`--metrics path.jsonl`) — `run` / `step` /
   `epoch_done` / `checkpoint` events, per-event flush
 - **`scripts/overnight.sh`** — nohup wrapper s pre-flight checks
@@ -65,6 +66,14 @@ WGSL, Vulkan/Metal/DX12).
   testů), `transformer_smoke` (3 convergence testů), `lm_quality_regression`
   (3 testů), `stability` (7 testů), `gpu_parity` (13 testů s `--features gpu`),
   `kv_cache` (3 testů).
+
+### Live vizualizace (Bevy, opt-in)
+- **`src/viz/`** + cargo feature `viz` — real-time Bevy 0.18 okno
+  s pipeline-flow vizualizací: embed → N×{attn/ffn bar} → LM head,
+  loss curve, decoded input/pred preview s OK/MISS indikátorem
+- Trénink běží ve worker threadu, viz na main threadu, sdílí
+  `Arc<Mutex<TrainingSnapshot>>` — žádný impact na throughput
+- Window close = trénink pokračuje headless
 
 ## Spuštění
 
@@ -91,6 +100,13 @@ cargo run --release --features gpu --example aurora_train -- \
   --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 \
   --seq-len 256 --batch-size 16 --epochs 20 \
   --lr 6e-4 --warmup-steps 2000
+
+# Live visualization (Bevy okno + CLI souběžně, --features viz,gpu)
+cargo run --release --features viz,gpu --example aurora_train -- \
+  --viz --gpu --corpus data/tiny_600k.txt --bpe data/tiny_600k_2048.bpe \
+  --vocab 2048 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 \
+  --seq-len 256 --batch-size 16 --epochs 8 \
+  --checkpoint data/tiny_600k_d384_l6_v2048.ckpt
 
 # Overnight wrapper (nohup + pre-flight + JSONL metrics)
 bash scripts/overnight.sh                  # default 25 epoch
