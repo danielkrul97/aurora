@@ -141,3 +141,96 @@ Pouze pokud S52 pass. Možnosti:
 - **CfC bez parallel scan na MAX_HIDDEN ≤ 1024 workgroup memory budget** —
   trade-off `n_hidden` vs. throughput nestudovaný.
 - **BPE × LNN-CfC LM** — málo prior work; SpikeGPT používá byte-level.
+
+---
+
+## Sprint 52+ — HDC pivot (LNN → bipolar HDC / VSA)
+
+LNN ablace ze Sprintu 51 sloužila jako baseline pro architektonickou
+otázku „kolik induktivního biasu chce Aurora ponechat". Po S51 se rozhodlo
+o **kompletním pivotu na bipolární HDC** (Multiply-Add-Permute, Kanerva 2009)
+— jednodušší matematika, žádný BPTT, větší inductive bias na compositional
+sequence representation, GPU-friendly (encoder = embarrassingly parallel
+bind+bundle, žádný T-loop reverse pass).
+
+### Designová rozhodnutí (uživatel potvrdil před S52)
+
+| # | Volba | Hodnota |
+|---|---|---|
+| 1 | Hypervektorový alfabet | **bipolar f32 ±1** (MAP); binary packed bits jako S56+ alternative |
+| 2 | Default `D` | **2048** pro tiny_200k, **4096** pro enwik8 |
+| 3 | LM strategie | **HDC encoder + trainable lineární readout**, Adam přes CE loss |
+| 4 | Sequence representation | **position binding** (cyclic-shift `P^pos(token_hv)`) + streaming prefix-sum bundle |
+| 5 | Trainable scope | **frozen codebook, jen readout** v S52–S55; codebook gradient ablace v S56 |
+| 6 | Training algorithm | Adam, reuse `optimizer.rs` |
+
+### S52 — CPU HDC primitivy (DONE)
+
+- `src/hdc/` modul: `Codebook` (random ±1), `ops::{bind, bundle, permute, similarity}`,
+  `Readout` (lineární head + Adam state), `HdcLm` wrapper s `forward_lm_tokens_stateful`,
+  `forward_backward_batch_tokens_stateful` API matching dříve LNN signature.
+- `tests/hdc_smoke.rs` — 11 testů: bind self-inverse, bundle membership > random,
+  permute orthogonal across offsets, permute round-trip, encode determinism,
+  finite-diff readout grad (W + b), training reduces loss, state-carry
+  consistency, codebook bipolar invariant. **Všech 11 zelených.**
+
+### S53 — GPU stack + parita (DONE)
+
+- `src/gpu/kernels_common.rs` — extracted generic kernely (linear forward/backward,
+  softmax_ce, reduce_per_batch, zero, scale, adam, l2_norm).
+- `src/gpu/kernels_hdc.rs` — `ENCODE_FORWARD_WGSL`: per-batch workgroup,
+  T-loop fused, workgroup-shared accumulator, cyclic-shift permute via `(i + D - shift) mod D`,
+  norm-stable `1/sqrt(pos+1)` scale.
+- `src/gpu/hdc_gpu.rs` — `HdcGpu` struct, mirror of CPU API, lazy chunk cache,
+  `from_cpu` / `to_cpu` round-trip.
+- `tests/hdc_gpu_parity.rs` — 5 testů, tolerance 1e-3 single-step / 5e-3 multi-step:
+  forward parity logits + contexts, backward Adam single step, 10-step drift,
+  state carry across consecutive chunks. **Všech 5 zelených.**
+- HDC GPU stack je výrazně jednodušší než LNN (žádný T-loop reverse pass) —
+  ~860 řádků vs. ~1700 LNN.
+
+### S54 — Cleanup + train loop + checkpoint (DONE)
+
+- Smazáno: `src/lnn.rs` (~1100 řádků), `src/gpu/lnn_gpu.rs` (~1700),
+  `src/gpu/kernels_lnn.rs` (~1000), `tests/lnn_smoke.rs`, `tests/lnn_gpu_parity.rs`.
+- Checkpoint magic `AURORA-LNN01` → **`AURORA-HDC01`**, schema přepsáno
+  (codebook + readout místo per-layer LNN matrices). Žádný backward compat.
+- `examples/aurora_train.rs` přepsán: CLI nahradil `--hidden / --layers / --tau-init / --memory-frac /
+  --tau-mem-init` jediným `--dim` + nepovinný `--stateful` flag pro carry bundle
+  napříč chunks v rámci epochy. Default = stateless per chunk.
+- `Cargo.toml` 0.2.0 → **0.3.0**, description „bipolar HDC".
+- Diagnostics fields: `bundle_norm`, `cleanup_top1` (argmax-cosine codebook recovery,
+  pure-HDC signal nezávislý na readoutu).
+- `analysis/diagnostics.py`, `scripts/overnight.sh`, `README.md`, `CLAUDE.md`
+  aktualizované.
+- **21 testů zelených** (5 lib unit incl. checkpoint round-trip + 11 hdc smoke + 5 gpu parity).
+
+### S55+ — Smoke run + enwik8 baseline (next)
+
+Otevřené úkoly:
+- Tiny_200k smoke run (D=2048, vocab=512, 1 epocha, GPU): **cíl val BPB ≤ 4.5**.
+- enwik8_10m overnight (D=4096, vocab=4096, 25 epoch): **cíl val BPB ≤ 4.0**.
+  Sprint 48 SSM baseline byl 2.36 — HDC pravděpodobně neporazí, ale „kolik ztrácí"
+  je validation outcome.
+
+### S56+ — Ablace + open questions
+
+- **Trainable codebook**: zapnout gradient přes `bind/bundle/permute` zpět do
+  `codebook.items`. WGSL kernel `hdc_encode_backward` se scatter-add per-batch
+  (problematika: stejný `token_id` v batchi víckrát → atomic add nebo
+  per-position scatter buffer).
+- **Packed binary alphabet**: `D = 8192` bits = `D/32` u32 per vector
+  (32× méně VRAM). WGSL `countOneBits` pro Hamming similarity. Bundle = majority
+  vote přes int counter buffer + threshold.
+- **Stateful long-context**: porovnat `--stateful` vs. default. EMA-decay state carry
+  jako kompromis.
+
+### Otevřené otázky pro HDC era
+
+- **Codebook capacity**: D=2048 random bipolar má kapacitu ~`0.04 * D = 82`
+  rozlišitelných vzorů (Kanerva 2009 odhad). Pro vocab=4096 obrovský overlap →
+  cleanup_top1 bude nízká dokud není trainable codebook (S56+).
+- **Pure-gradient HDC LM**: literatura na BPE-level autoregressive HDC je řídká.
+  Pokud val BPB > 5.0 v S55, signal že varianta s pouhým readoutem nestačí.
+- **Bundle entropy bottleneck**: kolik unikátních context HV vektorů je discriminable
+  po `T=64` bind+bundle? Čistě teoretická otevřená otázka.

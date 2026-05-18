@@ -1,13 +1,13 @@
-//! GPU infrastructure for LNN-CfC. wgpu over Vulkan/Metal/DX12 backend.
+//! GPU infrastructure for the bipolar HDC stack. wgpu over
+//! Vulkan/Metal/DX12 backend.
 //!
 //! `GpuContext` holds device + queue. `buffers::GpuBuffer` is a typed
 //! wrapper over `wgpu::Buffer` that handles upload/download for `f32`
-//! slices. `lnn_gpu::MultiLayerLnnSnnGpu` mirrors the CPU
-//! `crate::lnn::MultiLayerLnnSnn` API but keeps weights, activations,
-//! and Adam state resident in VRAM.
+//! slices. `hdc_gpu::HdcGpu` mirrors the CPU `crate::hdc::HdcLm` API
+//! but keeps the codebook, readout weights, and Adam state resident in
+//! VRAM.
 //!
-//! Gated by the `gpu` cargo feature. Without the feature, only the CPU
-//! path in `crate::lnn` is compiled.
+//! Gated by the `gpu` cargo feature.
 
 #![allow(
     clippy::redundant_clone,
@@ -24,8 +24,9 @@
 
 pub mod buffers;
 pub mod context;
-pub mod kernels_lnn;
-pub mod lnn_gpu;
+pub mod hdc_gpu;
+pub mod kernels_common;
+pub mod kernels_hdc;
 
 pub use context::GpuContext;
-pub use lnn_gpu::MultiLayerLnnSnnGpu;
+pub use hdc_gpu::HdcGpu;

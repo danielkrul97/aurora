@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 
 EPOCHS="${1:-25}"
 CORPUS="data/enwik8_10m.txt"
-CHECKPOINT="data/enwik8_10m_h1024_v4096.ckpt"
+CHECKPOINT="data/enwik8_10m_d4096_v4096.ckpt"
 
 # --- Pre-flight checks ---
 
@@ -51,7 +51,7 @@ LOG="logs/overnight_$(date +%Y%m%d_%H%M).log"
 nohup "$BIN" \
     --corpus "$CORPUS" \
     --vocab 4096 \
-    --hidden 1024 \
+    --dim 4096 \
     --epochs "$EPOCHS" \
     --chunk 64 \
     --lr 0.002 \
@@ -71,12 +71,12 @@ fi
 echo "started: PID $PID"
 echo "log:     $LOG"
 echo "ckpt:    $CHECKPOINT"
-echo "epochs:  $EPOCHS  (~$(( EPOCHS * 17 )) min odhad pro 10 MB / hidden 1024)"
+echo "epochs:  $EPOCHS  (~$(( EPOCHS * 5 )) min odhad pro 10 MB / D=4096)"
 echo
 echo "monitor:"
 echo "  tail -f $LOG"
 echo "  watch -n 30 nvidia-smi"
-echo "  grep -E 'epoch done|val bpb|rates|α \\[' $LOG"
+echo "  grep -E 'done|val|bundle_norm|cleanup_top1' $LOG"
 echo
 echo "stop:"
 echo "  kill $PID"

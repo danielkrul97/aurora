@@ -4,24 +4,23 @@
     clippy::too_many_lines
 )]
 
-//! Aurora — closed-form continuous-time (CfC) Liquid Neural Network
-//! language-model trainer.
+//! Aurora — bipolar HDC language-model trainer.
 //!
 //! Default backend: GPU (wgpu over Vulkan/Metal/DX12). Pass `--cpu` to
 //! force the rayon CPU path. Both backends share the same parameter
-//! layout (`crate::lnn::MultiLayerLnnSnn`) and the same `AURORA-LNN01`
-//! checkpoint format, so the GPU run is bit-equivalent to CPU within
-//! FP32 noise (see `tests/lnn_gpu_parity.rs`).
+//! layout (`crate::hdc::HdcLm`) and the same `AURORA-HDC01` checkpoint
+//! format, so the GPU run is bit-equivalent to CPU within FP32 noise
+//! (see `tests/hdc_gpu_parity.rs`).
 //!
 //! Usage:
 //!   cargo run --release --features gpu --example aurora_train -- \
-//!     --corpus data/tiny_600k.txt \
-//!     --vocab 1024 --hidden 128 --layers 2 \
+//!     --corpus data/tiny_200k.txt \
+//!     --vocab 512 --dim 2048 \
 //!     --epochs 3 --chunk 64 --lr 0.005 \
-//!     --checkpoint data/tiny_600k_h128.ckpt
+//!     --checkpoint data/tiny_200k_d2048.ckpt
 //!
-//! All flags optional; defaults are tuned for the tiny_600k smoke
-//! comparison against the Sprint 48 baseline.
+//! All flags optional; defaults are tuned for a quick smoke comparison
+//! against the LNN-era baseline.
 
 use std::env;
 use std::fs::File;
@@ -32,7 +31,7 @@ use std::time::Instant;
 
 use aurora::bpe::BpeTokenizer;
 use aurora::checkpoint;
-use aurora::lnn::{LnnState, MultiLayerLnnSnn};
+use aurora::hdc::{HdcLm, HdcState};
 use aurora::loss::cross_entropy_loss;
 use aurora::optimizer::AdamConfig;
 use aurora::text_io::{bits_per_byte, load_corpus, sample_token};
@@ -42,30 +41,26 @@ use rand::SeedableRng;
 use textplots::{Chart, Plot, Shape};
 
 #[cfg(feature = "gpu")]
-use aurora::gpu::{GpuContext, MultiLayerLnnSnnGpu};
+use aurora::gpu::{GpuContext, HdcGpu};
 
 const GRAD_CLIP: f32 = 1.0;
 const SAMPLE_LEN: usize = 200;
 const SAMPLE_TEMP: f32 = 0.8;
-const BATCH_SIZE: usize = 16;
+const DEFAULT_BATCH: usize = 16;
 const BOX_WIDTH: usize = 60;
 
 #[derive(Debug, Clone)]
 struct Cli {
     corpus: PathBuf,
     vocab: usize,
-    hidden: usize,
-    layers: usize,
+    dim: usize,
     epochs: usize,
     chunk: usize,
     lr: f32,
-    tau_init: f32,
-    /// M-LTC: fraction of *top-layer* neurons that run the memory
-    /// variant (sin/cos activation, log_tau floored at LOG_TAU_MEM_MIN).
-    /// `0.0` (default) reproduces classic CfC.
-    memory_frac: f32,
-    /// Initial log_tau for memory neurons (clamped to ≥ LOG_TAU_MEM_MIN).
-    tau_mem_init: f32,
+    batch: usize,
+    /// If true, carry the bundle accumulator across chunks within one
+    /// epoch (long-context HDC). Default false = stateless per chunk.
+    stateful: bool,
     bpe_path: Option<PathBuf>,
     metrics: Option<PathBuf>,
     checkpoint: Option<PathBuf>,
@@ -75,16 +70,14 @@ struct Cli {
 
 impl Cli {
     fn parse() -> Result<Self, String> {
-        let mut corpus: PathBuf = "data/tiny_600k.txt".into();
-        let mut vocab: usize = 1024;
-        let mut hidden: usize = 128;
-        let mut layers: usize = 2;
+        let mut corpus: PathBuf = "data/tiny_200k.txt".into();
+        let mut vocab: usize = 512;
+        let mut dim: usize = 2048;
         let mut epochs: usize = 3;
         let mut chunk: usize = 64;
         let mut lr: f32 = 0.005;
-        let mut tau_init: f32 = 0.0;
-        let mut memory_frac: f32 = 0.0;
-        let mut tau_mem_init: f32 = 1.5;
+        let mut batch: usize = DEFAULT_BATCH;
+        let mut stateful = false;
         let mut bpe_path: Option<PathBuf> = None;
         let mut metrics: Option<PathBuf> = None;
         let mut ckpt: Option<PathBuf> = None;
@@ -107,12 +100,8 @@ impl Cli {
                     vocab = want_value(i)?.parse().map_err(|e| format!("--vocab: {e}"))?;
                     i += 2;
                 }
-                "--hidden" => {
-                    hidden = want_value(i)?.parse().map_err(|e| format!("--hidden: {e}"))?;
-                    i += 2;
-                }
-                "--layers" => {
-                    layers = want_value(i)?.parse().map_err(|e| format!("--layers: {e}"))?;
+                "--dim" => {
+                    dim = want_value(i)?.parse().map_err(|e| format!("--dim: {e}"))?;
                     i += 2;
                 }
                 "--epochs" => {
@@ -127,23 +116,13 @@ impl Cli {
                     lr = want_value(i)?.parse().map_err(|e| format!("--lr: {e}"))?;
                     i += 2;
                 }
-                "--tau-init" => {
-                    tau_init = want_value(i)?
-                        .parse()
-                        .map_err(|e| format!("--tau-init: {e}"))?;
+                "--batch" => {
+                    batch = want_value(i)?.parse().map_err(|e| format!("--batch: {e}"))?;
                     i += 2;
                 }
-                "--memory-frac" => {
-                    memory_frac = want_value(i)?
-                        .parse()
-                        .map_err(|e| format!("--memory-frac: {e}"))?;
-                    i += 2;
-                }
-                "--tau-mem-init" => {
-                    tau_mem_init = want_value(i)?
-                        .parse()
-                        .map_err(|e| format!("--tau-mem-init: {e}"))?;
-                    i += 2;
+                "--stateful" => {
+                    stateful = true;
+                    i += 1;
                 }
                 "--bpe-path" => {
                     bpe_path = Some(want_value(i)?.into());
@@ -173,11 +152,14 @@ impl Cli {
             }
         }
 
-        if layers < 1 {
-            return Err("--layers must be ≥ 1".into());
+        if vocab < 16 {
+            return Err("--vocab must be ≥ 16".into());
         }
-        if vocab < 256 {
-            return Err("--vocab must be ≥ 256 (byte-level minimum)".into());
+        if dim < 64 {
+            return Err("--dim must be ≥ 64".into());
+        }
+        if dim > 4096 {
+            return Err("--dim must be ≤ 4096 (GPU workgroup-shared budget)".into());
         }
         if chunk < 1 {
             return Err("--chunk must be ≥ 1".into());
@@ -185,28 +167,30 @@ impl Cli {
         if epochs < 1 {
             return Err("--epochs must be ≥ 1".into());
         }
-        if !(0.0..=1.0).contains(&memory_frac) {
-            return Err("--memory-frac must be in [0, 1]".into());
+        if batch < 1 {
+            return Err("--batch must be ≥ 1".into());
         }
-        // M-LTC currently has no GPU kernel; force CPU when enabled.
-        if memory_frac > 0.0 && !cpu {
-            eprintln!(
-                "note: --memory-frac > 0 forces CPU backend (no GPU kernel for sin/cos cell yet)"
-            );
-            cpu = true;
+        // wgpu binding-size cap (typically 128 MB on consumer GPUs).
+        // Per-batch grad buffer = batch * vocab * dim * 4 bytes.
+        let pb_bytes = batch as u64 * vocab as u64 * dim as u64 * 4;
+        if pb_bytes > 128 * 1024 * 1024 && !cpu {
+            let hint = (128 * 1024 * 1024) / (vocab as u64 * dim as u64 * 4);
+            return Err(format!(
+                "GPU per-batch grad buffer = {} MB exceeds 128 MB binding limit. \
+                 Reduce --batch (try ≤ {hint}), --vocab, or --dim, or pass --cpu.",
+                pb_bytes / (1024 * 1024)
+            ));
         }
 
         Ok(Self {
             corpus,
             vocab,
-            hidden,
-            layers,
+            dim,
             epochs,
             chunk,
             lr,
-            tau_init,
-            memory_frac,
-            tau_mem_init,
+            batch,
+            stateful,
             bpe_path,
             metrics,
             checkpoint: ckpt,
@@ -217,50 +201,44 @@ impl Cli {
 }
 
 fn print_usage() {
-    println!("aurora_train — CfC LNN language-model trainer (GPU default)");
+    println!("aurora_train — bipolar HDC language-model trainer (GPU default)");
     println!();
     println!("flags (all optional):");
-    println!("  --corpus PATH     UTF-8 byte corpus           [default: data/tiny_600k.txt]");
-    println!("  --vocab N         BPE vocab size              [default: 1024]");
-    println!("  --hidden N        per-layer hidden dim        [default: 128, ≤ 1024 on GPU]");
-    println!("  --layers N        number of LNN layers        [default: 2]");
+    println!("  --corpus PATH     UTF-8 byte corpus           [default: data/tiny_200k.txt]");
+    println!("  --vocab N         BPE vocab size              [default: 512]");
+    println!("  --dim N           hyperdim D                  [default: 2048, max 4096 on GPU]");
     println!("  --epochs N        training epochs             [default: 3]");
-    println!("  --chunk N         BPTT chunk length (toks)    [default: 64]");
+    println!("  --chunk N         chunk length (tokens)       [default: 64]");
     println!("  --lr F            Adam learning rate          [default: 0.005]");
-    println!("  --tau-init F      log_tau init                [default: 0.0]");
-    println!("  --memory-frac F   M-LTC memory fraction in    [default: 0.0; 0 = pure CfC]");
-    println!("                    top layer (forces --cpu)");
-    println!("  --tau-mem-init F  log_tau init for memory     [default: 1.5]");
-    println!("  --bpe-path PATH   cache BPE merges            [default: <corpus>.bpe]");
+    println!("  --batch N         batch size                  [default: 16; lower if GPU OOM]");
+    println!("  --stateful        carry bundle across chunks  [default: stateless per chunk]");
+    println!("  --bpe-path PATH   cache BPE merges            [default: <corpus>.<vocab>.bpe]");
     println!("  --metrics PATH    JSONL metrics log           [default: logs/<stem>_<ts>.jsonl]");
-    println!("  --checkpoint PATH binary AURORA-LNN01 ckpt    [default: none]");
+    println!("  --checkpoint PATH binary AURORA-HDC01 ckpt    [default: none]");
     println!("  --seed N          RNG seed                    [default: 0xC0FFEE]");
     println!("  --cpu             force CPU (rayon) backend   [default: GPU when feature on]");
 }
 
-/// Backend choice. CPU keeps the network struct directly; GPU keeps a
-/// `MultiLayerLnnSnnGpu` plus a CPU-side mirror for evaluation /
-/// sampling / checkpoint save (refreshed via `to_cpu` once per epoch).
 enum Backend {
-    Cpu(MultiLayerLnnSnn),
+    Cpu(HdcLm),
     #[cfg(feature = "gpu")]
-    Gpu(MultiLayerLnnSnnGpu),
+    Gpu(HdcGpu),
 }
 
 impl Backend {
     fn name(&self) -> &'static str {
         match self {
-            Self::Cpu(_) => "CPU LNN-CfC (rayon)",
+            Self::Cpu(_) => "CPU HDC (rayon)",
             #[cfg(feature = "gpu")]
-            Self::Gpu(_) => "GPU LNN-CfC (wgpu)",
+            Self::Gpu(_) => "GPU HDC (wgpu)",
         }
     }
 
-    fn fresh_states(&self) -> Vec<LnnState> {
+    fn fresh_state(&self) -> HdcState {
         match self {
-            Self::Cpu(net) => net.fresh_states(),
+            Self::Cpu(net) => net.fresh_state(),
             #[cfg(feature = "gpu")]
-            Self::Gpu(net) => net.fresh_states(),
+            Self::Gpu(net) => net.fresh_state(),
         }
     }
 
@@ -268,12 +246,11 @@ impl Backend {
         &mut self,
         inputs: &[&[u32]],
         targets: &[&[u32]],
-        states: &mut [Vec<LnnState>],
+        states: &mut [HdcState],
         adam: &AdamConfig,
     ) -> f32 {
         match self {
             Self::Cpu(net) => {
-                net.zero_grad();
                 let loss = net.forward_backward_batch_tokens_stateful(inputs, targets, states);
                 net.clip_grads(GRAD_CLIP);
                 net.step_adam(adam);
@@ -291,7 +268,7 @@ impl Backend {
     }
 
     /// Snapshot CPU view of current weights — for evaluate, generate, save.
-    fn cpu_snapshot(&self) -> MultiLayerLnnSnn {
+    fn cpu_snapshot(&self) -> HdcLm {
         match self {
             Self::Cpu(net) => net.clone(),
             #[cfg(feature = "gpu")]
@@ -336,8 +313,8 @@ fn main() -> ExitCode {
     let tokens: Vec<u32> = bpe.encode(&corpus);
     let encode_s = encode_t0.elapsed().as_secs_f64();
     let n_tokens = tokens.len();
-    if n_tokens < (cli.chunk + 1) * BATCH_SIZE * 2 {
-        eprintln!("corpus too short for chunk={} batch={BATCH_SIZE}", cli.chunk);
+    if n_tokens < (cli.chunk + 1) * cli.batch * 2 {
+        eprintln!("corpus too short for chunk={} batch={}", cli.chunk, cli.batch);
         return ExitCode::FAILURE;
     }
     let split = (n_tokens as f32 * 0.95) as usize;
@@ -345,7 +322,6 @@ fn main() -> ExitCode {
     let val_toks = &tokens[split..];
     let comp = corpus.len() as f32 / n_tokens as f32;
 
-    // Net + start_epoch (0 unless we resumed from a checkpoint).
     let (mut backend, start_epoch) = build_backend(&cli, actual_vocab);
 
     let adam = AdamConfig {
@@ -405,7 +381,7 @@ fn main() -> ExitCode {
     for epoch in start_epoch..cli.epochs as u32 {
         let epoch_start = Instant::now();
 
-        let stream_len = train_toks.len() / BATCH_SIZE;
+        let stream_len = train_toks.len() / cli.batch;
         let n_chunks_per_stream = stream_len.saturating_sub(1) / cli.chunk;
         let report_every = (n_chunks_per_stream / 50).max(1);
         let mut total_nats = 0.0_f32;
@@ -415,19 +391,26 @@ fn main() -> ExitCode {
         let pb = ProgressBar::new(n_chunks_per_stream as u64).with_style(bar_style.clone());
         pb.set_message("·");
 
-        let mut states: Vec<Vec<LnnState>> =
-            (0..BATCH_SIZE).map(|_| backend.fresh_states()).collect();
-        let mut inputs_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
-        let mut targets_owned: Vec<&[u32]> = Vec::with_capacity(BATCH_SIZE);
+        // Stateful: keep states across the whole epoch's chunks (per-stream).
+        // Stateless: reset before each chunk.
+        let mut states: Vec<HdcState> =
+            (0..cli.batch).map(|_| backend.fresh_state()).collect();
+        let mut inputs_owned: Vec<&[u32]> = Vec::with_capacity(cli.batch);
+        let mut targets_owned: Vec<&[u32]> = Vec::with_capacity(cli.batch);
 
         for chunk_idx in 0..n_chunks_per_stream {
             inputs_owned.clear();
             targets_owned.clear();
-            for b in 0..BATCH_SIZE {
+            for b in 0..cli.batch {
                 let stream_start = b * stream_len;
                 let p = stream_start + chunk_idx * cli.chunk;
                 inputs_owned.push(&train_toks[p..p + cli.chunk]);
                 targets_owned.push(&train_toks[p + 1..p + cli.chunk + 1]);
+            }
+            if !cli.stateful {
+                for s in states.iter_mut() {
+                    *s = backend.fresh_state();
+                }
             }
             let loss = backend.forward_backward_chunk(
                 &inputs_owned,
@@ -436,7 +419,7 @@ fn main() -> ExitCode {
                 &adam,
             );
             total_nats += loss;
-            total_tokens += cli.chunk * BATCH_SIZE;
+            total_tokens += cli.chunk * cli.batch;
             chunks_seen += 1;
             pb.inc(1);
 
@@ -458,43 +441,27 @@ fn main() -> ExitCode {
         let train_bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
         pb.finish_with_message(format!("{train_bpb:.3}"));
 
-        // Snapshot CPU view for evaluation / sampling / checkpointing.
         let net_cpu = backend.cpu_snapshot();
-        let (val_bpb, activity, alpha_stats) = evaluate_lnn(&net_cpu, val_toks, cli.chunk, comp);
+        let (val_bpb, bundle_norm, cleanup_top1) =
+            evaluate_hdc(&net_cpu, val_toks, cli.chunk, comp, cli.stateful);
         if val_bpb < best_val {
             best_val = val_bpb;
         }
         val_history.push((chunks_seen as f32, val_bpb));
         let epoch_elapsed = epoch_start.elapsed().as_secs_f64();
-        let tau_means: Vec<f32> = net_cpu
-            .layers
-            .iter()
-            .map(|l| {
-                let n = l.log_tau.len() as f32;
-                if n == 0.0 {
-                    0.0
-                } else {
-                    l.log_tau.iter().map(|v| v.exp()).sum::<f32>() / n
-                }
-            })
-            .collect();
         println!(
             "  done — train {train_bpb:.3}  val {val_bpb:.3}  ({epoch_elapsed:.1}s)"
         );
-        epoch_diagnostics(&activity, &alpha_stats, &tau_means);
+        epoch_diagnostics(bundle_norm, cleanup_top1);
         render_bpb_chart(&train_history, &val_history, chunks_seen);
 
         if let Some(m) = metrics.as_mut() {
-            let alpha_means: Vec<f32> = alpha_stats.iter().map(|(m, _)| *m).collect();
-            let alpha_devs: Vec<f32> = alpha_stats.iter().map(|(_, d)| *d).collect();
             m.epoch_done(
                 epoch,
                 train_bpb,
                 val_bpb,
-                &activity,
-                &alpha_means,
-                &alpha_devs,
-                &tau_means,
+                bundle_norm,
+                cleanup_top1,
                 epoch_elapsed,
             );
         }
@@ -528,36 +495,12 @@ fn main() -> ExitCode {
 
 fn build_backend(cli: &Cli, actual_vocab: usize) -> (Backend, u32) {
     let mut rng = StdRng::seed_from_u64(cli.seed);
-    let hidden_dims = vec![cli.hidden; cli.layers];
-    // M-LTC: only the *top* layer gets memory neurons. Lower layers stay
-    // as fast/sensory CfC.
-    let n_mem_top = ((cli.hidden as f32) * cli.memory_frac).round() as usize;
-    let mut n_memory_per_layer = vec![0_usize; cli.layers];
-    if cli.memory_frac > 0.0 {
-        if let Some(last) = n_memory_per_layer.last_mut() {
-            *last = n_mem_top.min(cli.hidden);
-        }
-    }
-    let n_memory_per_layer_for_closure = n_memory_per_layer.clone();
-    let mut fresh_net = || {
-        MultiLayerLnnSnn::new_with_memory(
-            actual_vocab,
-            &hidden_dims,
-            &n_memory_per_layer_for_closure,
-            actual_vocab,
-            cli.tau_init,
-            cli.tau_mem_init,
-            &mut rng,
-        )
-    };
+    let mut fresh_net = || HdcLm::new(cli.dim, actual_vocab, &mut rng);
 
     let (cpu_net, start_epoch) = match cli.checkpoint.as_ref().filter(|p| p.exists()) {
         Some(path) => match checkpoint::load(path) {
             Ok(c) => {
-                let arch_ok = c.net.n_input == actual_vocab
-                    && c.net.n_output == actual_vocab
-                    && c.net.layers.len() == cli.layers
-                    && c.net.layers.iter().all(|l| l.n_hidden == cli.hidden);
+                let arch_ok = c.net.dim == cli.dim && c.net.vocab == actual_vocab;
                 if arch_ok {
                     println!("loaded checkpoint {} (epoch {})", path.display(), c.epoch);
                     (c.net, c.epoch)
@@ -593,10 +536,7 @@ fn build_backend(cli: &Cli, actual_vocab: usize) -> (Backend, u32) {
                     "GPU adapter: {} ({:?}, {:?})",
                     info.name, info.device_type, info.backend
                 );
-                return (
-                    Backend::Gpu(MultiLayerLnnSnnGpu::from_cpu(&cpu_net, ctx)),
-                    start_epoch,
-                );
+                return (Backend::Gpu(HdcGpu::from_cpu(&cpu_net, ctx)), start_epoch);
             }
             Err(e) => {
                 eprintln!("⚠ GPU init failed ({e}); falling back to CPU");
@@ -649,79 +589,96 @@ fn load_or_train_bpe(
     }
 }
 
-fn evaluate_lnn(
-    net: &MultiLayerLnnSnn,
+/// Evaluate val BPB and two HDC-specific diagnostics:
+/// - mean L2 norm of context HV (`bundle_norm`),
+/// - top-1 cleanup accuracy: how often `argmax_v cosine(ctx, codebook_v)`
+///   matches the target. Pure-HDC signal independent of the readout.
+fn evaluate_hdc(
+    net: &HdcLm,
     val_toks: &[u32],
     chunk: usize,
     comp: f32,
-) -> (f32, Vec<f32>, Vec<(f32, f32)>) {
+    stateful: bool,
+) -> (f32, f32, f32) {
     if val_toks.len() < chunk + 1 {
-        return (
-            f32::INFINITY,
-            vec![0.0; net.layers.len()],
-            vec![(0.0, 0.0); net.layers.len()],
-        );
+        return (f32::INFINITY, 0.0, 0.0);
     }
-    let mut states = net.fresh_states();
+    let mut state = net.fresh_state();
     let mut total_nats = 0.0_f32;
     let mut total_tokens = 0_usize;
-    let mut activity_acc = vec![0.0_f32; net.layers.len()];
-    let mut alpha_acc: Vec<(f32, f32)> = vec![(0.0, 0.0); net.layers.len()];
-    let mut chunks_seen = 0_usize;
+    let mut bundle_norm_sum = 0.0_f32;
+    let mut bundle_norm_chunks = 0_usize;
+    let mut cleanup_hits = 0_u64;
     let mut pos = 0;
     while pos + chunk < val_toks.len() {
+        if !stateful {
+            state = net.fresh_state();
+        }
         let inputs = &val_toks[pos..pos + chunk];
         let targets = &val_toks[pos + 1..pos + chunk + 1];
-        let cache = net.forward_lm_tokens_stateful(inputs, &mut states);
-        for (logits_t, &target) in cache.logits.iter().zip(targets.iter()) {
-            total_nats += cross_entropy_loss(logits_t, target as usize);
-        }
-        for (acc, a) in activity_acc.iter_mut().zip(cache.activity()) {
-            *acc += a;
-        }
-        for (acc, (m, d)) in alpha_acc.iter_mut().zip(cache.alpha_stats()) {
-            acc.0 += m;
-            if d > acc.1 {
-                acc.1 = d;
+        let cache = net.forward_lm_tokens_stateful(inputs, &mut state);
+        for (t, &target) in targets.iter().enumerate() {
+            let logits_off = t * net.vocab;
+            total_nats += cross_entropy_loss(
+                &cache.logits[logits_off..logits_off + net.vocab],
+                target as usize,
+            );
+            // Cleanup: cosine similarity of context_t against every
+            // codebook row → argmax. Frozen codebook = pure HDC signal.
+            let ctx_off = t * net.dim;
+            let ctx = &cache.contexts[ctx_off..ctx_off + net.dim];
+            let mut best = 0_u32;
+            let mut best_score = f32::NEG_INFINITY;
+            for v in 0..net.vocab {
+                let row = &net.codebook.items[v * net.dim..(v + 1) * net.dim];
+                let mut s = 0.0_f32;
+                for i in 0..net.dim {
+                    s += row[i] * ctx[i];
+                }
+                if s > best_score {
+                    best_score = s;
+                    best = v as u32;
+                }
+            }
+            if best == target {
+                cleanup_hits += 1;
             }
         }
-        chunks_seen += 1;
+        bundle_norm_sum += cache.bundle_norm(net.dim);
+        bundle_norm_chunks += 1;
         total_tokens += chunk;
         pos += chunk;
     }
-    let mean_activity: Vec<f32> = activity_acc
-        .into_iter()
-        .map(|s| if chunks_seen == 0 { 0.0 } else { s / chunks_seen as f32 })
-        .collect();
-    let mean_alpha: Vec<(f32, f32)> = alpha_acc
-        .into_iter()
-        .map(|(m, d)| {
-            (
-                if chunks_seen == 0 { 0.0 } else { m / chunks_seen as f32 },
-                d,
-            )
-        })
-        .collect();
     let bpb = bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize);
-    (bpb, mean_activity, mean_alpha)
+    let bundle_norm = if bundle_norm_chunks == 0 {
+        0.0
+    } else {
+        bundle_norm_sum / bundle_norm_chunks as f32
+    };
+    let top1 = if total_tokens == 0 {
+        0.0
+    } else {
+        cleanup_hits as f32 / total_tokens as f32
+    };
+    (bpb, bundle_norm, top1)
 }
 
 fn generate(
-    net: &MultiLayerLnnSnn,
+    net: &HdcLm,
     seed: &[u32],
     n: usize,
     temperature: f32,
     vocab: usize,
     rng: &mut impl rand::Rng,
 ) -> Vec<u32> {
-    let mut states = net.fresh_states();
+    let mut state = net.fresh_state();
     for &t in seed {
-        let _ = net.step_lm_token(t, &mut states);
+        let _ = net.step_lm_token(t, &mut state);
     }
     let mut last = *seed.last().unwrap_or(&0);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        let logits = net.step_lm_token(last, &mut states);
+        let logits = net.step_lm_token(last, &mut state);
         last = sample_token(&logits, temperature, rng);
         if (last as usize) >= vocab {
             last = (vocab - 1) as u32;
@@ -745,7 +702,7 @@ fn print_header(
 ) {
     let bar_h = "═".repeat(BOX_WIDTH);
     println!("╔{bar_h}╗");
-    let title = format!("Aurora · {}-layer LNN-CfC · BPE", cli.layers);
+    let title = format!("Aurora · bipolar HDC · D = {}", cli.dim);
     println!("{}", center(&title));
     println!("╠{bar_h}╣");
     println!("{}", kv("backend", backend));
@@ -770,37 +727,23 @@ fn print_header(
         "{}",
         kv("split", &format!("{n_train} train / {n_val} val toks"))
     );
-    let arch = format!(
-        "{vocab} → ({hidden} × {layers} layers) → {vocab}",
-        hidden = cli.hidden,
-        layers = cli.layers,
-    );
+    let arch = format!("{vocab} → HDC(D={dim}) → {vocab}", dim = cli.dim);
     println!("{}", kv("architecture", &arch));
-    println!("{}", kv("chunk (BPTT toks)", &format!("{}", cli.chunk)));
+    println!("{}", kv("chunk (tokens)", &format!("{}", cli.chunk)));
     println!(
         "{}",
         kv(
-            "optimizer",
-            &format!("Adam lr={}, grad clip {GRAD_CLIP}, batch {BATCH_SIZE}", cli.lr)
+            "state mode",
+            if cli.stateful { "stateful (carry across chunks)" } else { "stateless (reset per chunk)" }
         )
     );
     println!(
         "{}",
-        kv("tau init", &format!("log_tau = {:.2}", cli.tau_init))
+        kv(
+            "optimizer",
+            &format!("Adam lr={}, grad clip {GRAD_CLIP}, batch {}", cli.lr, cli.batch)
+        )
     );
-    if cli.memory_frac > 0.0 {
-        let n_mem = ((cli.hidden as f32) * cli.memory_frac).round() as usize;
-        println!(
-            "{}",
-            kv(
-                "M-LTC top layer",
-                &format!(
-                    "{n_mem}/{} memory neurons (sin), log_tau_mem = {:.2}",
-                    cli.hidden, cli.tau_mem_init
-                )
-            )
-        );
-    }
     println!(
         "{}",
         kv("epochs", &format!("{} → {}", start_epoch, cli.epochs))
@@ -826,23 +769,11 @@ fn print_footer(best_val: f32, elapsed_s: f64, val_bytes_est: usize) {
     println!("╚{bar_h}╝");
 }
 
-fn epoch_diagnostics(activity: &[f32], alpha_stats: &[(f32, f32)], tau_means: &[f32]) {
-    let act_s = activity
-        .iter()
-        .map(|r| format!("{r:.4}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let alpha_s = alpha_stats
-        .iter()
-        .map(|(m, d)| format!("{m:.3}±{d:.2}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let tau_s = tau_means
-        .iter()
-        .map(|t| format!("{t:.2}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!("  |x| [{act_s}]  α [{alpha_s}]  τ [{tau_s}]");
+fn epoch_diagnostics(bundle_norm: f32, cleanup_top1: f32) {
+    println!(
+        "  bundle_norm {bundle_norm:.3}  cleanup_top1 {:.4}",
+        cleanup_top1
+    );
 }
 
 fn render_bpb_chart(
@@ -921,15 +852,12 @@ impl MetricsWriter {
     ) {
         let _ = writeln!(
             self.out,
-            r#"{{"event":"run","cell":"lnn-cfc","corpus":{corpus:?},"corpus_bytes":{corpus_bytes},"n_tokens":{n_tokens},"vocab":{actual_vocab},"hidden":{hidden},"layers":{layers},"chunk":{chunk},"lr":{lr},"tau_init":{tau_init},"memory_frac":{memory_frac},"tau_mem_init":{tau_mem_init},"epochs":{epochs},"seed":{seed},"backend":{backend:?}}}"#,
+            r#"{{"event":"run","cell":"hdc","corpus":{corpus:?},"corpus_bytes":{corpus_bytes},"n_tokens":{n_tokens},"vocab":{actual_vocab},"dim":{dim},"chunk":{chunk},"lr":{lr},"stateful":{stateful},"epochs":{epochs},"seed":{seed},"backend":{backend:?}}}"#,
             corpus = cli.corpus.display().to_string(),
-            hidden = cli.hidden,
-            layers = cli.layers,
+            dim = cli.dim,
             chunk = cli.chunk,
             lr = format_finite(cli.lr),
-            tau_init = format_finite(cli.tau_init),
-            memory_frac = format_finite(cli.memory_frac),
-            tau_mem_init = format_finite(cli.tau_mem_init),
+            stateful = cli.stateful,
             epochs = cli.epochs,
             seed = cli.seed,
         );
@@ -946,27 +874,22 @@ impl MetricsWriter {
         let _ = self.out.flush();
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn epoch_done(
         &mut self,
         epoch: u32,
         train_bpb: f32,
         val_bpb: f32,
-        activity: &[f32],
-        alpha_means: &[f32],
-        alpha_devs: &[f32],
-        tau_means: &[f32],
+        bundle_norm: f32,
+        cleanup_top1: f32,
         elapsed_s: f64,
     ) {
         let _ = writeln!(
             self.out,
-            r#"{{"event":"epoch_done","epoch":{epoch},"train_bpb":{train},"val_bpb":{val},"activity":{activity},"alpha_means":{alpha_means},"alpha_devs":{alpha_devs},"tau_means":{tau_means},"elapsed_s":{elapsed:.3}}}"#,
+            r#"{{"event":"epoch_done","epoch":{epoch},"train_bpb":{train},"val_bpb":{val},"bundle_norm":{bn},"cleanup_top1":{c1},"elapsed_s":{elapsed:.3}}}"#,
             train = format_finite(train_bpb),
             val = format_finite(val_bpb),
-            activity = format_array(activity),
-            alpha_means = format_array(alpha_means),
-            alpha_devs = format_array(alpha_devs),
-            tau_means = format_array(tau_means),
+            bn = format_finite(bundle_norm),
+            c1 = format_finite(cleanup_top1),
             elapsed = elapsed_s,
         );
         let _ = self.out.flush();
@@ -988,16 +911,4 @@ fn format_finite(v: f32) -> String {
     } else {
         format!("\"{v}\"")
     }
-}
-
-fn format_array(xs: &[f32]) -> String {
-    let mut s = String::from("[");
-    for (i, x) in xs.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str(&format_finite(*x));
-    }
-    s.push(']');
-    s
 }

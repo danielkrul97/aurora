@@ -1,8 +1,8 @@
 [package]
 name = "aurora"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Biologically-inspired language model on a closed-form continuous-time (CfC) Liquid Neural Network cell"
+description = "Bipolar Hyperdimensional Computing (HDC / VSA) language model"
 license = "MIT OR Apache-2.0"
 
 [lib]
