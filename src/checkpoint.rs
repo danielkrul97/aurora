@@ -2,44 +2,43 @@
     clippy::cast_possible_truncation,
     clippy::cast_lossless,
     clippy::missing_panics_doc,
-    clippy::missing_errors_doc
+    clippy::missing_errors_doc,
+    clippy::too_many_lines
 )]
 
-//! Sprint 28: weight checkpointing for `MultiLayerGatedSnn`.
+//! AURORA03 checkpoint format for the decoder-only transformer.
 //!
-//! Binary format (little-endian):
+//! Binary layout (little-endian):
 //! ```text
-//! magic       : [u8; 8] = b"AURORA01" or b"AURORA02"
-//! n_input     : u32
-//! n_output    : u32
-//! n_layers    : u32
-//! threshold   : f32
-//! alpha       : f32   (legacy global α; v2: still written for
-//!                      compatibility, but per-layer α below is
-//!                      authoritative)
-//! epoch       : u32   (training metadata: completed epochs)
-//! _pad        : u32
-//! per layer:
-//!   n_in      : u32
-//!   n_hidden  : u32
-//!   w_in      : f32[n_hidden * n_in]
-//!   w_rec     : f32[n_hidden * n_hidden]
-//!   w_gate_in : f32[n_hidden * n_in]
-//!   w_gate_rec: f32[n_hidden * n_hidden]
-//!   b_h       : f32[n_hidden]
-//!   b_gate    : f32[n_hidden]
-//!   alpha     : f32   (Sprint 30 LSG, v2 only)
-//! w_out       : f32[n_output * top_hidden]
-//! b_o         : f32[n_output]
+//! magic       : [u8; 8] = b"AURORA03"
+//! vocab       : u32
+//! d_model     : u32
+//! n_layer     : u32
+//! n_head      : u32
+//! d_ff        : u32
+//! seq_len_max : u32
+//! epoch       : u32
+//! step        : u64
+//!
+//! w_tok       : f32[vocab * d_model]
+//! w_pos       : f32[seq_len_max * d_model]
+//! per block (× n_layer):
+//!   ln1_gamma : f32[d_model]
+//!   ln1_beta  : f32[d_model]
+//!   w_q       : f32[d_model * d_model]
+//!   w_k       : f32[d_model * d_model]
+//!   w_v       : f32[d_model * d_model]
+//!   w_o       : f32[d_model * d_model]
+//!   ln2_gamma : f32[d_model]
+//!   ln2_beta  : f32[d_model]
+//!   w_fc      : f32[d_ff * d_model]
+//!   w_proj    : f32[d_model * d_ff]
+//! final_gamma : f32[d_model]
+//! final_beta  : f32[d_model]
 //! ```
 //!
-//! Sprint 30 bumps the format to AURORA02 to carry per-layer
-//! surrogate-gradient widths (LSG). The loader still reads AURORA01
-//! and falls back per-layer α to the global one.
-//!
-//! Adam state is intentionally NOT serialized — resuming uses fresh
-//! moments. The slight optimizer warmup is acceptable; storing m1/m2
-//! would roughly triple checkpoint size for a feature most of the time.
+//! AdamW moments are NOT serialized — resume uses fresh state. The
+//! warmup cost is negligible vs the moment-buffer size (~2× model bytes).
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -48,160 +47,149 @@ use std::path::Path;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use crate::snn_gated_multi::MultiLayerGatedSnn;
-use crate::surrogate::SpikeFn;
+use crate::transformer::{DecoderTransformer, TransformerConfig};
 
-const MAGIC_V1: &[u8; 8] = b"AURORA01";
-const MAGIC_V2: &[u8; 8] = b"AURORA02";
+const MAGIC: &[u8; 8] = b"AURORA03";
 
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
-    pub net: MultiLayerGatedSnn,
+    pub model: DecoderTransformer,
     pub epoch: u32,
+    pub step: u64,
 }
 
-/// Save a network plus the number of completed epochs.
-///
-/// # Errors
-/// Propagates the underlying I/O error if the file cannot be written.
-pub fn save<P: AsRef<Path>>(path: P, net: &MultiLayerGatedSnn, epoch: u32) -> io::Result<()> {
+/// Save model + training progress to disk.
+pub fn save<P: AsRef<Path>>(
+    path: P,
+    model: &DecoderTransformer,
+    epoch: u32,
+    step: u64,
+) -> io::Result<()> {
     let f = File::create(path)?;
     let mut w = BufWriter::new(f);
 
-    w.write_all(MAGIC_V2)?;
-    write_u32(&mut w, net.n_input as u32)?;
-    write_u32(&mut w, net.n_output as u32)?;
-    write_u32(&mut w, net.layers.len() as u32)?;
-    write_f32(&mut w, net.spike_fn.threshold)?;
-    write_f32(&mut w, net.spike_fn.alpha)?;
+    w.write_all(MAGIC)?;
+    write_u32(&mut w, model.config.vocab as u32)?;
+    write_u32(&mut w, model.config.d_model as u32)?;
+    write_u32(&mut w, model.config.n_layer as u32)?;
+    write_u32(&mut w, model.config.n_head as u32)?;
+    write_u32(&mut w, model.config.d_ff as u32)?;
+    write_u32(&mut w, model.config.seq_len_max as u32)?;
     write_u32(&mut w, epoch)?;
-    write_u32(&mut w, 0)?;
+    write_u64(&mut w, step)?;
 
-    for layer in &net.layers {
-        write_u32(&mut w, layer.n_in as u32)?;
-        write_u32(&mut w, layer.n_hidden as u32)?;
-        write_f32_slice(&mut w, &layer.w_in)?;
-        write_f32_slice(&mut w, &layer.w_rec)?;
-        write_f32_slice(&mut w, &layer.w_gate_in)?;
-        write_f32_slice(&mut w, &layer.w_gate_rec)?;
-        write_f32_slice(&mut w, &layer.b_h)?;
-        write_f32_slice(&mut w, &layer.b_gate)?;
-        write_f32(&mut w, layer.alpha)?;
+    write_f32_slice(&mut w, &model.embed.w_tok)?;
+    write_f32_slice(&mut w, &model.embed.w_pos)?;
+    for blk in &model.blocks {
+        write_f32_slice(&mut w, &blk.ln1.gamma)?;
+        write_f32_slice(&mut w, &blk.ln1.beta)?;
+        write_f32_slice(&mut w, &blk.mha.w_q.w)?;
+        write_f32_slice(&mut w, &blk.mha.w_k.w)?;
+        write_f32_slice(&mut w, &blk.mha.w_v.w)?;
+        write_f32_slice(&mut w, &blk.mha.w_o.w)?;
+        write_f32_slice(&mut w, &blk.ln2.gamma)?;
+        write_f32_slice(&mut w, &blk.ln2.beta)?;
+        write_f32_slice(&mut w, &blk.ffn.w_fc.w)?;
+        write_f32_slice(&mut w, &blk.ffn.w_proj.w)?;
     }
-    write_f32_slice(&mut w, &net.w_out)?;
-    write_f32_slice(&mut w, &net.b_o)?;
-    w.flush()?;
-    Ok(())
+    write_f32_slice(&mut w, &model.final_ln.gamma)?;
+    write_f32_slice(&mut w, &model.final_ln.beta)?;
+    w.flush()
 }
 
-/// Load a checkpoint. The returned network has fresh Adam state.
-///
-/// # Errors
-/// Returns an error if the file is missing, truncated, or has the wrong magic.
+/// Load a checkpoint. Returned model has fresh AdamW moments.
 pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     let f = File::open(path)?;
     let mut r = BufReader::new(f);
 
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
-    let version: u32 = if &magic == MAGIC_V2 {
-        2
-    } else if &magic == MAGIC_V1 {
-        1
-    } else {
+    if &magic != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bad checkpoint magic",
-        ));
-    };
-    let n_input = read_u32(&mut r)? as usize;
-    let n_output = read_u32(&mut r)? as usize;
-    let n_layers = read_u32(&mut r)? as usize;
-    let threshold = read_f32(&mut r)?;
-    let alpha = read_f32(&mut r)?;
-    let epoch = read_u32(&mut r)?;
-    let _pad = read_u32(&mut r)?;
-
-    let mut hidden_dims = Vec::with_capacity(n_layers);
-    let mut layer_blobs: Vec<([Vec<f32>; 6], f32)> = Vec::with_capacity(n_layers);
-    for _ in 0..n_layers {
-        let n_in = read_u32(&mut r)? as usize;
-        let n_hidden = read_u32(&mut r)? as usize;
-        hidden_dims.push(n_hidden);
-        let w_in = read_f32_vec(&mut r, n_hidden * n_in)?;
-        let w_rec = read_f32_vec(&mut r, n_hidden * n_hidden)?;
-        let w_gate_in = read_f32_vec(&mut r, n_hidden * n_in)?;
-        let w_gate_rec = read_f32_vec(&mut r, n_hidden * n_hidden)?;
-        let b_h = read_f32_vec(&mut r, n_hidden)?;
-        let b_gate = read_f32_vec(&mut r, n_hidden)?;
-        let layer_alpha = if version >= 2 {
-            read_f32(&mut r)?
-        } else {
-            alpha
-        };
-        layer_blobs.push((
-            [w_in, w_rec, w_gate_in, w_gate_rec, b_h, b_gate],
-            layer_alpha,
+            "bad checkpoint magic — expected AURORA03",
         ));
     }
-    let top_hidden = *hidden_dims.last().expect("≥1 layer");
-    let w_out = read_f32_vec(&mut r, n_output * top_hidden)?;
-    let b_o = read_f32_vec(&mut r, n_output)?;
+    let vocab = read_u32(&mut r)? as usize;
+    let d_model = read_u32(&mut r)? as usize;
+    let n_layer = read_u32(&mut r)? as usize;
+    let n_head = read_u32(&mut r)? as usize;
+    let d_ff = read_u32(&mut r)? as usize;
+    let seq_len_max = read_u32(&mut r)? as usize;
+    let epoch = read_u32(&mut r)?;
+    let step = read_u64(&mut r)?;
+
+    let cfg = TransformerConfig {
+        vocab,
+        d_model,
+        n_layer,
+        n_head,
+        d_ff,
+        seq_len_max,
+    };
 
     let mut rng = StdRng::seed_from_u64(0);
-    let mut net = MultiLayerGatedSnn::new(
-        n_input,
-        &hidden_dims,
-        n_output,
-        SpikeFn { threshold, alpha },
-        &mut rng,
-    );
-    for (i, (blob, layer_alpha)) in layer_blobs.into_iter().enumerate() {
-        let [w_in, w_rec, w_gate_in, w_gate_rec, b_h, b_gate] = blob;
-        let layer = &mut net.layers[i];
-        layer.w_in = w_in;
-        layer.w_rec = w_rec;
-        layer.w_gate_in = w_gate_in;
-        layer.w_gate_rec = w_gate_rec;
-        layer.b_h = b_h;
-        layer.b_gate = b_gate;
-        layer.alpha = layer_alpha;
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+
+    model.embed.w_tok = read_f32_vec(&mut r, vocab * d_model)?;
+    model.embed.w_pos = read_f32_vec(&mut r, seq_len_max * d_model)?;
+    for blk in &mut model.blocks {
+        blk.ln1.gamma = read_f32_vec(&mut r, d_model)?;
+        blk.ln1.beta = read_f32_vec(&mut r, d_model)?;
+        blk.mha.w_q.w = read_f32_vec(&mut r, d_model * d_model)?;
+        blk.mha.w_k.w = read_f32_vec(&mut r, d_model * d_model)?;
+        blk.mha.w_v.w = read_f32_vec(&mut r, d_model * d_model)?;
+        blk.mha.w_o.w = read_f32_vec(&mut r, d_model * d_model)?;
+        blk.ln2.gamma = read_f32_vec(&mut r, d_model)?;
+        blk.ln2.beta = read_f32_vec(&mut r, d_model)?;
+        blk.ffn.w_fc.w = read_f32_vec(&mut r, d_ff * d_model)?;
+        blk.ffn.w_proj.w = read_f32_vec(&mut r, d_model * d_ff)?;
     }
-    net.w_out = w_out;
-    net.b_o = b_o;
+    model.final_ln.gamma = read_f32_vec(&mut r, d_model)?;
+    model.final_ln.beta = read_f32_vec(&mut r, d_model)?;
+    model.step = step;
 
-    Ok(Checkpoint { net, epoch })
+    Ok(Checkpoint {
+        model,
+        epoch,
+        step,
+    })
 }
 
-// --- low-level binary helpers -------------------------------------------
+// --- low-level binary helpers ------------------------------------------
 
-fn write_u32<W: Write>(w: &mut W, v: u32) -> io::Result<()> {
+pub fn write_u32<W: Write>(w: &mut W, v: u32) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
-fn write_f32<W: Write>(w: &mut W, v: f32) -> io::Result<()> {
+pub fn write_u64<W: Write>(w: &mut W, v: u64) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
-fn write_f32_slice<W: Write>(w: &mut W, v: &[f32]) -> io::Result<()> {
-    // SAFETY: f32 has the same alignment+size as 4 raw bytes; the slice
-    // is only borrowed for the duration of write_all.
+pub fn write_f32<W: Write>(w: &mut W, v: f32) -> io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+pub fn write_f32_slice<W: Write>(w: &mut W, v: &[f32]) -> io::Result<()> {
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
     };
     w.write_all(bytes)
 }
-fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
+pub fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(u32::from_le_bytes(b))
 }
-fn read_f32<R: Read>(r: &mut R) -> io::Result<f32> {
+pub fn read_u64<R: Read>(r: &mut R) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+pub fn read_f32<R: Read>(r: &mut R) -> io::Result<f32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(f32::from_le_bytes(b))
 }
-fn read_f32_vec<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<f32>> {
+pub fn read_f32_vec<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<f32>> {
     let mut out = vec![0.0_f32; n];
-    // SAFETY: f32 layout is 4 bytes; the borrow lives only for read_exact.
     let bytes: &mut [u8] = unsafe {
         std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), n * 4)
     };

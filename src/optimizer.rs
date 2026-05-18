@@ -2,26 +2,29 @@
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::suboptimal_flops,
-    clippy::needless_range_loop
+    clippy::needless_range_loop,
+    clippy::must_use_candidate
 )]
 
-//! Adam (Kingma & Ba 2015) and plain SGD steppers.
+//! AdamW stepper (Loshchilov & Hutter 2019).
 
 #[derive(Copy, Clone, Debug)]
-pub struct AdamConfig {
+pub struct AdamWConfig {
     pub lr: f32,
     pub beta1: f32,
     pub beta2: f32,
     pub eps: f32,
+    pub weight_decay: f32,
 }
 
-impl Default for AdamConfig {
+impl Default for AdamWConfig {
     fn default() -> Self {
         Self {
-            lr: 0.001,
+            lr: 6e-4,
             beta1: 0.9,
-            beta2: 0.999,
+            beta2: 0.95,
             eps: 1e-8,
+            weight_decay: 0.1,
         }
     }
 }
@@ -42,13 +45,16 @@ impl AdamGroup {
     }
 }
 
-pub fn adam_apply(
+/// `apply_wd` selects whether decoupled weight decay is applied to this
+/// group — typically off for biases, LayerNorm γ/β, and embeddings.
+pub fn adamw_apply(
     params: &mut [f32],
     grads: &[f32],
     group: &mut AdamGroup,
-    config: &AdamConfig,
+    config: &AdamWConfig,
     bc1: f32,
     bc2: f32,
+    apply_wd: bool,
 ) {
     debug_assert_eq!(params.len(), grads.len());
     debug_assert_eq!(params.len(), group.m1.len());
@@ -61,19 +67,16 @@ pub fn adam_apply(
         group.m2[i] = config.beta2 * group.m2[i] + one_minus_b2 * g * g;
         let m1_hat = group.m1[i] / bc1;
         let m2_hat = group.m2[i] / bc2;
-        params[i] -= config.lr * m1_hat / (m2_hat.sqrt() + config.eps);
+        let mut step = config.lr * m1_hat / (m2_hat.sqrt() + config.eps);
+        if apply_wd {
+            step += config.lr * config.weight_decay * params[i];
+        }
+        params[i] -= step;
     }
 }
 
 #[must_use]
-pub fn bias_correction(t: usize, config: &AdamConfig) -> (f32, f32) {
+pub fn bias_correction(t: usize, beta1: f32, beta2: f32) -> (f32, f32) {
     let t = t as i32;
-    (1.0 - config.beta1.powi(t), 1.0 - config.beta2.powi(t))
-}
-
-pub fn sgd_apply(params: &mut [f32], grads: &[f32], lr: f32) {
-    debug_assert_eq!(params.len(), grads.len());
-    for (w, g) in params.iter_mut().zip(grads.iter()) {
-        *w -= lr * g;
-    }
+    (1.0 - beta1.powi(t), 1.0 - beta2.powi(t))
 }
