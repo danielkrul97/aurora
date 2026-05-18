@@ -1,18 +1,8 @@
-//! GPU infrastructure for `GatedRecurrentSnn` (Sprint 13, foundation).
+//! GPU infrastructure for the decoder-only transformer.
 //!
 //! Backend: wgpu over Vulkan/Metal/DX12 — cross-platform, no CUDA
-//! toolchain required. WGSL compute shaders for sparse matvec and the
-//! gated cell. CPU↔GPU parity is asserted via integration tests in
-//! `tests/gpu_parity.rs`; see also `Sprint 13` in
-//! `docs/10_implementacni_plan.md` for scope and exit criteria.
-//!
-//! This module is gated by the `gpu` cargo feature. The CPU code path
+//! toolchain required. Gated by the `gpu` cargo feature; CPU code path
 //! has no dependency on wgpu and continues to work without it.
-//!
-//! Current status: foundation. `GpuContext` initializes a wgpu device
-//! and queue; `kernels::sparse_matvec_onehot` runs the sparse one-hot
-//! matvec used in the LM forward path. Backward, full forward/backward
-//! integration, and Adam port are tracked in Sprint 13 followups.
 
 #![allow(
     clippy::redundant_clone,
@@ -27,13 +17,31 @@
     clippy::suboptimal_flops
 )]
 
+pub mod attention;
 pub mod buffers;
 pub mod context;
-pub mod forward_mega;
-pub mod forward_mega_2layer;
-pub mod kernels;
-pub mod snn_gated_gpu;
-pub mod snn_gated_gpu_multi;
+pub mod elementwise;
+pub mod embedding;
+pub mod gelu;
+pub mod kv_cache;
+pub mod layer_norm;
+pub mod matmul;
+pub mod optimizer;
+pub mod reduce;
+pub mod softmax_ce;
+pub mod transformer;
 
+pub use attention::{CausalMhaBackwardKernel, CausalMhaForwardKernel};
 pub use context::GpuContext;
-pub use snn_gated_gpu::GatedRecurrentSnnGpu;
+pub use elementwise::{ScaleBufferKernel, VectorAddKernel, ZeroBufferKernel};
+pub use embedding::{EmbedScatterAddKernel, TokenPosEmbedKernel};
+pub use gelu::{GeluBackwardKernel, GeluKernel};
+pub use kv_cache::{KvBlockGpu, KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
+pub use layer_norm::{LayerNormBackwardKernel, LayerNormForwardKernel};
+pub use matmul::{cpu_gemm, cpu_gemm_transpose_b, GemmKernel, GemmTransposeBKernel};
+pub use optimizer::AdamWKernel;
+pub use reduce::{
+    EmbedScatterReduceKernel, GradNormSqReduceKernel, OuterProductAccumKernel, RowReduceAddKernel,
+};
+pub use softmax_ce::SoftmaxCrossEntropyKernel;
+pub use transformer::DecoderTransformerGpu;

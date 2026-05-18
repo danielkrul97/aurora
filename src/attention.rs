@@ -11,25 +11,15 @@
     clippy::too_long_first_doc_paragraph
 )]
 
-//! Sprint 27: spiking attention building blocks.
+//! Building blocks for transformer attention.
 //!
-//! Stand-alone forward + backward primitives. Nothing here is integrated
-//! into the gated-SNN training pipeline yet — these are unit-tested
-//! components that future sprints will assemble into a hybrid
-//! SNN/Transformer cell.
+//! Forward + backward primitives, shared by CPU and (eventually) GPU.
+//! All gradients are returned alongside saved-for-backward caches so
+//! callers can chain modules without any global state.
 //!
-//! Conventions:
+//! Layout conventions:
 //! * sequences are flat row-major `[T * D]` tensors
 //! * `T` = sequence length, `D` = feature dim, `H` = head dim
-//! * all gradients are returned alongside saved-for-backward caches so
-//!   callers can chain modules without any global state
-//!
-//! Components:
-//! * [`LayerNorm`] — per-token affine standardization
-//! * [`LinearProj`] — bias-less linear (used for Q/K/V/output)
-//! * [`scaled_dot_product_attention`] — softmax(QKᵀ/√d_k) V
-//! * [`spike_gated_attention`] — same, but query/key/value rows masked
-//!   by a binary spike vector (positions with spike=0 don't contribute)
 
 use rand::Rng;
 
@@ -68,6 +58,21 @@ pub struct LayerNormCache {
 pub struct LayerNormGrads {
     pub d_gamma: Vec<f32>,
     pub d_beta: Vec<f32>,
+}
+
+impl LayerNormGrads {
+    #[must_use]
+    pub fn zeros(d: usize) -> Self {
+        Self {
+            d_gamma: vec![0.0; d],
+            d_beta: vec![0.0; d],
+        }
+    }
+
+    pub fn zero(&mut self) {
+        self.d_gamma.fill(0.0);
+        self.d_beta.fill(0.0);
+    }
 }
 
 /// Forward LayerNorm over the last axis.
@@ -154,11 +159,35 @@ impl LinearProj {
             .collect();
         Self { w, d_in, d_out }
     }
+
+    /// Scaled init for the residual-projection branch (Karpathy/nanoGPT
+    /// convention: scale init by `1/sqrt(2 * n_layer)` to keep
+    /// activations stable through pre-norm residual stack).
+    pub fn new_scaled(d_in: usize, d_out: usize, scale: f32, rng: &mut impl Rng) -> Self {
+        let bound = (6.0_f32 / (d_in + d_out) as f32).sqrt() * scale;
+        let w = (0..d_in * d_out)
+            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * bound)
+            .collect();
+        Self { w, d_in, d_out }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct LinearGrads {
     pub d_w: Vec<f32>,
+}
+
+impl LinearGrads {
+    #[must_use]
+    pub fn zeros(d_in: usize, d_out: usize) -> Self {
+        Self {
+            d_w: vec![0.0; d_in * d_out],
+        }
+    }
+
+    pub fn zero(&mut self) {
+        self.d_w.fill(0.0);
+    }
 }
 
 /// Forward `y = x @ Wᵀ`. `x: [T * d_in]`, output `y: [T * d_out]`.
@@ -227,8 +256,7 @@ pub struct AttentionCache {
 /// * `q`: `[T_q * d_k]`
 /// * `k`: `[T_k * d_k]`
 /// * `v`: `[T_k * d_v]`
-/// * `key_mask`: optional `[T_k]`; positions with `mask[i] == 0.0` are
-///   set to `-∞` before the softmax (used for spike gating).
+/// * `causal`: if true, mask `s[i,j] = -∞` for `j > i` (lower-triangular).
 ///
 /// Returns `(out: [T_q * d_v], cache)` where the cache holds the softmax
 /// output for the backward pass.
@@ -238,7 +266,7 @@ pub fn scaled_dot_product_attention(
     v: &[f32],
     d_k: usize,
     d_v: usize,
-    key_mask: Option<&[f32]>,
+    causal: bool,
 ) -> (Vec<f32>, AttentionCache) {
     let t_q = q.len() / d_k;
     let t_k = k.len() / d_k;
@@ -246,7 +274,6 @@ pub fn scaled_dot_product_attention(
     let scale = (d_k as f32).sqrt().recip();
     let mut probs = vec![0.0_f32; t_q * t_k];
 
-    // scores S = Q Kᵀ / √d_k, then row-wise softmax (with optional mask).
     for i in 0..t_q {
         let qr = &q[i * d_k..(i + 1) * d_k];
         let mut row_max = f32::NEG_INFINITY;
@@ -257,10 +284,8 @@ pub fn scaled_dot_product_attention(
                 s += qr[c] * kr[c];
             }
             s *= scale;
-            if let Some(m) = key_mask {
-                if m[j] == 0.0 {
-                    s = NEG_INF;
-                }
+            if causal && j > i {
+                s = NEG_INF;
             }
             probs[i * t_k + j] = s;
             if s > row_max {
@@ -279,7 +304,6 @@ pub fn scaled_dot_product_attention(
         }
     }
 
-    // out = probs @ V
     let mut out = vec![0.0_f32; t_q * d_v];
     for i in 0..t_q {
         let pr = &probs[i * t_k..(i + 1) * t_k];
@@ -311,9 +335,9 @@ pub fn scaled_dot_product_attention(
 
 /// Backward scaled dot-product attention.
 ///
-/// Returns `(dq, dk, dv)`. The mask used in forward (if any) is implicit
-/// in `cache.probs` — masked-out positions already have `prob == 0`, so
-/// their gradients are naturally zero.
+/// Returns `(dq, dk, dv)`. The causal mask is implicit in `cache.probs` —
+/// masked-out positions already have `prob == 0`, so their gradients are
+/// naturally zero.
 pub fn scaled_dot_product_attention_backward(
     q: &[f32],
     k: &[f32],
@@ -326,7 +350,6 @@ pub fn scaled_dot_product_attention_backward(
     let d_k = cache.d_k;
     let d_v = cache.d_v;
 
-    // dV[j] = Σ_i probs[i,j] * d_out[i]
     let mut dv = vec![0.0_f32; t_k * d_v];
     for i in 0..t_q {
         let pr = &cache.probs[i * t_k..(i + 1) * t_k];
@@ -343,7 +366,6 @@ pub fn scaled_dot_product_attention_backward(
         }
     }
 
-    // dProbs[i,j] = d_out[i] · V[j]
     let mut d_probs = vec![0.0_f32; t_q * t_k];
     for i in 0..t_q {
         let dor = &d_out[i * d_v..(i + 1) * d_v];
@@ -357,8 +379,6 @@ pub fn scaled_dot_product_attention_backward(
         }
     }
 
-    // dScores[i,j] = probs[i,j] * (dProbs[i,j] - Σ_k probs[i,k] dProbs[i,k])
-    // (standard softmax-Jacobian-vector product)
     let mut d_scores = vec![0.0_f32; t_q * t_k];
     for i in 0..t_q {
         let pr = &cache.probs[i * t_k..(i + 1) * t_k];
@@ -372,8 +392,6 @@ pub fn scaled_dot_product_attention_backward(
         }
     }
 
-    // dQ = (dScores * scale) @ K
-    // dK = (dScoresᵀ * scale) @ Q
     let mut dq = vec![0.0_f32; t_q * d_k];
     let mut dk_buf = vec![0.0_f32; t_k * d_k];
     let scale = cache.scale;
@@ -396,22 +414,4 @@ pub fn scaled_dot_product_attention_backward(
     }
 
     (dq, dk_buf, dv)
-}
-
-/// Convenience wrapper: spike-gated attention. The `key_spikes` vector
-/// must have the same length as the number of key/value tokens; positions
-/// where `key_spikes[i] == 0.0` are completely masked from the softmax.
-///
-/// This is the key biologically-flavored variant: only currently-spiking
-/// tokens contribute to attention. With all-ones it degenerates to plain
-/// SDPA.
-pub fn spike_gated_attention(
-    q: &[f32],
-    k: &[f32],
-    v: &[f32],
-    d_k: usize,
-    d_v: usize,
-    key_spikes: &[f32],
-) -> (Vec<f32>, AttentionCache) {
-    scaled_dot_product_attention(q, k, v, d_k, d_v, Some(key_spikes))
 }

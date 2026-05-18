@@ -1,26 +1,24 @@
-//! Sprint 28: end-to-end LM quality regression tests.
+//! Sprint 54: end-to-end LM quality regression tests for the CPU
+//! transformer. Catches silent training stalls or backward bugs.
 //!
-//! These run as part of `cargo test --release` and catch silent
-//! quality/perf regressions that wouldn't show up in unit tests.
-//! Targets are loose (true BPB is much lower than the assertion) so
-//! these don't get flaky on minor numerical drift, but tight enough
-//! to flag e.g. a broken backward pass that lets training stall.
+//! Thresholds are loose (true BPB is much lower) so these don't flake
+//! on minor numerical drift, but tight enough to catch a broken
+//! training step where loss never decreases.
 
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::needless_range_loop)]
 
 use std::path::Path;
 
 use aurora::bpe::BpeTokenizer;
 use aurora::checkpoint;
-use aurora::optimizer::AdamConfig;
-use aurora::snn_gated::GatedState;
-use aurora::snn_gated_multi::MultiLayerGatedSnn;
-use aurora::surrogate::SpikeFn;
+use aurora::optimizer::AdamWConfig;
 use aurora::text_io::{bits_per_byte, load_corpus};
+use aurora::transformer::loss::softmax;
+use aurora::transformer::{
+    cosine_warmup, DecoderTransformer, ModelGrads, TransformerConfig,
+};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-
-const GRAD_CLIP: f32 = 1.0;
 
 fn corpus_or_skip(path: &str) -> Option<Vec<u8>> {
     if !Path::new(path).exists() {
@@ -30,237 +28,190 @@ fn corpus_or_skip(path: &str) -> Option<Vec<u8>> {
     load_corpus(path).ok()
 }
 
-/// Byte-level CPU multi-layer regression. Uses a small corpus + tiny
-/// model so the test runs in a few seconds. Asserts val BPB drops
-/// well below random (8.0) within one epoch — typical observed value
-/// is ~5.0 on this config, so the 6.0 threshold has headroom but still
-/// catches a stalled trainer.
+/// Tiny byte-level training run: confirm val BPB falls well below
+/// random (8.0) within ~1 epoch. Expected ~5–6 on this config.
 #[test]
-fn cpu_byte_lm_converges_under_one_epoch() {
-    let Some(full) = corpus_or_skip("data/tiny_200k.txt") else { return };
+fn cpu_transformer_byte_lm_converges_under_one_epoch() {
+    let Some(full) = corpus_or_skip("data/tiny_200k.txt") else {
+        return;
+    };
     let corpus = &full[..50_000.min(full.len())];
 
-    let mut rng = StdRng::seed_from_u64(0x000A_170A);
-    let mut net = MultiLayerGatedSnn::new(
-        256,
-        &[64, 64],
-        256,
-        SpikeFn::default(),
-        &mut rng,
-    );
-    let adam = AdamConfig {
-        lr: 0.005,
-        ..AdamConfig::default()
+    let mut rng = StdRng::seed_from_u64(0xA51A);
+    let cfg = TransformerConfig {
+        vocab: 256,
+        d_model: 64,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 128,
+        seq_len_max: 64,
     };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let mut grads = ModelGrads::zeros(&cfg);
 
-    let n_train = (corpus.len() * 9) / 10;
-    let train = &corpus[..n_train];
-    let val = &corpus[n_train..];
-
-    let chunk = 32;
-    let batch = 8;
-    let stream_len = train.len() / batch;
-    let n_chunks = stream_len.saturating_sub(1) / chunk;
-    let mut states: Vec<Vec<GatedState>> =
-        (0..batch).map(|_| net.fresh_states()).collect();
-
-    for ci in 0..n_chunks {
-        let mut inputs: Vec<&[u8]> = Vec::with_capacity(batch);
-        let mut targets: Vec<&[u8]> = Vec::with_capacity(batch);
-        for b in 0..batch {
-            let p = b * stream_len + ci * chunk;
-            inputs.push(&train[p..p + chunk]);
-            targets.push(&train[p + 1..p + chunk + 1]);
-        }
-        net.forward_backward_batch_stateful(&inputs, &targets, &mut states);
-        net.clip_grads(GRAD_CLIP);
-        net.step_adam(&adam);
-    }
-
-    let val_bpb = eval_byte(&net, val, chunk);
-    eprintln!("cpu_byte_lm val BPB = {val_bpb:.3}");
-    assert!(
-        val_bpb < 6.0,
-        "byte-level LM stalled: val BPB {val_bpb:.3} ≥ 6.0 (random=8.0)"
-    );
-    assert!(val_bpb.is_finite(), "BPB is non-finite — backward broken");
-
-    // Sprint 31 regression: hidden layers must actually fire. Before
-    // the b_h positive-init fix, networks reached BPB 4.83 by learning
-    // only b_o constant prediction and never firing. Assert a stateful
-    // forward over val data shows non-trivial activity in every layer.
-    let mut states = net.fresh_states();
-    let probe = &val[..chunk.min(val.len())];
-    let cache = net.forward_lm_bytes_stateful(probe, &mut states);
-    let rates = cache.firing_rates();
-    eprintln!("cpu_byte_lm firing rates = {rates:?}");
-    for (l, &r) in rates.iter().enumerate() {
-        assert!(
-            r > 0.001,
-            "layer {l} silent (rate {r:.4}) — Sprint 31 wake-up regressed"
-        );
-    }
-}
-
-/// CPU + BPE regression. Same shape as the byte test, but the corpus
-/// is BPE-tokenized first; loss is normalized back to BPB so it's
-/// comparable to the byte-level baseline.
-#[test]
-fn cpu_bpe_lm_converges_under_one_epoch() {
-    let Some(full) = corpus_or_skip("data/tiny_200k.txt") else { return };
-    let corpus = &full[..50_000.min(full.len())];
-
-    let bpe = BpeTokenizer::train(corpus, 384);
-    let tokens = bpe.encode(corpus);
-    let comp = (corpus.len() as f32) / (tokens.len() as f32);
-    assert!(comp > 1.5, "BPE compression unexpectedly low: {comp:.2}×");
-
-    let vocab = bpe.vocab_size();
-    let mut rng = StdRng::seed_from_u64(0xBEE);
-    let mut net = MultiLayerGatedSnn::new(
-        vocab,
-        &[64, 64],
-        vocab,
-        SpikeFn::default(),
-        &mut rng,
-    );
-    let adam = AdamConfig {
-        lr: 0.005,
-        ..AdamConfig::default()
-    };
-
+    let tokens: Vec<u32> = corpus.iter().map(|&b| b as u32).collect();
     let n_train = (tokens.len() * 9) / 10;
     let train = &tokens[..n_train];
     let val = &tokens[n_train..];
 
-    let chunk = 32;
-    let batch = 8;
-    let stream_len = train.len() / batch;
-    let n_chunks = stream_len.saturating_sub(1) / chunk;
-    let mut states: Vec<Vec<GatedState>> =
-        (0..batch).map(|_| net.fresh_states()).collect();
+    let seq_len = 32;
+    let n_chunks = (train.len().saturating_sub(1)) / seq_len;
+    let mut step = 0u64;
 
-    for ci in 0..n_chunks {
-        let mut inputs: Vec<&[u32]> = Vec::with_capacity(batch);
-        let mut targets: Vec<&[u32]> = Vec::with_capacity(batch);
-        for b in 0..batch {
-            let p = b * stream_len + ci * chunk;
-            inputs.push(&train[p..p + chunk]);
-            targets.push(&train[p + 1..p + chunk + 1]);
+    for chunk_idx in 0..n_chunks {
+        let lr = cosine_warmup(step as usize, 50, n_chunks, 3e-3, 1e-4);
+        let adam = AdamWConfig {
+            lr,
+            weight_decay: 0.0,
+            ..AdamWConfig::default()
+        };
+        let p = chunk_idx * seq_len;
+        if p + seq_len + 1 > train.len() {
+            break;
         }
-        net.forward_backward_batch_tokens_stateful(&inputs, &targets, &mut states);
-        net.clip_grads(GRAD_CLIP);
-        net.step_adam(&adam);
+        let input = &train[p..p + seq_len];
+        let target = &train[p + 1..p + seq_len + 1];
+
+        let (_logits, cache) = model.forward(input);
+        grads.zero();
+        let _ = model.backward(&cache, target, &mut grads);
+        DecoderTransformer::clip_grads(&mut grads, 1.0);
+        model.step_adamw(&grads, &adam);
+        step += 1;
     }
 
-    let val_bpb = eval_token(&net, val, chunk, comp);
-    eprintln!("cpu_bpe_lm val BPB = {val_bpb:.3} (comp {comp:.2}×)");
-    assert!(
-        val_bpb < 6.0,
-        "BPE LM stalled: val BPB {val_bpb:.3} ≥ 6.0 (random=8.0)"
-    );
-    assert!(val_bpb.is_finite(), "BPB is non-finite — backward broken");
+    let val_bpb = eval_bpb(&model, val, seq_len, 1.0);
+    assert!(val_bpb < 6.0, "byte transformer val BPB {val_bpb} ≥ 6.0");
 }
 
-/// Checkpoint round-trip: train briefly, save, load into a fresh
-/// network, and confirm the loaded network reproduces the original's
-/// validation loss bit-for-bit.
 #[test]
-fn checkpoint_round_trip_preserves_loss() {
-    let Some(full) = corpus_or_skip("data/tiny_200k.txt") else { return };
-    let corpus = &full[..20_000.min(full.len())];
-
-    let mut rng = StdRng::seed_from_u64(0xC4FE);
-    let mut net = MultiLayerGatedSnn::new(
-        256,
-        &[32, 32],
-        256,
-        SpikeFn::default(),
-        &mut rng,
-    );
-    let adam = AdamConfig {
-        lr: 0.005,
-        ..AdamConfig::default()
+fn cpu_transformer_bpe_lm_converges_under_one_epoch() {
+    let Some(corpus) = corpus_or_skip("data/tiny_200k.txt") else {
+        return;
     };
-    let chunk = 32;
-    let batch = 4;
-    let n_train = (corpus.len() * 9) / 10;
-    let train = &corpus[..n_train];
-    let val = &corpus[n_train..];
-    let stream_len = train.len() / batch;
-    let n_chunks = stream_len.saturating_sub(1) / chunk;
-    let mut states: Vec<Vec<GatedState>> =
-        (0..batch).map(|_| net.fresh_states()).collect();
+    let corpus = &corpus[..50_000.min(corpus.len())];
 
-    for ci in 0..n_chunks.min(20) {
-        let mut inputs: Vec<&[u8]> = Vec::with_capacity(batch);
-        let mut targets: Vec<&[u8]> = Vec::with_capacity(batch);
-        for b in 0..batch {
-            let p = b * stream_len + ci * chunk;
-            inputs.push(&train[p..p + chunk]);
-            targets.push(&train[p + 1..p + chunk + 1]);
+    let bpe = BpeTokenizer::train(corpus, 384);
+    let tokens = bpe.encode(corpus);
+    let comp = corpus.len() as f32 / tokens.len() as f32;
+
+    let actual_vocab = bpe.vocab_size();
+    let mut rng = StdRng::seed_from_u64(0xB7E5);
+    let cfg = TransformerConfig {
+        vocab: actual_vocab,
+        d_model: 64,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 128,
+        seq_len_max: 32,
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let mut grads = ModelGrads::zeros(&cfg);
+
+    let n_train = (tokens.len() * 9) / 10;
+    let train = &tokens[..n_train];
+    let val = &tokens[n_train..];
+    let seq_len = 32;
+    let n_chunks = (train.len().saturating_sub(1)) / seq_len;
+    let mut step = 0u64;
+
+    for chunk_idx in 0..n_chunks {
+        let lr = cosine_warmup(step as usize, 50, n_chunks, 3e-3, 1e-4);
+        let adam = AdamWConfig {
+            lr,
+            weight_decay: 0.0,
+            ..AdamWConfig::default()
+        };
+        let p = chunk_idx * seq_len;
+        if p + seq_len + 1 > train.len() {
+            break;
         }
-        net.forward_backward_batch_stateful(&inputs, &targets, &mut states);
-        net.clip_grads(GRAD_CLIP);
-        net.step_adam(&adam);
+        let input = &train[p..p + seq_len];
+        let target = &train[p + 1..p + seq_len + 1];
+
+        let (_logits, cache) = model.forward(input);
+        grads.zero();
+        let _ = model.backward(&cache, target, &mut grads);
+        DecoderTransformer::clip_grads(&mut grads, 1.0);
+        model.step_adamw(&grads, &adam);
+        step += 1;
     }
 
-    let bpb_before = eval_byte(&net, val, chunk);
-    let tmp = std::env::temp_dir().join("aurora_checkpoint_test.ckpt");
-    checkpoint::save(&tmp, &net, 1).expect("checkpoint save");
-    let loaded = checkpoint::load(&tmp).expect("checkpoint load");
-    let _ = std::fs::remove_file(&tmp);
+    let val_bpb = eval_bpb(&model, val, seq_len, comp);
+    assert!(val_bpb < 6.0, "BPE transformer val BPB {val_bpb} ≥ 6.0");
+}
 
-    assert_eq!(loaded.epoch, 1);
-    let bpb_after = eval_byte(&loaded.net, val, chunk);
+#[test]
+fn checkpoint_v3_round_trip_preserves_loss() {
+    let mut rng = StdRng::seed_from_u64(0x99);
+    let cfg = TransformerConfig {
+        vocab: 32,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+    };
+    let model = DecoderTransformer::new(cfg.clone(), &mut rng);
+
+    let tokens: Vec<u32> = (0..16u32).collect();
+    let input = &tokens[..15];
+    let target = &tokens[1..];
+
+    let (_logits_before, cache_before) = model.forward(input);
+    let mut grads_before = ModelGrads::zeros(&cfg);
+    let loss_before = model.clone().backward(&cache_before, target, &mut grads_before);
+
+    let tmp = std::env::temp_dir().join("aurora_ckpt_v3_roundtrip.bin");
+    checkpoint::save(&tmp, &model, 0, model.step).expect("save");
+
+    let loaded = checkpoint::load(&tmp).expect("load");
+    let (_logits_after, cache_after) = loaded.model.forward(input);
+    let mut grads_after = ModelGrads::zeros(&cfg);
+    let loss_after = loaded
+        .model
+        .clone()
+        .backward(&cache_after, target, &mut grads_after);
+
+    let diff = (loss_before - loss_after).abs();
     assert!(
-        (bpb_before - bpb_after).abs() < 1e-5,
-        "checkpoint round-trip changed val BPB: {bpb_before:.6} → {bpb_after:.6}"
+        diff < 1e-5,
+        "loss before {loss_before}, after {loss_after}, diff {diff}"
     );
-}
 
-fn eval_byte(net: &MultiLayerGatedSnn, val: &[u8], chunk: usize) -> f32 {
-    if val.len() < chunk + 1 {
-        return f32::INFINITY;
+    // Spot-check params are identical.
+    for i in 0..16 {
+        assert!((model.embed.w_tok[i] - loaded.model.embed.w_tok[i]).abs() < 1e-6);
     }
-    let mut total_nats = 0.0_f32;
-    let mut total_bytes = 0_usize;
-    let mut pos = 0;
-    while pos + chunk < val.len() {
-        let inputs = &val[pos..pos + chunk];
-        let targets = &val[pos + 1..pos + chunk + 1];
-        let cache = net.forward_lm_bytes(inputs);
-        for (logits_t, &target) in cache.logits.iter().zip(targets.iter()) {
-            let max = logits_t.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let log_sum_exp =
-                max + logits_t.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
-            total_nats += log_sum_exp - logits_t[target as usize];
+    for (b1, b2) in model.blocks.iter().zip(loaded.model.blocks.iter()) {
+        for i in 0..16 {
+            assert!((b1.mha.w_q.w[i] - b2.mha.w_q.w[i]).abs() < 1e-6);
         }
-        total_bytes += chunk;
-        pos += chunk;
     }
-    bits_per_byte(total_nats, total_bytes)
+
+    std::fs::remove_file(&tmp).ok();
 }
 
-fn eval_token(net: &MultiLayerGatedSnn, val: &[u32], chunk: usize, comp: f32) -> f32 {
-    if val.len() < chunk + 1 {
+fn eval_bpb(model: &DecoderTransformer, val: &[u32], seq_len: usize, comp: f32) -> f32 {
+    if val.len() <= seq_len + 1 {
         return f32::INFINITY;
     }
+    let v = model.config.vocab;
     let mut total_nats = 0.0_f32;
     let mut total_tokens = 0_usize;
-    let mut pos = 0;
-    while pos + chunk < val.len() {
-        let inputs = &val[pos..pos + chunk];
-        let targets = &val[pos + 1..pos + chunk + 1];
-        let cache = net.forward_lm_tokens(inputs);
-        for (logits_t, &target) in cache.logits.iter().zip(targets.iter()) {
-            let max = logits_t.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let log_sum_exp =
-                max + logits_t.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
-            total_nats += log_sum_exp - logits_t[target as usize];
+    let mut p = 0;
+    while p + seq_len + 1 < val.len() {
+        let input = &val[p..p + seq_len];
+        let target = &val[p + 1..p + seq_len + 1];
+        let (logits, _) = model.forward(input);
+        for ti in 0..seq_len {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let probs = softmax(row);
+            let p_t = probs[target[ti] as usize].max(1e-12);
+            total_nats += -p_t.ln();
+            total_tokens += 1;
         }
-        total_tokens += chunk;
-        pos += chunk;
+        p += seq_len;
     }
     bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize)
 }

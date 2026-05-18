@@ -1,26 +1,54 @@
 # Projekt
 
-Cílem projektu Aurora je vytvořit custom LLM, přičemž využije neurobiologicky inspirovanou architekturu 
-umělé neuronové sítě. Projekt je napsán v Rustu. Cílem však NENÍ vytvořit další obecnou LLM.
+Aurora je decoder-only transformer language model, from-scratch v Rustu.
+Pre-norm GPT-style stack (token + positional embed, N transformer bloků
+s causal multi-head attention a GELU FFN, tied LM head), AdamW + cosine
+LR schedule, CPU + GPU backend (wgpu / WGSL).
+
+Projekt byl v Sprint 0–50 biologicky inspirovaná SNN (LIF + surrogate
+gradient + gated recurrent cell). Sprint 51 demolice + Sprint 52–60
+rebuild ho překlopily na klasický transformer; SNN linie zůstává jen
+v archivních docs/01_*–docs/11_*. Cíl je realistické BPB < 1.5 na enwik8
+v overnight runu (nano-GPT scale ~10M params, GTX 1650).
 
 ## Hlavní vstupní body
 
-- **Hlavní training example:** `examples/aurora_train.rs` (GPU 2-layer + BPE + checkpointing + auto-resume).
-  Spouštěj přes `scripts/overnight.sh` nebo přímo `cargo run --release --features gpu --example aurora_train -- ...`.
-- **Anti-regrese:** `tests/lm_quality_regression.rs` (CPU byte + BPE BPB threshold + checkpoint round-trip),
-  `tests/gpu_parity.rs` (CPU↔GPU drift < 5e-2). Před commitem oba zkontroluj.
-- **Diagnostické grafy:** `python3 analysis/diagnostics.py logs/<run>.jsonl` po skončení tréninku.
+- **Hlavní training example:** `examples/aurora_train.rs`. CPU default,
+  `--gpu` opt-in (vyžaduje `--features gpu`). CLI flags:
+  `--d-model --n-layer --n-head --d-ff --seq-len --batch-size --epochs
+  --lr --warmup-steps --weight-decay --grad-clip --checkpoint --bpe
+  --metrics --seed --sample-len --sample-temp`. Spouštěj přes
+  `scripts/overnight.sh` nebo přímo `cargo run --release [--features gpu]
+  --example aurora_train -- ...`.
+- **Anti-regrese před commitem:**
+  - `tests/transformer_primitives.rs` — numerické gradient checks (CPU)
+  - `tests/transformer_smoke.rs` — copy task convergence (CPU)
+  - `tests/lm_quality_regression.rs` — BPB threshold + checkpoint round-trip
+  - `tests/stability.rs` — grad health, sampling diversity, LR schedule
+  - `tests/gpu_parity.rs` — CPU↔GPU drift < 5e-2, 13 testů (`--features gpu`)
+  - `tests/kv_cache.rs` — inference parity vs full-forward
+- **Diagnostické grafy:** `python3 analysis/diagnostics.py logs/<run>.jsonl`
+  po skončení tréninku.
 
 ## Konvence
 
-- **Aktivní plán = `docs/11_implementacni_plan_v2.md`.** `docs/10_implementacni_plan.md` je zamrzlý
-  historický záznam (Sprint 0–25, 92 KB), do něj nepiš. Nový sprint dokumentuj v 11; pokud 11 přeroste
-  ~50 KB, založ 12.
-- **JSONL metriky** chodí default do `logs/<ckpt_stem>_<unix_ts>.jsonl`. Schema: `run` / `chunk` /
-  `epoch_done` / `checkpoint` events. Per-event flush — `tail -f` má sub-second lag.
-- **Checkpoint format `AURORA02`** (`src/checkpoint.rs`). Bumpy magic při schema change, drž backward compat
-  pro `AURORA01`.
-- **Korpusy** se stahují přes `scripts/get_corpus.sh <variant>` do `data/`. `data/` a `logs/` jsou v gitignore.
+- **Aktivní plán = `docs/12_refactoring_plan_transformer.md`.**
+  `docs/10_*` (Sprint 0–25) a `docs/11_*` (Sprint 26–50) jsou zamrzlé
+  historické záznamy SNN éry. Nový sprint dokumentuj v 12; pokud 12
+  přeroste ~50 KB, založ 13.
+- **JSONL metriky** chodí default do `logs/<ckpt_stem>_<unix_ts>.jsonl`.
+  Schema: `run` / `step` / `epoch_done` / `checkpoint` events. Per-event
+  flush — `tail -f` má sub-second lag.
+- **Checkpoint format `AURORA03`** (`src/checkpoint.rs`). Žádný backward
+  compat se staršími SNN formáty (AURORA01/02 jsou pryč). Bumpy magic na
+  AURORA04 při schema change.
+- **Korpusy** se stahují přes `scripts/get_corpus.sh <variant>` do
+  `data/`. `data/` a `logs/` jsou v gitignore.
+- **GPU performance limitace:** Sprint 60A udělal gradient akumulaci
+  pure-GPU, Sprint 60B udělal tiled MHA backward. Per-step latence je
+  stále převážně v `clip_grads` (per-tensor partials download) a v
+  jednotlivých dispatch overhead. Sprint 61+ může fuzí přes encoder
+  reduce dál; KV cache je zatím CPU-only (GPU port = Sprint 61).
 
 # Code style
 

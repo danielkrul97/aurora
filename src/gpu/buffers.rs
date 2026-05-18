@@ -40,11 +40,50 @@ impl GpuBuffer {
         }
     }
 
+    /// Same as `from_slice` but for `u32` payloads (token IDs).
+    #[must_use]
+    pub fn from_u32_slice(ctx: &GpuContext, label: &str, data: &[u32]) -> Self {
+        let buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+            });
+        Self {
+            inner: Arc::new(buf),
+            len: data.len(),
+        }
+    }
+
     /// Empty zero-initialized storage buffer.
     #[must_use]
     pub fn zeros(ctx: &GpuContext, label: &str, len: usize) -> Self {
         let bytes = vec![0.0_f32; len];
         Self::from_slice(ctx, label, &bytes)
+    }
+
+    /// Allocate an uninitialized storage buffer (no host upload). The
+    /// contents are undefined; caller must either write before read or
+    /// zero via a GPU kernel (e.g. `ZeroBufferKernel`). Saves the host
+    /// allocation + PCIe upload that `zeros()` incurs for large buffers.
+    #[must_use]
+    pub fn empty(ctx: &GpuContext, label: &str, len: usize) -> Self {
+        let bytes = (len * std::mem::size_of::<f32>()) as u64;
+        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        Self {
+            inner: Arc::new(buf),
+            len,
+        }
     }
 
     /// Upload from CPU. Length must match.
