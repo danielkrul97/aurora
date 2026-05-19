@@ -13,8 +13,8 @@ const SOFTMAX_CE_WGSL: &str = "
 struct SCE {
     n_output: u32,
     n_timesteps: u32,
+    loss_scale: f32,
     _pad0: u32,
-    _pad1: u32,
 };
 
 @group(0) @binding(0) var<storage, read>       logits: array<f32>;
@@ -94,7 +94,7 @@ fn main(
         if (idx == target_idx) {
             d = prob - 1.0;
         }
-        d_logits[base + idx] = d;
+        d_logits[base + idx] = d * p.loss_scale;
         idx = idx + 256u;
     }
     if (tid == 0u) {
@@ -109,8 +109,8 @@ fn main(
 struct SoftmaxCeParams {
     n_output: u32,
     n_timesteps: u32,
+    loss_scale: f32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 pub struct SoftmaxCrossEntropyKernel {
@@ -180,6 +180,7 @@ impl SoftmaxCrossEntropyKernel {
         n_output: u32,
         n_timesteps: u32,
         batch_size: u32,
+        loss_scale: f32,
     ) {
         assert!(n_output > 0, "n_output must be > 0");
         debug_assert!(logits.len >= (batch_size * n_timesteps * n_output) as usize);
@@ -190,8 +191,8 @@ impl SoftmaxCrossEntropyKernel {
         let p = SoftmaxCeParams {
             n_output,
             n_timesteps,
+            loss_scale,
             _pad0: 0,
-            _pad1: 0,
         };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora softmax_ce bind"),

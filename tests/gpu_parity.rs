@@ -15,7 +15,7 @@ use aurora::gpu::{
     cpu_gemm, cpu_gemm_transpose_b, CausalMhaBackwardKernel, CausalMhaForwardKernel,
     GeluBackwardKernel, GeluKernel, GemmKernel, GemmTransposeBKernel, GpuContext,
     GradNormSqReduceKernel, LayerNormBackwardKernel, LayerNormForwardKernel,
-    OuterProductAccumKernel, RowReduceAddKernel, TokenPosEmbedKernel,
+    OuterProductAccumKernel, RowReduceAddKernel, SoftmaxCrossEntropyKernel, TokenPosEmbedKernel,
 };
 use aurora::linalg::{gelu, gelu_backward};
 use aurora::transformer::attention::{causal_mha_forward, MhaWeights};
@@ -657,5 +657,169 @@ fn full_transformer_training_step_matches_cpu_direction() {
     assert!(
         gpu_loss_after < initial_loss + 0.1,
         "GPU loss did not drop: initial {initial_loss}, after 3 steps {gpu_loss_after}"
+    );
+}
+
+// ─── Sprint 61: GPU softmax_ce + evaluate port ───────────────────────────
+
+/// Gate test: GPU `SoftmaxCrossEntropyKernel` must produce gradients that
+/// match CPU `cross_entropy_with_grad` after applying `loss_scale = 1/T`.
+/// If this fails, the GPU train_step refactor would silently drift.
+#[test]
+fn softmax_ce_grad_matches_cpu() {
+    use aurora::transformer::loss::cross_entropy_with_grad;
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let kernel = SoftmaxCrossEntropyKernel::new(&ctx);
+    let mut rng = StdRng::seed_from_u64(0x5CE_6_4AD);
+
+    let v: usize = 257; // odd, to expose stride-loop bugs
+    let t: usize = 5;
+    let logits: Vec<f32> = (0..t * v).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect();
+    let targets: Vec<u32> = (0..t).map(|i| (i * 37 % v) as u32).collect();
+    let loss_scale = 1.0_f32 / t as f32;
+
+    let logits_gpu = GpuBuffer::from_slice(&ctx, "logits", &logits);
+    let d_logits_gpu = GpuBuffer::zeros(&ctx, "d_logits", t * v);
+    let loss_seq_gpu = GpuBuffer::zeros(&ctx, "loss_seq", t);
+    let targets_gpu = GpuBuffer::from_u32_slice(&ctx, "targets", &targets);
+    let mut enc = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("softmax_ce_grad test"),
+        });
+    kernel.dispatch_into(
+        &ctx, &mut enc,
+        &logits_gpu, &d_logits_gpu, &loss_seq_gpu, &targets_gpu,
+        v as u32, t as u32, 1, loss_scale,
+    );
+    ctx.queue.submit(Some(enc.finish()));
+
+    let gpu_d_logits = d_logits_gpu.download(&ctx);
+    let gpu_loss = loss_seq_gpu.download(&ctx);
+
+    // CPU reference.
+    let mut cpu_d_logits = vec![0.0_f32; t * v];
+    let mut cpu_loss = vec![0.0_f32; t];
+    for ti in 0..t {
+        let row = &logits[ti * v..(ti + 1) * v];
+        let (l, g) = cross_entropy_with_grad(row, targets[ti] as usize);
+        cpu_loss[ti] = l;
+        for c in 0..v {
+            cpu_d_logits[ti * v + c] = g[c] * loss_scale;
+        }
+    }
+
+    let grad_err = max_rel_err(&cpu_d_logits, &gpu_d_logits);
+    assert!(grad_err < 1e-4, "d_logits rel err {grad_err}");
+    let loss_err = max_rel_err(&cpu_loss, &gpu_loss);
+    assert!(loss_err < 1e-5, "per-token loss rel err {loss_err}");
+}
+
+/// End-to-end: `DecoderTransformerGpu::eval_step` driven through a
+/// sliding window must match CPU `evaluate`-style BPB within 1e-3.
+#[test]
+fn evaluate_gpu_matches_cpu_evaluate() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::text_io::bits_per_byte;
+    use aurora::transformer::loss::softmax;
+    use aurora::transformer::{DecoderTransformer, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0xE_4A1);
+    let cfg = TransformerConfig {
+        vocab: 64,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 4,
+        d_ff: 64,
+        seq_len_max: 32,
+    };
+    let cpu = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let gpu = DecoderTransformerGpu::from_cpu(&cpu, ctx);
+
+    let seq_len: usize = 32;
+    let val_len: usize = 320;
+    let val_toks: Vec<u32> = (0..val_len)
+        .map(|_| rng.random::<u32>() % cfg.vocab as u32)
+        .collect();
+    let comp: f32 = 1.0;
+
+    // CPU eval — open-coded to match `evaluate()` in aurora_train.rs
+    // (avoids depending on the example binary).
+    let mut cpu_nats = 0.0_f32;
+    let mut cpu_tokens = 0_usize;
+    let mut p = 0;
+    while p + seq_len + 1 < val_toks.len() {
+        let input = &val_toks[p..p + seq_len];
+        let target = &val_toks[p + 1..p + seq_len + 1];
+        let (logits, _) = cpu.forward(input);
+        for ti in 0..seq_len {
+            let row = &logits[ti * cfg.vocab..(ti + 1) * cfg.vocab];
+            let probs = softmax(row);
+            let pt = probs[target[ti] as usize].max(1e-12);
+            cpu_nats += -pt.ln();
+            cpu_tokens += 1;
+        }
+        p += seq_len;
+    }
+    let cpu_bpb = bits_per_byte(cpu_nats, (cpu_tokens as f32 * comp) as usize);
+
+    // GPU eval — sums per-window total NLL from eval_step.
+    let mut gpu_nats = 0.0_f32;
+    let mut gpu_tokens = 0_usize;
+    let mut p = 0;
+    while p + seq_len + 1 < val_toks.len() {
+        let input = &val_toks[p..p + seq_len];
+        let target = &val_toks[p + 1..p + seq_len + 1];
+        gpu_nats += gpu.eval_step(input, target);
+        gpu_tokens += seq_len;
+        p += seq_len;
+    }
+    let gpu_bpb = bits_per_byte(gpu_nats, (gpu_tokens as f32 * comp) as usize);
+
+    let diff = (cpu_bpb - gpu_bpb).abs();
+    assert!(
+        diff < 1e-3,
+        "val BPB drift: cpu {cpu_bpb} vs gpu {gpu_bpb} (diff {diff})"
+    );
+}
+
+/// Train-step regression: GPU mean_loss (now from softmax_ce) must
+/// match CPU baseline loss for the same weights + inputs. Validates
+/// the train_step refactor end-to-end.
+#[test]
+fn train_step_loss_matches_cpu_baseline() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0xBEEF_F00D);
+    let cfg = TransformerConfig {
+        vocab: 32,
+        d_model: 16,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 32,
+        seq_len_max: 16,
+    };
+    let cpu = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let mut gpu = DecoderTransformerGpu::from_cpu(&cpu, ctx);
+
+    let t: usize = 8;
+    let tokens: Vec<u32> = (0..t as u32).map(|i| i % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&x| (x + 1) % cfg.vocab as u32).collect();
+
+    // CPU loss (mean cross-entropy).
+    let mut grads = ModelGrads::zeros(&cfg);
+    let (_, cache) = cpu.forward(&tokens);
+    let cpu_loss = cpu.clone().backward(&cache, &targets, &mut grads);
+
+    let gpu_loss = gpu.train_step(&tokens, &targets);
+
+    let diff = (cpu_loss - gpu_loss).abs();
+    assert!(
+        diff < 5e-3,
+        "train_step loss drift: cpu {cpu_loss} vs gpu {gpu_loss} (diff {diff})"
     );
 }

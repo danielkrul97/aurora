@@ -18,10 +18,9 @@ use super::{
     EmbedScatterReduceKernel, GeluBackwardKernel, GeluKernel, GemmKernel, GemmTransposeBKernel,
     GpuContext, GradNormFinalizeKernel, GradNormSqReduceKernel, LayerNormBackwardKernel,
     LayerNormForwardKernel, OuterProductAccumKernel, RowReduceAddKernel, ScaleByBufferKernel,
-    TokenPosEmbedKernel, VectorAddKernel, ZeroBufferKernel,
+    SoftmaxCrossEntropyKernel, TokenPosEmbedKernel, VectorAddKernel, ZeroBufferKernel,
 };
 use crate::optimizer::{bias_correction, AdamWConfig};
-use crate::transformer::loss::cross_entropy_with_grad;
 use crate::transformer::{DecoderTransformer, TransformerConfig};
 
 const GN_GROUPS_PER_TENSOR: u32 = 8;
@@ -53,6 +52,7 @@ pub struct DecoderTransformerGpu {
     pub embed_scatter_reduce: EmbedScatterReduceKernel,
     pub single_embed: SingleTokenEmbedKernel,
     pub mha_kv: MhaKvCacheKernel,
+    pub softmax_ce: SoftmaxCrossEntropyKernel,
 
     // Pure-GPU clip_grads scratch:
     //   gn_partials_flat — concatenated per-tensor partial sums of squares
@@ -194,6 +194,10 @@ pub(crate) struct Activations {
     pub h_final: GpuBuffer,
     pub logits_buf: GpuBuffer,
     pub d_logits_buf: GpuBuffer,
+    /// Per-token NLL written by `SoftmaxCrossEntropyKernel`. Sized for `seq_len_max`.
+    pub loss_seq_buf: GpuBuffer,
+    /// u32 target token IDs uploaded once per call to train_step / eval_step.
+    pub targets_buf: GpuBuffer,
 
     // Backward scratch (shared across blocks since bwd is sequential).
     pub d_h_final: GpuBuffer,
@@ -266,6 +270,8 @@ impl Activations {
             h_final: GpuBuffer::empty(ctx, "h_final", td),
             logits_buf: GpuBuffer::empty(ctx, "logits", t * v),
             d_logits_buf: GpuBuffer::empty(ctx, "d_logits", t * v),
+            loss_seq_buf: GpuBuffer::empty(ctx, "loss_seq", t),
+            targets_buf: GpuBuffer::empty(ctx, "targets", t),
             d_h_final: GpuBuffer::empty(ctx, "d_h_final", td),
             d_pre_final: GpuBuffer::empty(ctx, "d_pre_final", td),
             d_h_post: GpuBuffer::empty(ctx, "d_h_post", td_ff),
@@ -656,6 +662,7 @@ impl DecoderTransformerGpu {
         let embed_scatter_reduce = EmbedScatterReduceKernel::new(&ctx);
         let single_embed = SingleTokenEmbedKernel::new(&ctx);
         let mha_kv = MhaKvCacheKernel::new(&ctx);
+        let softmax_ce = SoftmaxCrossEntropyKernel::new(&ctx);
 
         let grad_ops =
             build_grad_ops(&ctx, &p, &cfg, &zerob, &adamw, &gn_sq, &scaleb_buf,
@@ -694,6 +701,7 @@ impl DecoderTransformerGpu {
             embed_scatter_reduce,
             single_embed,
             mha_kv,
+            softmax_ce,
             gn_partials_flat,
             gn_result,
             ctx,
@@ -837,16 +845,13 @@ impl DecoderTransformerGpu {
         r[0]
     }
 
-    /// Full forward + backward + loss computation. Single-sequence
-    /// version (B=1) to keep state minimal. Caller is expected to
-    /// reset gradients via `zero_grad()` between minibatches.
-    ///
-    /// Activation buffers come from `self.acts` and bind groups from
-    /// `self.fwd_ops` / `self.bwd_ops` — all built once at construction.
-    /// Returns the per-token mean cross-entropy loss.
-    pub fn train_step(&mut self, tokens: &[u32], targets: &[u32]) -> f32 {
-        let cfg = self.config.clone();
-        let t = tokens.len();
+    /// Encode the forward pass (embed → N blocks → final LN → tied LM
+    /// head) into `enc`. Writes logits into `self.acts.logits_buf` at
+    /// offset 0, length `t * vocab`. Caller must have uploaded tokens
+    /// to `self.acts.tok_buf` first. Used by both `train_step` and
+    /// `eval_step` so the two paths share the exact same dispatch chain.
+    fn encode_forward(&self, enc: &mut wgpu::CommandEncoder, t: usize) {
+        let cfg = &self.config;
         let d = cfg.d_model;
         let v = cfg.vocab;
         let n_head = cfg.n_head;
@@ -855,14 +860,6 @@ impl DecoderTransformerGpu {
         let t_u = t as u32;
         let d_u = d as u32;
         let d_ff_u = d_ff as u32;
-        debug_assert_eq!(targets.len(), t);
-
-        self.acts.tok_buf.upload_u32_prefix(&self.ctx, tokens);
-
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fwd") });
 
         // Embed (1 pass).
         {
@@ -980,28 +977,57 @@ impl DecoderTransformerGpu {
             pass.set_pipeline(self.gemm_t.pipeline());
             self.gemm_t.dispatch_with_bind(&mut pass, &self.fwd_ops.final_gemm, t_u, v as u32, d_u);
         }
-        self.ctx.queue.submit(Some(enc.finish()));
+    }
 
-        let logits = self.acts.logits_buf.download_prefix(&self.ctx, t * v);
+    /// Full forward + backward + loss computation. Single-sequence
+    /// version (B=1) to keep state minimal. Caller is expected to
+    /// reset gradients via `zero_grad()` between minibatches.
+    ///
+    /// Activation buffers come from `self.acts` and bind groups from
+    /// `self.fwd_ops` / `self.bwd_ops` — all built once at construction.
+    /// Loss + d_logits are computed on the GPU by `softmax_ce` in the
+    /// same encoder as fwd/bwd; only T floats (per-token NLL) come back
+    /// to the host. Returns the per-token mean cross-entropy loss.
+    pub fn train_step(&mut self, tokens: &[u32], targets: &[u32]) -> f32 {
+        let cfg = self.config.clone();
+        let t = tokens.len();
+        let d = cfg.d_model;
+        let v = cfg.vocab;
+        let n_head = cfg.n_head;
+        let d_head = d / n_head;
+        let d_ff = cfg.d_ff;
+        let t_u = t as u32;
+        let d_u = d as u32;
+        debug_assert_eq!(targets.len(), t);
 
-        // ---- LOSS + d_logits on host ----
-        let mut total_loss = 0.0_f32;
-        let mut d_logits = vec![0.0_f32; t * v];
-        for ti in 0..t {
-            let row = &logits[ti * v..(ti + 1) * v];
-            let (loss, grad) = cross_entropy_with_grad(row, targets[ti] as usize);
-            total_loss += loss;
-            for c in 0..v {
-                d_logits[ti * v + c] = grad[c] / t as f32;
-            }
-        }
-        let mean_loss = total_loss / t as f32;
+        self.acts.tok_buf.upload_u32_prefix(&self.ctx, tokens);
 
-        self.acts.d_logits_buf.upload_prefix(&self.ctx, &d_logits);
         let mut enc = self
             .ctx
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bwd") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fwd") });
+
+        self.encode_forward(&mut enc, t);
+
+        // GPU softmax + cross-entropy: writes per-token NLL into
+        // `loss_seq_buf` (length T) and pre-scaled gradient (probs −
+        // one_hot)/T into `d_logits_buf`. Eliminates the T·V logits
+        // download + per-token CPU loss + T·V d_logits upload that the
+        // earlier path paid every step.
+        self.acts.targets_buf.upload_u32_prefix(&self.ctx, targets);
+        let loss_scale = 1.0_f32 / t as f32;
+        self.softmax_ce.dispatch_into(
+            &self.ctx,
+            &mut enc,
+            &self.acts.logits_buf,
+            &self.acts.d_logits_buf,
+            &self.acts.loss_seq_buf,
+            &self.acts.targets_buf,
+            v as u32,
+            t_u,
+            1,
+            loss_scale,
+        );
 
         // d_h_final = d_logits × w_tok  AND  outer_accum into g_w_tok.
         // The two reads of d_logits are concurrent (read-only) so we
@@ -1057,7 +1083,57 @@ impl DecoderTransformerGpu {
         }
         self.ctx.queue.submit(Some(enc.finish()));
 
-        mean_loss
+        // Per-token NLL was written by softmax_ce; reduce on host.
+        // Download is T floats (small) instead of the legacy T·V logits.
+        let loss_per_t = self.acts.loss_seq_buf.download_prefix(&self.ctx, t);
+        loss_per_t.iter().sum::<f32>() / t as f32
+    }
+
+    /// Forward-only path for validation. Encodes the same forward
+    /// dispatch chain as `train_step`, runs GPU softmax_ce to produce
+    /// per-token NLL, downloads T floats and returns their **sum**
+    /// (not mean — caller aggregates across windows). `d_logits_buf`
+    /// is still bound by softmax_ce but its contents are discarded.
+    ///
+    /// `&self` (no mutation): safe to call any number of times between
+    /// train steps without disturbing optimizer / gradient state.
+    pub fn eval_step(&self, tokens: &[u32], targets: &[u32]) -> f32 {
+        let cfg = self.config.clone();
+        let t = tokens.len();
+        let v = cfg.vocab;
+        let t_u = t as u32;
+        debug_assert_eq!(targets.len(), t);
+
+        self.acts.tok_buf.upload_u32_prefix(&self.ctx, tokens);
+        self.acts.targets_buf.upload_u32_prefix(&self.ctx, targets);
+
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("eval fwd"),
+            });
+
+        self.encode_forward(&mut enc, t);
+
+        // loss_scale is irrelevant for eval (d_logits not used), but
+        // softmax_ce still writes it; pass 1.0 to keep raw probabilities.
+        self.softmax_ce.dispatch_into(
+            &self.ctx,
+            &mut enc,
+            &self.acts.logits_buf,
+            &self.acts.d_logits_buf,
+            &self.acts.loss_seq_buf,
+            &self.acts.targets_buf,
+            v as u32,
+            t_u,
+            1,
+            1.0,
+        );
+        self.ctx.queue.submit(Some(enc.finish()));
+
+        let loss_per_t = self.acts.loss_seq_buf.download_prefix(&self.ctx, t);
+        loss_per_t.iter().sum()
     }
 
     fn block_backward(

@@ -479,6 +479,39 @@ Očekávaný model size: ~10M params. 16 × 256 = 4096 tokenů per batch, ~30K s
 
 ---
 
+## Sprint 61 — GPU loss v `train_step` + GPU port `evaluate`
+
+**Cíl:** vyhodit dva duplicitní host roundtripy z hot path. Per-step train už nestahuje T·V logits (CPU loss → upload d_logits → backward), a per-epoch validace už nečeká na `gpu.to_cpu()` + neběží na CPU.
+
+**Co se změnilo:**
+
+1. **`src/gpu/softmax_ce.rs`** — `SoftmaxCrossEntropyKernel` má nový push-constant `loss_scale: f32`. Shader násobí d_logits tímto skalárem v jediném shader stride loop. `dispatch_into` má nový argument; volání pro train používá `1.0 / t`, eval `1.0` (d_logits se zahodí).
+2. **`src/gpu/transformer.rs`**:
+   - `DecoderTransformerGpu` má nový field `softmax_ce: SoftmaxCrossEntropyKernel`.
+   - `Activations` má dvě nové buffery sized `seq_len_max`: `loss_seq_buf` (per-token NLL) a `targets_buf` (u32 targets uploadovány per call).
+   - Forward dispatchy (embed → bloky → final LN → tied LM head) jsou vytažené do privátního `fn encode_forward(&self, enc, t)` — train_step a eval_step volají identický kód.
+   - `train_step` napojený na GPU softmax_ce: jeden command encoder pro fwd + softmax_ce + bwd, jeden submit, download jen T floatů na mean reporting. Odpadla CPU loss smyčka i `upload_prefix(&d_logits)`.
+   - Nová metoda `pub fn eval_step(&self, tokens, targets) -> f32` — forward + softmax_ce, vrací sumu NLL přes T (caller agreguje napříč okny).
+3. **`examples/aurora_train.rs`** — nová `evaluate_gpu(gpu, val_toks, seq_len, comp)` zrcadlí CPU `evaluate` (stride = seq_len). Call-site v `aurora_train` větví: pokud `gpu_backend` je `Some`, volá `evaluate_gpu`, jinak CPU `evaluate`. `gpu.to_cpu()` na začátku epochy zůstává — pořád ho potřebuje `checkpoint::save` a `generate(&ctx.model, …)`.
+4. **`tests/gpu_parity.rs`** +3 testy:
+   - `softmax_ce_grad_matches_cpu` — micro-gate, V=257 / T=5, rel err < 1e-4 na d_logits, < 1e-5 na per-token NLL.
+   - `train_step_loss_matches_cpu_baseline` — GPU `train_step` loss vs CPU `forward+backward` loss na stejných váhách, |Δ| < 5e-3.
+   - `evaluate_gpu_matches_cpu_evaluate` — d=32, n_layer=2, V=64, val_len=320, |Δ BPB| < 1e-3.
+
+**Exit kritéria — splněno:**
+
+- 16/16 testů v `tests/gpu_parity.rs` zelených (13 stávajících + 3 nové).
+- `cargo check --features gpu --all-targets` clean; `cargo check` (bez GPU) clean.
+- Eliminován per-step download `t * v` floatů + upload `t * v` floatů; nahrazeno downloadem `t` floatů. Pro nano config (T=128, V=4096): ~4 MB roundtrip per step uspořeno.
+
+**Záměrně neřešeno (deferred):**
+
+- **True B>1 vektorizace.** Všechny forward i backward kernely mají buffery sized `T·D` (B=1). Skutečné B>1 by vyžadovalo resize aktivačního arena na `B·T·D`, B-aware dispatch ve všech kernelech a přestavbu `fwd_ops` / `bwd_ops`. Out of scope Sprint 61 → otevřeno pro Sprint 62.
+- **Reorder `to_cpu()` za eval.** Marginální wall-time výhra, větší churn — neuděláno.
+- **GPU sample generation.** `generate()` v `aurora_train` pořád běží na CPU modelu po `to_cpu()`. KV cache pro inference je v `src/gpu/kv_cache.rs` připravená, ale není napojená.
+
+---
+
 ## Sprint 60+ — otevřená pole
 
 | Větev | Co odemyká | Effort |
@@ -491,6 +524,7 @@ Očekávaný model size: ~10M params. 16 × 256 = 4096 tokenů per batch, ~30K s
 | **GPT-2-small reprodukce** | n_layer=12, d_model=768 — VRAM tight, mixed precision dependency | medium-large |
 | **Hyperparam search** (proper, ne hand-tuning) | Optuna / random search wrapper kolem `aurora_train` | medium |
 | **SwiGLU FFN** | +2-3 % na quality dle literatury | small |
+| **True B>1 batched fwd/bwd na GPU** | Vektorizace všech aktivačních bufferů na `B·T·D` + B-aware dispatch | large |
 
 ---
 

@@ -672,6 +672,13 @@ fn run_training_loop(mut ctx: TrainCtx) {
         }
 
         let train_bpb = bits_per_byte(total_nats, (total_tokens as f32 * ctx.comp) as usize);
+        #[cfg(feature = "gpu")]
+        let val_bpb = if let Some(gpu) = ctx.gpu_backend.as_ref() {
+            evaluate_gpu(gpu, val_toks, ctx.cli.seq_len, ctx.comp)
+        } else {
+            evaluate(&ctx.model, val_toks, ctx.cli.seq_len, ctx.comp)
+        };
+        #[cfg(not(feature = "gpu"))]
         let val_bpb = evaluate(&ctx.model, val_toks, ctx.cli.seq_len, ctx.comp);
         if val_bpb < best_val {
             best_val = val_bpb;
@@ -904,6 +911,34 @@ fn evaluate(model: &DecoderTransformer, val_toks: &[u32], seq_len: usize, comp: 
             total_nats += -p_t.ln();
             total_tokens += 1;
         }
+        p += stride;
+    }
+    bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize)
+}
+
+/// GPU equivalent of `evaluate`. Sliding window is identical (stride =
+/// seq_len), but each window runs forward + softmax_ce on the GPU and
+/// only T floats per window are read back. Avoids the per-epoch
+/// `to_cpu()` round-trip on the eval critical path.
+#[cfg(feature = "gpu")]
+fn evaluate_gpu(
+    gpu: &DecoderTransformerGpu,
+    val_toks: &[u32],
+    seq_len: usize,
+    comp: f32,
+) -> f32 {
+    if val_toks.len() <= seq_len + 1 {
+        return f32::INFINITY;
+    }
+    let stride = seq_len;
+    let mut total_nats = 0.0_f32;
+    let mut total_tokens = 0_usize;
+    let mut p = 0;
+    while p + seq_len + 1 < val_toks.len() {
+        let input = &val_toks[p..p + seq_len];
+        let target = &val_toks[p + 1..p + seq_len + 1];
+        total_nats += gpu.eval_step(input, target);
+        total_tokens += seq_len;
         p += stride;
     }
     bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize)
