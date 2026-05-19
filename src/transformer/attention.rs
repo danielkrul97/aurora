@@ -33,17 +33,17 @@ pub struct MhaWeights {
 }
 
 impl MhaWeights {
-    /// Initialize Q/K/V with plain Xavier; O with nanoGPT residual
-    /// scaling `1 / sqrt(2 * n_layer)` for stable pre-norm stacks.
-    pub fn new<R: Rng>(d_model: usize, n_head: usize, n_layer: usize, rng: &mut R) -> Self {
+    /// Q/K/V Xavier; w_o is zero-initialized so the MHA sublayer is an
+    /// identity at init (output = h_in). Residual stream dominates
+    /// early; attention learns its own scale from gradient signal.
+    pub fn new<R: Rng>(d_model: usize, n_head: usize, rng: &mut R) -> Self {
         assert!(d_model % n_head == 0, "d_model must be divisible by n_head");
         let d_head = d_model / n_head;
-        let resid_scale = (2.0_f32 * n_layer as f32).sqrt().recip();
         Self {
             w_q: LinearProj::new(d_model, d_model, rng),
             w_k: LinearProj::new(d_model, d_model, rng),
             w_v: LinearProj::new(d_model, d_model, rng),
-            w_o: LinearProj::new_scaled(d_model, d_model, resid_scale, rng),
+            w_o: LinearProj::new_scaled(d_model, d_model, 0.0, rng),
             n_head,
             d_head,
             d_model,

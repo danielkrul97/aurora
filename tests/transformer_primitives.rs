@@ -43,7 +43,7 @@ fn mha_causal_backward_matches_numerical() {
     let n_head = 2;
     let t = 4;
 
-    let w = MhaWeights::new(d_model, n_head, 2, &mut rng);
+    let w = MhaWeights::new(d_model, n_head, &mut rng);
     let x = random_vec(t * d_model, &mut rng);
     let upstream = random_vec(t * d_model, &mut rng);
 
@@ -100,7 +100,7 @@ fn mha_causal_mask_blocks_future() {
     let d_model = 8;
     let n_head = 2;
     let t = 4;
-    let w = MhaWeights::new(d_model, n_head, 2, &mut rng);
+    let w = MhaWeights::new(d_model, n_head, &mut rng);
     let mut x = random_vec(t * d_model, &mut rng);
     let (y_before, _) = causal_mha_forward(&w, &x);
 

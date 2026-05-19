@@ -221,7 +221,7 @@ fn causal_mha_forward_matches_cpu() {
 
     for &(t, n_head, d_head) in &[(4, 2, 8), (8, 4, 16), (12, 2, 32)] {
         let d_model = n_head * d_head;
-        let w = MhaWeights::new(d_model, n_head, 2, &mut rng);
+        let w = MhaWeights::new(d_model, n_head, &mut rng);
         let x = random_vec(t * d_model, &mut rng);
         let (cpu_y, cpu_cache) = causal_mha_forward(&w, &x);
 
@@ -277,7 +277,7 @@ fn causal_mha_backward_matches_cpu() {
     let d_head: usize = 8;
     let d_model = n_head * d_head;
 
-    let w = MhaWeights::new(d_model, n_head, 2, &mut rng);
+    let w = MhaWeights::new(d_model, n_head, &mut rng);
     let x = random_vec(t * d_model, &mut rng);
     let (_y, cache) = causal_mha_forward(&w, &x);
 

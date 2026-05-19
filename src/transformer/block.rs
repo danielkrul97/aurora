@@ -29,7 +29,7 @@ impl TransformerBlock {
     ) -> Self {
         Self {
             ln1: LayerNorm::new(d_model),
-            mha: MhaWeights::new(d_model, n_head, n_layer, rng),
+            mha: MhaWeights::new(d_model, n_head, rng),
             ln2: LayerNorm::new(d_model),
             ffn: FfnWeights::new(d_model, d_ff, n_layer, rng),
             d_model,

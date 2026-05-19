@@ -35,4 +35,5 @@ logs/
 experiments/wt/
 experiments/*.ckpt
 experiments/baseline.jsonl
-experiments/results/*/*.ckpt
+experiments/results/**/*.ckpt
+experiments/results/**/*.bin
