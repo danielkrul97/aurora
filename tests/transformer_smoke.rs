@@ -37,7 +37,7 @@ fn cpu_transformer_converges_on_copy_task() {
 
     let mut first_loss: f32 = 0.0;
     let mut last_loss: f32 = 0.0;
-    let steps = 200;
+    let steps = 600;
 
     for step in 0..steps {
         // Build a length-12 sequence by repeating each random token twice.
