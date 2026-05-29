@@ -1,0 +1,14 @@
+NEW BANK-BEST SINGLE-CHANGE WIN: delta_bpb = -0.331873 (2.718824 → 2.386951). Larger than full fixup-resid-zero-init (-0.251) by +0.08 BPB. The mechanism is NOT "identity stack at init" as fixup's KEEP suggested — it's specifically "zero MHA noise at init, keep FFN as before".
+
+Reinterpretation of bank: the iter-4 fixup win was actually two effects:
+- MHA-side zero-init: +0.332 (the dominant effect)
+- FFN-side zero-init: NEGATIVE contribution (~-0.08)
+- Combined: +0.251 (partial cancellation)
+
+This suggests a future ablation `fixup-ffn-only` (zero w_proj alone) would likely LOSE or be near-baseline, confirming the asymmetric mechanism. Worth running.
+
+Composability: combo-fixup-mha-only-wsd predicted additive Δ ≈ -0.381 — likely new bank-best composite. Worth running next.
+
+Multi-seed validation recommended urgently.
+
+Sample text quality is visibly improved over baseline and full-fixup outputs.

@@ -14,7 +14,7 @@ struct SCE {
     n_output: u32,
     n_timesteps: u32,
     loss_scale: f32,
-    _pad0: u32,
+    bt_offset: u32,
 };
 
 @group(0) @binding(0) var<storage, read>       logits: array<f32>;
@@ -37,7 +37,7 @@ fn main(
     let t = wgid.y;
     let bt_idx = b * p.n_timesteps + t;
     let base = bt_idx * p.n_output;
-    let target_idx = targets[bt_idx];
+    let target_idx = targets[p.bt_offset + bt_idx];
 
     var local_max: f32 = -3.4028235e38;
     var idx: u32 = tid;
@@ -99,7 +99,7 @@ fn main(
     }
     if (tid == 0u) {
         let p_target = max(exp(logits[base + target_idx] - sh_max) / sh_sum, 1e-12);
-        loss_seq[bt_idx] = -log(p_target);
+        loss_seq[p.bt_offset + bt_idx] = -log(p_target);
     }
 }
 ";
@@ -110,7 +110,11 @@ struct SoftmaxCeParams {
     n_output: u32,
     n_timesteps: u32,
     loss_scale: f32,
-    _pad0: u32,
+    /// Flat offset into `targets` / `loss_seq` (in (b·T+t) units) — lets a
+    /// per-sequence dispatch (batch_size = 1) read targets and write NLLs
+    /// into a shared `B·T` buffer at the right sequence slot. `logits` /
+    /// `d_logits` are always at offset 0 (per-sequence scratch).
+    bt_offset: u32,
 }
 
 pub struct SoftmaxCrossEntropyKernel {
@@ -181,18 +185,19 @@ impl SoftmaxCrossEntropyKernel {
         n_timesteps: u32,
         batch_size: u32,
         loss_scale: f32,
+        bt_offset: u32,
     ) {
         assert!(n_output > 0, "n_output must be > 0");
         debug_assert!(logits.len >= (batch_size * n_timesteps * n_output) as usize);
         debug_assert!(d_logits.len >= (batch_size * n_timesteps * n_output) as usize);
-        debug_assert!(loss_seq.len >= (batch_size * n_timesteps) as usize);
-        debug_assert!(targets.len >= (batch_size * n_timesteps) as usize);
+        debug_assert!(loss_seq.len >= (bt_offset + batch_size * n_timesteps) as usize);
+        debug_assert!(targets.len >= (bt_offset + batch_size * n_timesteps) as usize);
 
         let p = SoftmaxCeParams {
             n_output,
             n_timesteps,
             loss_scale,
-            _pad0: 0,
+            bt_offset,
         };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora softmax_ce bind"),

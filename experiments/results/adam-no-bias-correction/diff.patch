@@ -1,0 +1,39 @@
+diff --git a/data b/data
+new file mode 120000
+index 0000000..b28914a
+--- /dev/null
++++ b/data
+@@ -0,0 +1 @@
++/home/dkrul/Projects/research-projects/aurora/data
+\ No newline at end of file
+diff --git a/src/gpu/optimizer.rs b/src/gpu/optimizer.rs
+index 2acc16a..c5fd101 100644
+--- a/src/gpu/optimizer.rs
++++ b/src/gpu/optimizer.rs
+@@ -39,8 +39,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+     let g = grads[i];
+     m1[i] = p.beta1 * m1[i] + p.one_minus_b1 * g;
+     m2[i] = p.beta2 * m2[i] + p.one_minus_b2 * g * g;
+-    let m1_hat = m1[i] / p.bc1;
+-    let m2_hat = m2[i] / p.bc2;
++    let m1_hat = m1[i];
++    let m2_hat = m2[i];
+     var step = p.lr * m1_hat / (sqrt(m2_hat) + p.eps);
+     if (p.apply_wd != 0u) {
+         step = step + p.lr * p.weight_decay * params[i];
+diff --git a/src/optimizer.rs b/src/optimizer.rs
+index a35a833..0277e99 100644
+--- a/src/optimizer.rs
++++ b/src/optimizer.rs
+@@ -65,8 +65,9 @@ pub fn adamw_apply(
+         let g = grads[i];
+         group.m1[i] = config.beta1 * group.m1[i] + one_minus_b1 * g;
+         group.m2[i] = config.beta2 * group.m2[i] + one_minus_b2 * g * g;
+-        let m1_hat = group.m1[i] / bc1;
+-        let m2_hat = group.m2[i] / bc2;
++        let _ = (bc1, bc2);
++        let m1_hat = group.m1[i];
++        let m2_hat = group.m2[i];
+         let mut step = config.lr * m1_hat / (m2_hat.sqrt() + config.eps);
+         if apply_wd {
+             step += config.lr * config.weight_decay * params[i];

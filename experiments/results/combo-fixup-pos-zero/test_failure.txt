@@ -1,0 +1,37 @@
+failing test: cpu_transformer_converges_on_copy_task
+
+Last 40 lines (cargo test --release --test transformer_smoke):
+
+running 3 tests
+test cpu_transformer_step_does_not_nan ... ok
+test cpu_transformer_argmax_sanity ... ok
+test cpu_transformer_converges_on_copy_task ... FAILED
+
+failures:
+
+---- cpu_transformer_converges_on_copy_task stdout ----
+
+thread 'cpu_transformer_converges_on_copy_task' panicked at tests/transformer_smoke.rs:69:5:
+loss did not decrease: first=1.7334412, last=1.3604535, baseline=2.0794415
+
+Test invariant: last_loss < first_loss * 0.7
+  first_loss * 0.7 = 1.2134
+  last_loss = 1.3604535
+  actual relative drop = 21.5%, required 30%
+
+failures:
+    cpu_transformer_converges_on_copy_task
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+
+Interpretation: The smoke test runs a 200-step copy task. The combo applies
+THREE zero-inits simultaneously (w_o, w_proj, w_pos). At step 0 every
+sublayer output is zero AND positional info is zero. Sublayers and pos
+embeddings have to develop from data starting at step 1. Within 200 steps
+the model has only just begun to use its full capacity, so the relative
+loss drop is ~22% rather than the 30% the test expects.
+
+Loss IS decreasing (1.73 → 1.36, monotone), no NaN, no math error — this
+is a "warm-up too slow for the smoke harness", not a bug in the math or
+the forward/backward. But per RESEARCHER.md spec, smoke failure ⇒
+broken_impl.

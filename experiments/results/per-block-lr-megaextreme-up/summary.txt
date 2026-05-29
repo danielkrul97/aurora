@@ -1,0 +1,13 @@
+status: loss
+delta_bpb: -0.013175
+mechanism: Per-block LR multiplier [0.1x, 1.9x]. Block 5 effective LR = 1.14e-3 (1.9× baseline).
+notes: SATURATION FOUND. Going wider than [0.2, 1.8] regresses sharply. Full curve mapped:
+- [1.5, 0.5] counter: +0.018
+- [0.5, 1.5]:        -0.014
+- [0.3, 1.7]:        -0.0206 (win)
+- [0.2, 1.8]:        -0.025  (peak win, iter 49)
+- [0.1, 1.9]:        -0.013  (regressed!)
+Sweet spot is [0.2, 1.8]. Two plausible failure modes at extreme:
+1. block 0 LR = 6e-5 = baseline min_lr — too slow to keep up with the rest of the stack
+2. block 5 LR = 1.14e-3 — overshoots AdamW stability margins
+Likely BOTH simultaneously. Suggests the per-block-LR axis has a smooth peak ~[0.2, 1.8] for n_layer=6 and lr=6e-4. Composite iter 50 (with [0.2, 1.8]) is the bank-best for the new baseline.

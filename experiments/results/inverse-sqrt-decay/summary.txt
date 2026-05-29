@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: -0.006579
+mechanism: cosine_warmup post-warmup branch: base_lr * sqrt(warmup/step), original Noam Transformer (Vaswani 2017) decay; never reaches min_lr.
+notes: Small improvement (-0.007) below the -0.02 win threshold. Same "stay-at-high-LR-longer" mechanism as wsd-tail20-linear (which won -0.049 on the OLD baseline). The win compounds much less on top of fixup-mha-only — new baseline is already extracting more value from each step, so the marginal value of additional high-LR steps shrinks. Triangulates with combo-fixup-mha-only-wsd worktree (-0.376 vs old baseline = ~ -0.044 on top of fixup-mha-only).

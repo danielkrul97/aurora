@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.020598
+mechanism: Per-block LR multiplier 0.3x (block 0) linearly up to 1.7x (block 5). Mean preserved at 1.0. CPU + GPU step_adamw modified.
+notes: Solo win, just crosses threshold. Near-linear scaling with spread: iter 45 [0.5,1.5] gave -0.014; this [0.3,1.7] gives -0.0206 (×1.47 vs ×1.4 spread ratio). Depth-LR asymmetry has NOT saturated. Worth probing even wider in a future iter. Also: substituting this wider variant into iter 46's composite (for combo-decay-beta2-blocklr-spread-wide) might push total to -0.038ish.

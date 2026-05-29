@@ -1,0 +1,13 @@
+WIN: Δ_BPB = -0.033405 vs post-merge baseline (2.386948 → 2.353543).
+
+WSD schedule with 10% decay tail. Win, but weaker than wsd-tail20-fresh (-0.044).
+
+Tail-fraction comparison:
+- tail10: -0.033 (this)
+- tail20: -0.044 (iter 58, stronger)
+
+10% tail sacrifices end-of-training annealing; 20% is the better choice. This worktree is kept per spec (win > -0.02 threshold) but wsd-tail20 supersedes it for composite use.
+
+Diff: 11 LoC in src/transformer/schedule.rs.
+
+Not a merge candidate on its own — wsd-tail20 dominates. Kept for completeness of the tail-fraction sweep.

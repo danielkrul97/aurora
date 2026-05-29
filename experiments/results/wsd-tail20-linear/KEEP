@@ -1,0 +1,1 @@
+WIN: delta_bpb = -0.048763 (baseline 2.718824 → experiment 2.670061). WSD with linear decay over tail 20% beat cosine over 1-epoch enwik8_10m. Needs multi-seed validation before merging.

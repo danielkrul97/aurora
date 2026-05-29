@@ -1,0 +1,21 @@
+diff --git a/data b/data
+new file mode 120000
+index 0000000..b28914a
+--- /dev/null
++++ b/data
+@@ -0,0 +1 @@
++/home/dkrul/Projects/research-projects/aurora/data
+\ No newline at end of file
+diff --git a/src/optimizer.rs b/src/optimizer.rs
+index a35a833..6694a0f 100644
+--- a/src/optimizer.rs
++++ b/src/optimizer.rs
+@@ -21,7 +21,7 @@ impl Default for AdamWConfig {
+     fn default() -> Self {
+         Self {
+             lr: 6e-4,
+-            beta1: 0.9,
++            beta1: 0.95,
+             beta2: 0.95,
+             eps: 1e-8,
+             weight_decay: 0.1,

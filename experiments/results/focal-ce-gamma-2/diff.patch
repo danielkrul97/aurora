@@ -1,0 +1,34 @@
+src/transformer/loss.rs | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+--- Changes ---
+
+src/transformer/loss.rs
+  @@ -11,13 +11,27 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
+  +/// Focal cross-entropy (Lin et al. 2017) with γ=2. Down-weights easy
+  +/// examples by `(1 − p_t)^γ`; matches CE asymptotically at small p_t,
+  +/// kills the gradient for already-confident predictions.
+  +const FOCAL_GAMMA: f32 = 2.0;
+  +
+   #[must_use]
+   pub fn cross_entropy_with_grad(logits: &[f32], target: usize) -> (f32, Vec<f32>) {
+       let probs = softmax(logits);
+  -    let p_target = probs[target].max(1e-12);
+  -    let loss = -p_target.ln();
+  +    let p_t = probs[target].max(1e-12);
+  +    let log_p_t = p_t.ln();
+  +    let one_minus_p = 1.0 - p_t;
+  +    let one_minus_p_g = one_minus_p.powf(FOCAL_GAMMA);
+  +    let loss = one_minus_p_g * (-log_p_t);
+  +    let d_l_d_pt = FOCAL_GAMMA * one_minus_p.powf(FOCAL_GAMMA - 1.0) * log_p_t
+  +        - one_minus_p_g / p_t;
+  +    let s = -d_l_d_pt * p_t;
+       let mut grad = probs;
+       grad[target] -= 1.0;
+  +    for g in grad.iter_mut() {
+  +        *g *= s;
+  +    }
+       (loss, grad)
+   }
+   
+  +16 -2

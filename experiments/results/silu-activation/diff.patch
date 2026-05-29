@@ -1,0 +1,64 @@
+data            |  1 +
+ src/gpu/gelu.rs | 13 ++++---------
+ src/linalg.rs   | 18 ++++++------------
+ 3 files changed, 11 insertions(+), 21 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/gpu/gelu.rs
+  @@ -17,9 +17,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  -    let k: f32 = 0.7978845608028654; // sqrt(2/π)
+  -    let inner = k * (v + 0.044715 * v * v * v);
+  -    y[i] = 0.5 * v * (1.0 + tanh(inner));
+  +    let s = 1.0 / (1.0 + exp(-v));
+  +    y[i] = v * s;
+   }
+   ";
+   
+  @@ -35,12 +34,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  -    let k: f32 = 0.7978845608028654;
+  -    let inner = k * (v + 0.044715 * v * v * v);
+  -    let th = tanh(inner);
+  -    let sech2 = 1.0 - th * th;
+  -    let d_inner_dv = k * (1.0 + 3.0 * 0.044715 * v * v);
+  -    let g = 0.5 * (1.0 + th) + 0.5 * v * sech2 * d_inner_dv;
+  +    let s = 1.0 / (1.0 + exp(-v));
+  +    let g = s * (1.0 + v * (1.0 - s));
+       dx[i] = dy[i] * g;
+   }
+   ";
+  +4 -9
+
+src/linalg.rs
+  @@ -39,22 +39,16 @@ pub fn matvec_transpose(m: &[f32], v: &[f32], rows: usize, cols: usize) -> Vec<f
+  -/// GELU activation (tanh approximation, used by GPT-2 / nanoGPT).
+  -/// `gelu(x) = 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))`.
+  +/// SiLU / Swish activation: `silu(x) = x * sigmoid(x)`.
+   #[must_use]
+   pub fn gelu(x: f32) -> f32 {
+  -    let k: f32 = (2.0_f32 / std::f32::consts::PI).sqrt();
+  -    let inner = k * (x + 0.044715 * x * x * x);
+  -    0.5 * x * (1.0 + inner.tanh())
+  +    let s = 1.0 / (1.0 + (-x).exp());
+  +    x * s
+   }
+   
+  -/// `d_gelu/dx` at `x`, used in backward.
+  +/// `d_silu/dx` at `x`, used in backward.
+   #[must_use]
+   pub fn gelu_backward(x: f32) -> f32 {
+  -    let k: f32 = (2.0_f32 / std::f32::consts::PI).sqrt();
+  -    let inner = k * (x + 0.044715 * x * x * x);
+  -    let tanh_inner = inner.tanh();
+  -    let sech2 = 1.0 - tanh_inner * tanh_inner;
+  -    let d_inner_dx = k * (1.0 + 3.0 * 0.044715 * x * x);
+  -    0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * d_inner_dx
+  +    let s = 1.0 / (1.0 + (-x).exp());
+  +    s * (1.0 + x * (1.0 - s))
+   }
+  +6 -12

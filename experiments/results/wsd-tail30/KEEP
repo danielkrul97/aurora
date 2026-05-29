@@ -1,0 +1,14 @@
+WIN: Δ_BPB = -0.044996 vs post-merge baseline (2.386948 → 2.341952).
+
+WSD schedule with 30% decay tail. Marginally better than wsd-tail20 (-0.0437) — within noise (~0.001).
+
+Tail-fraction sweep:
+- tail10: -0.033 (too short)
+- tail20: -0.044
+- tail30: -0.045 (this)
+
+Broad optimum 20-30%. tail20 and tail30 are statistically equivalent. The bank-best composite (iter 59) uses tail20; substituting tail30 would not meaningfully change it.
+
+Diff: 11 LoC in src/transformer/schedule.rs.
+
+Kept per spec (win). Schedule axis fully characterized: WSD, 20-30% tail.

@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: -0.002662
+mechanism: attention scale multiplied by 2/3: scores = QKᵀ * (2/(3*√d_k)) instead of QKᵀ/√d_k. Softer initial softmax over attention positions.
+notes: Within noise. Softening initial attention had no measurable effect — Aurora's optimization is happy with the standard scale at this regime.

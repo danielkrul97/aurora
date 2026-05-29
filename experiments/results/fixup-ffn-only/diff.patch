@@ -1,0 +1,17 @@
+src/transformer/ffn.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- Changes ---
+
+src/transformer/ffn.rs
+  @@ -25,10 +25,10 @@ pub struct FfnWeights {
+  -        let resid_scale = (2.0_f32 * n_layer as f32).sqrt().recip();
+  +        let _ = n_layer;
+           Self {
+               w_fc: LinearProj::new(d_model, d_ff, rng),
+  -            w_proj: LinearProj::new_scaled(d_ff, d_model, resid_scale, rng),
+  +            w_proj: LinearProj::new_scaled(d_ff, d_model, 0.0, rng),
+               d_model,
+               d_ff,
+           }
+  +2 -2

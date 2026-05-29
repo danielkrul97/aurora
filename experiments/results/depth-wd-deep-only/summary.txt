@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.001293
+mechanism: apply_wd=false for w_{q,k,v,o,fc,proj} in blocks 0-2 (shallow half), apply_wd=true for blocks 3-5 (deep half). Both CPU model.rs and GPU build_grad_ops updated.
+notes: Within noise. At WD=0.1 and 641 steps, the integrated shrinkage on weights is too small for the asymmetry to bite. Confirms iter 3 (embed-no-wd, also loss within noise): WD regime is too gentle for selective application to matter.

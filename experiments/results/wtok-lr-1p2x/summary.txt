@@ -1,0 +1,4 @@
+status: broken_impl
+delta_bpb: n/a (smoke failed: argmax sanity + copy-task convergence)
+mechanism: w_tok-only AdamW LR boost 1.2x; w_pos and all other params at base LR.
+notes: Smoke failed 2/3 tests (argmax got 3 expected 2; copy-task only 11% drop, needs 30%). Surprising given embed-lr-1p2x (iter 63, BOTH w_tok and w_pos at 1.2x) PASSED smoke. The difference: boosting only w_tok creates a w_tok/w_pos LR imbalance. In the tiny smoke model, the tied w_tok racing ahead of w_pos destabilizes copy-task learning. Informative negative result: the embedding-LR mechanism needs w_tok and w_pos scaled TOGETHER — they must stay balanced. embed-lr-1p2x (iter 63 win) is the correct form; w_tok-only is not a valid decomposition. The embed-LR gain is a JOINT property of the embedding group, not attributable to w_tok alone.

@@ -1,0 +1,7 @@
+status: loss
+delta_bpb: +0.049582
+mechanism: Step-function depth-LR: blocks 0-2 = 0.5x, blocks 3-5 = 1.5x. Same endpoints and mean (1.0) as linear [0.5, 1.5].
+notes: Moderate regression. Comparison at same endpoints (0.5, 1.5):
+- Linear: Δ = −0.014 (iter 45 win)
+- Step:   Δ = +0.050 (this loss)
+Asymmetry = 0.064 BPB. The discontinuous 3× jump between block 2 (0.5×) and block 3 (1.5×) disrupts smooth feature gradation across the block boundary. Useful insight: depth-LR continuity matters strongly — it's not just the endpoint magnitudes but the smooth gradient between them. Confirms linear shape with continuous spread is the right mechanism (matching iter 52's quadratic also being neutral — only linear has the right gradation profile).

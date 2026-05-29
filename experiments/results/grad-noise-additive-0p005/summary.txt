@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.003735
+mechanism: Additive gradient noise on d_logits in cross_entropy_with_grad. Per-element noise ~ uniform[-0.005, 0.005], deterministic LCG seeded from (target, logits[0].to_bits()).
+notes: Within noise. Confirms prior — at 1-epoch byte-LM scale the model is far from any minimum where exploration via gradient noise helps. The "escape sharp minima" argument doesn't apply here. AdamW's m2 likely absorbs the noise into its variance estimate, neutralizing the effect.

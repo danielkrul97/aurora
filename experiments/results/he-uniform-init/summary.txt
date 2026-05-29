@@ -1,0 +1,3 @@
+status: broken_impl
+delta_bpb: n/a (sanity gate failed — no screening run)
+mechanism: LinearProj::new bound changed from sqrt(6/(d_in+d_out)) to sqrt(6/d_in) (Xavier-uniform → He-uniform); primitives::mha_causal_backward_matches_numerical fails with rel err 0.083 vs TOL 0.050 (sharper softmax at d_model=8 exceeds finite-difference precision). Math correct; passes smoke + GPU parity. Test tolerance, not math, is the gate failure.

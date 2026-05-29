@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: -0.010003
+mechanism: AdamWConfig::default beta2: 0.95 -> 0.98 (longer effective averaging window for m2)
+notes: -0.010 improvement, just below win threshold. Same direction as inverse-sqrt-decay (-0.007) — both reduce per-step variance. Two data points suggest "smoother dynamics" mechanism gives consistent ~-0.01 BPB on new baseline, below win-threshold individually. Combining them might compose super-additively (smooth schedule × smooth optimizer = more consistent step magnitudes) — candidate for a future composite experiment.

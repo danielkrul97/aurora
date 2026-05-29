@@ -1,0 +1,126 @@
+   Compiling cfg_aliases v0.1.1
+   Compiling bitflags v2.11.1
+   Compiling thiserror v1.0.69
+   Compiling parking_lot_core v0.9.12
+   Compiling libloading v0.8.9
+   Compiling khronos-egl v6.0.0
+   Compiling bit-vec v0.8.0
+   Compiling unicode-width v0.1.14
+   Compiling scopeguard v1.2.0
+   Compiling hashbrown v0.17.0
+   Compiling smallvec v1.15.1
+   Compiling bytemuck_derive v1.10.2
+   Compiling naga v23.1.0
+   Compiling thiserror-impl v1.0.69
+   Compiling foldhash v0.1.5
+   Compiling equivalent v1.0.2
+   Compiling termcolor v1.4.1
+   Compiling ash v0.38.0+1.3.281
+   Compiling bit-set v0.8.0
+   Compiling hashbrown v0.15.5
+   Compiling gpu-descriptor-types v0.2.0
+   Compiling spirv v0.3.0+sdk-1.3.268.0
+   Compiling gpu-alloc-types v0.3.0
+   Compiling lock_api v0.4.14
+   Compiling wgpu-hal v23.0.1
+   Compiling rustc-hash v1.1.0
+   Compiling codespan-reporting v0.11.1
+   Compiling unicode-xid v0.2.6
+   Compiling hexf-parse v0.2.1
+   Compiling arrayvec v0.7.6
+   Compiling log v0.4.29
+   Compiling parking_lot v0.12.5
+   Compiling gpu-alloc v0.6.0
+   Compiling wgpu-types v23.0.0
+   Compiling indexmap v2.14.0
+   Compiling wgpu-core v23.0.1
+   Compiling gpu-descriptor v0.3.2
+   Compiling litrs v1.0.0
+   Compiling profiling v1.0.17
+   Compiling glow v0.14.2
+   Compiling bytemuck v1.25.0
+   Compiling raw-window-handle v0.6.2
+   Compiling renderdoc-sys v1.1.0
+   Compiling wgpu v23.0.1
+   Compiling static_assertions v1.1.0
+   Compiling document-features v0.2.12
+   Compiling rgb v0.8.53
+   Compiling pollster v0.4.0
+   Compiling textplots v0.8.7
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/inverse-sqrt-decay)
+    Finished `release` profile [optimized] target(s) in 16.61s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics /home/dkrul/Projects/research-projects/aurora/experiments/results/inverse-sqrt-decay/metrics.jsonl --checkpoint /home/dkrul/Projects/research-projects/aurora/experiments/results/inverse-sqrt-decay/ckpt.bin`
+no checkpoint at /home/dkrul/Projects/research-projects/aurora/experiments/results/inverse-sqrt-decay/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 5.8s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : /home/dkrul/Projects/research-projects/aurora/experiments/results/inverse-sqrt-decay/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.199  bpb 3.505  lr 3.60e-5  gn 24.43    11.0s
+  step      24  chunk    24/641    loss 8.063  bpb 3.464  lr 7.20e-5  gn 13.86    22.0s
+  step      36  chunk    36/641    loss 7.825  bpb 3.425  lr 1.08e-4  gn 11.46    33.0s
+  step      48  chunk    48/641    loss 7.636  bpb 3.384  lr 1.44e-4  gn 11.22    44.0s
+  step      60  chunk    60/641    loss 7.533  bpb 3.348  lr 1.80e-4  gn 10.71    55.0s
+  step      72  chunk    72/641    loss 7.468  bpb 3.317  lr 2.16e-4  gn 7.95    66.1s
+  step      84  chunk    84/641    loss 7.424  bpb 3.306  lr 2.52e-4  gn 8.40    77.1s
+  step      96  chunk    96/641    loss 7.470  bpb 3.286  lr 2.88e-4  gn 9.67    88.1s
+  step     108  chunk   108/641    loss 7.367  bpb 3.268  lr 3.24e-4  gn 9.85    99.1s
+  step     120  chunk   120/641    loss 7.330  bpb 3.251  lr 3.60e-4  gn 20.22   110.2s
+  step     132  chunk   132/641    loss 7.210  bpb 3.234  lr 3.96e-4  gn 19.10   121.2s
+  step     144  chunk   144/641    loss 7.132  bpb 3.216  lr 4.32e-4  gn 16.84   132.2s
+  step     156  chunk   156/641    loss 6.899  bpb 3.195  lr 4.68e-4  gn 16.37   143.2s
+  step     168  chunk   168/641    loss 6.825  bpb 3.173  lr 5.04e-4  gn 18.69   154.3s
+  step     180  chunk   180/641    loss 6.731  bpb 3.152  lr 5.40e-4  gn 15.91   165.3s
+  step     192  chunk   192/641    loss 6.601  bpb 3.130  lr 5.76e-4  gn 19.67   176.3s
+  step     204  chunk   204/641    loss 6.549  bpb 3.109  lr 5.96e-4  gn 18.11   187.3s
+  step     216  chunk   216/641    loss 6.482  bpb 3.089  lr 5.79e-4  gn 16.96   198.4s
+  step     228  chunk   228/641    loss 6.448  bpb 3.069  lr 5.63e-4  gn 15.05   209.4s
+  step     240  chunk   240/641    loss 6.343  bpb 3.050  lr 5.49e-4  gn 17.60   220.4s
+  step     252  chunk   252/641    loss 6.387  bpb 3.033  lr 5.36e-4  gn 17.69   231.4s
+  step     264  chunk   264/641    loss 6.319  bpb 3.016  lr 5.23e-4  gn 16.66   242.5s
+  step     276  chunk   276/641    loss 6.324  bpb 2.999  lr 5.12e-4  gn 19.27   253.5s
+  step     288  chunk   288/641    loss 6.265  bpb 2.983  lr 5.01e-4  gn 17.39   264.5s
+  step     300  chunk   300/641    loss 6.122  bpb 2.968  lr 4.91e-4  gn 16.06   275.6s
+  step     312  chunk   312/641    loss 6.098  bpb 2.951  lr 4.81e-4  gn 15.71   286.7s
+  step     324  chunk   324/641    loss 6.049  bpb 2.936  lr 4.72e-4  gn 18.02   297.8s
+  step     336  chunk   336/641    loss 6.233  bpb 2.923  lr 4.64e-4  gn 17.24   308.8s
+  step     348  chunk   348/641    loss 6.040  bpb 2.911  lr 4.56e-4  gn 16.01   319.9s
+  step     360  chunk   360/641    loss 5.827  bpb 2.897  lr 4.48e-4  gn 18.88   331.0s
+  step     372  chunk   372/641    loss 5.767  bpb 2.884  lr 4.41e-4  gn 18.67   342.1s
+  step     384  chunk   384/641    loss 5.849  bpb 2.871  lr 4.34e-4  gn 17.79   353.2s
+  step     396  chunk   396/641    loss 5.792  bpb 2.858  lr 4.27e-4  gn 16.43   364.2s
+  step     408  chunk   408/641    loss 5.804  bpb 2.845  lr 4.21e-4  gn 16.38   375.3s
+  step     420  chunk   420/641    loss 5.926  bpb 2.835  lr 4.15e-4  gn 16.08   386.4s
+  step     432  chunk   432/641    loss 5.783  bpb 2.825  lr 4.09e-4  gn 15.90   397.5s
+  step     444  chunk   444/641    loss 5.764  bpb 2.813  lr 4.03e-4  gn 17.34   408.6s
+  step     456  chunk   456/641    loss 5.801  bpb 2.804  lr 3.98e-4  gn 14.96   419.6s
+  step     468  chunk   468/641    loss 5.566  bpb 2.793  lr 3.93e-4  gn 15.86   430.7s
+  step     480  chunk   480/641    loss 5.645  bpb 2.783  lr 3.88e-4  gn 18.42   441.8s
+  step     492  chunk   492/641    loss 5.638  bpb 2.772  lr 3.83e-4  gn 16.76   452.9s
+  step     504  chunk   504/641    loss 5.767  bpb 2.764  lr 3.78e-4  gn 14.94   464.0s
+  step     516  chunk   516/641    loss 5.713  bpb 2.755  lr 3.74e-4  gn 16.87   475.0s
+  step     528  chunk   528/641    loss 5.604  bpb 2.747  lr 3.70e-4  gn 19.44   486.1s
+  step     540  chunk   540/641    loss 5.629  bpb 2.738  lr 3.65e-4  gn 19.72   497.1s
+  step     552  chunk   552/641    loss 5.484  bpb 2.728  lr 3.61e-4  gn 15.87   508.2s
+  step     564  chunk   564/641    loss 5.462  bpb 2.719  lr 3.58e-4  gn 16.07   519.2s
+  step     576  chunk   576/641    loss 5.305  bpb 2.711  lr 3.54e-4  gn 18.44   530.2s
+  step     588  chunk   588/641    loss 5.608  bpb 2.702  lr 3.50e-4  gn 15.62   541.2s
+  step     600  chunk   600/641    loss 5.356  bpb 2.695  lr 3.47e-4  gn 17.02   552.3s
+  step     612  chunk   612/641    loss 5.423  bpb 2.686  lr 3.43e-4  gn 16.61   563.3s
+  step     624  chunk   624/641    loss 5.622  bpb 2.679  lr 3.40e-4  gn 16.70   574.4s
+  step     636  chunk   636/641    loss 5.400  bpb 2.672  lr 3.37e-4  gn 17.02   585.4s
+  done   train bpb 2.670  val bpb 2.380  616.5s
+  checkpoint → /home/dkrul/Projects/research-projects/aurora/experiments/results/inverse-sqrt-decay/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "reported or vice or court animal Governmentately with the bash of the more than sorbits the ret and between Latin an unperystion Dr]] - [[ilitary and presidential generally constitution, during his work she attacks not expandharisions delent is yor of many ded rolk between why museums as the most experremedithy investlack, endly or calling. The confloonical Cowic spec. In one term for these group of mouth that it was not him to ', his case these to decendually helped by a pos"
+
+Total time 668.9s   best val bpb 2.380   steps planned 641

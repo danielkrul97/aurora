@@ -1,0 +1,29 @@
+data                        |  1 +
+ src/transformer/schedule.rs | 11 ++++++++---
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/transformer/schedule.rs
+  @@ -11,10 +11,15 @@ pub fn cosine_warmup(
+  +    let post_warmup = (max_steps - warmup_steps).max(1);
+  +    let decay_len = ((post_warmup as f32) * 0.1).ceil() as usize;
+  +    let decay_start = max_steps.saturating_sub(decay_len);
+  +    if step < decay_start {
+  +        return base_lr;
+  +    }
+       if step >= max_steps {
+           return min_lr;
+       }
+  -    let progress = (step - warmup_steps) as f32 / (max_steps - warmup_steps).max(1) as f32;
+  -    let cos = (std::f32::consts::PI * progress).cos();
+  -    min_lr + 0.5 * (base_lr - min_lr) * (1.0 + cos)
+  +    let decay_progress = (step - decay_start) as f32 / decay_len.max(1) as f32;
+  +    base_lr + (min_lr - base_lr) * decay_progress
+   }
+  +8 -3

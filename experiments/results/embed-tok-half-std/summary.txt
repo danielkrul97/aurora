@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.021794
+mechanism: w_tok init scaled to 0.5x baseline magnitude (uniform[-0.0173, +0.0173] instead of [-0.0346, +0.0346]). Tied LM head sees half-magnitude initial logits.
+notes: Mirror-image of iter 16 pos-embed-half-std (-0.022); the two wins are nearly identical in magnitude, suggesting symmetric mechanism: Aurora benefits from smaller initial embedding magnitudes on both pathways.

@@ -1,0 +1,27 @@
+WIN: Δ_BPB = -0.086751 vs post-merge baseline (2.386948 → 2.300197).
+
+NEW BANK-BEST of the post-merge-baseline session. Eleventh win.
+
+4-way composite:
+1. WSD-tail20 schedule (-0.044 solo)
+2. AdamW β2 = 0.98 (-0.010 solo)
+3. per-block lr_mult [0.2x, 1.8x] (-0.025 solo)
+4. embed-lr 1.1x for w_tok/w_pos (~-0.024 solo, scaled from 1.2x's -0.027)
+
+Linear-sum prediction ~-0.103. Actual -0.0868 → SUB-additive by ~0.016.
+The embed-LR axis composes much less cleanly than schedule/optimizer/depth
+(those were near-linear). embed-LR and per-block-LR both modulate
+per-parameter-group AdamW step size — they overlap mechanistically, so
+stacking hits diminishing returns.
+
+embed-lr at 1.2x (iter 64) broke smoke in the 4-way; 1.1x is the safe
+operating point that clears all gates.
+
+Diff: 36 LoC across schedule.rs, optimizer.rs, model.rs, gpu/transformer.rs.
+No GPU shader changes; no new params; no checkpoint bump.
+
+Cumulative: old baseline 2.718824 → 2.300197 = -0.419 BPB total.
+
+Marginally better than the 3-way iter 59 (-0.0825). Both are strong merge
+candidates; iter 59 is simpler (3 axes, 32 LoC) for a similar result.
+Worth multi-seed validation to decide which to merge.

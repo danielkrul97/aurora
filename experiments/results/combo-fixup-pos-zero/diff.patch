@@ -1,0 +1,45 @@
+src/transformer/attention.rs | 4 ++--
+ src/transformer/embedding.rs | 4 +---
+ src/transformer/ffn.rs       | 4 ++--
+ 3 files changed, 5 insertions(+), 7 deletions(-)
+
+--- Changes ---
+
+src/transformer/attention.rs
+  @@ -38,12 +38,12 @@ impl MhaWeights {
+  -        let resid_scale = (2.0_f32 * n_layer as f32).sqrt().recip();
+  +        let _ = n_layer;
+           Self {
+               w_q: LinearProj::new(d_model, d_model, rng),
+               w_k: LinearProj::new(d_model, d_model, rng),
+               w_v: LinearProj::new(d_model, d_model, rng),
+  -            w_o: LinearProj::new_scaled(d_model, d_model, resid_scale, rng),
+  +            w_o: LinearProj::new_scaled(d_model, d_model, 0.0, rng),
+               n_head,
+               d_head,
+               d_model,
+  +2 -2
+
+src/transformer/embedding.rs
+  @@ -34,9 +34,7 @@ impl EmbedWeights {
+  -        let w_pos: Vec<f32> = (0..seq_len_max * d_model)
+  -            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * scale)
+  -            .collect();
+  +        let w_pos: Vec<f32> = vec![0.0; seq_len_max * d_model];
+           Self {
+               w_tok,
+               w_pos,
+  +1 -3
+
+src/transformer/ffn.rs
+  @@ -25,10 +25,10 @@ pub struct FfnWeights {
+  -        let resid_scale = (2.0_f32 * n_layer as f32).sqrt().recip();
+  +        let _ = n_layer;
+           Self {
+               w_fc: LinearProj::new(d_model, d_ff, rng),
+  -            w_proj: LinearProj::new_scaled(d_ff, d_model, resid_scale, rng),
+  +            w_proj: LinearProj::new_scaled(d_ff, d_model, 0.0, rng),
+               d_model,
+               d_ff,
+           }
+  +2 -2

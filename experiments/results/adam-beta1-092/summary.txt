@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.074969
+mechanism: AdamWConfig::default beta1 0.9 -> 0.92 (smoother first-moment momentum, ~12-step effective window)
+notes: Counter to hypothesis. β1 smoothing HURTS unlike β2 smoothing which helps. The asymmetry is informative: β2 (m2 magnitude smoothing, denominator of update) wants more averaging because the variance estimate is noisier; β1 (m1 direction smoothing, numerator of update) wants LESS averaging because gradient direction at byte-LM with batch=16 has real signal that gets diluted by over-smoothing. Together they say: smooth the variance estimate, but track the direction freshly. Validates β1=0.9 as the right setting; rules out β1>0.9 family from future composites.

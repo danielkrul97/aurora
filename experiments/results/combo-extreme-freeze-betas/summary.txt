@@ -1,0 +1,4 @@
+status: broken_impl
+delta_bpb: n/a (smoke argmax sanity failed)
+mechanism: 4-way composite: inverse-sqrt + β2=0.98 + per-block-lr [0.2,1.8] + freeze-LN-betas
+notes: Smoke argmax sanity failed (got 0, expected 2). Smoke uses n_layer=2 with lr=3e-2. With block 0 LR multiplier 0.2× and LN betas frozen, the effective learning rate for early layers becomes too small to reach identity prediction in 100 steps. Iter 50 (without freeze-betas) passes; iter 42 (freeze-betas alone) passes. The composite breaks because both reduce optimization capacity on shallow blocks simultaneously. Useful negative result: not all "neutral solo" + "winning composite" combinations are safe at extreme block-LR ratios.

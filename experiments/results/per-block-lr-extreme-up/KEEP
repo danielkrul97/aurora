@@ -1,0 +1,16 @@
+WIN: Δ_BPB = -0.025023 vs post-merge baseline (2.386948 → 2.361925).
+
+Fourth win of the post-merge-baseline session.
+
+Mechanism: per-block AdamW LR multiplier [0.2× (block 0), 1.8× (block 5)] — even wider than iter 47 [0.3, 1.7] which was -0.0206. Diff: 16 LoC (CPU + GPU).
+
+Saturation curve so far:
+- [0.5, 1.5]: -0.014 (sub-threshold; iter 45)
+- [0.3, 1.7]: -0.0206 (win; iter 47)
+- [0.2, 1.8]: -0.025 (win; this)
+
+Slight super-linearity in spread (gain-per-unit-spread is 0.014, 0.0147, 0.0156). Block 5 effective LR is 1.08e-3 (1.8× baseline 6e-4), getting close to instability — pushing further (e.g., [0.1, 1.9]) is plausible but riskier.
+
+Composes with iter 46's combo (substitute this variant for block-LR component). Expected combined Δ ~-0.045 if 3-axis linearity continues.
+
+Worth multi-seed validation before merge.

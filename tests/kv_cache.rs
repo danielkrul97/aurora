@@ -202,7 +202,7 @@ fn gpu_kv_cache_matches_cpu_kv_cache() {
         seq_len_max: 16,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
-    let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx);
+    let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
 
     let seed: Vec<u32> = vec![3, 0, 7, 1, 11];
 
@@ -251,7 +251,7 @@ fn gpu_kv_cache_greedy_matches_full_forward() {
         seq_len_max: 16,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
-    let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx);
+    let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
 
     let seed: Vec<u32> = vec![2, 4, 1];
     let mut tokens_full = seed.clone();
@@ -303,7 +303,7 @@ fn gpu_kv_cache_parallel_kernel_handles_large_t_total() {
         seq_len_max: 96, // > 64 forces stride loops in phase 1/2
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
-    let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx);
+    let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
 
     // 80 tokens prefill → 5 generate steps.
     let seed: Vec<u32> = (0..80u32).map(|i| i % cfg.vocab as u32).collect();
@@ -346,7 +346,7 @@ fn gpu_kv_cache_reset_correctness() {
         seq_len_max: 16,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
-    let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx);
+    let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
 
     let seed_a: Vec<u32> = vec![3, 0, 7, 1];
     let seed_b: Vec<u32> = vec![5, 2, 9, 11];

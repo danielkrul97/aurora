@@ -1,0 +1,79 @@
+data                        |  1 +
+ src/gpu/transformer.rs      |  5 +++--
+ src/optimizer.rs            |  2 +-
+ src/transformer/model.rs    |  6 ++++--
+ src/transformer/schedule.rs | 11 ++++++++---
+ 5 files changed, 17 insertions(+), 8 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/gpu/transformer.rs
+  @@ -1293,13 +1293,14 @@ impl DecoderTransformerGpu {
+  -            for op in &self.grad_ops {
+  +            for (i, op) in self.grad_ops.iter().enumerate() {
+  +                let lr_mult = if i < 2 { 1.2 } else { 1.0 };
+                   self.adamw.dispatch_with_bind(
+                       &mut pass,
+                       &op.adamw_bind,
+                       op.n,
+                       op.apply_wd,
+  -                    config.lr,
+  +                    config.lr * lr_mult,
+                       config.beta1,
+                       config.beta2,
+                       config.eps,
+  +3 -2
+
+src/optimizer.rs
+  @@ -22,7 +22,7 @@ impl Default for AdamWConfig {
+  -            beta2: 0.95,
+  +            beta2: 0.98,
+               eps: 1e-8,
+               weight_decay: 0.1,
+           }
+  +1 -1
+
+src/transformer/model.rs
+  @@ -384,11 +384,13 @@ impl DecoderTransformer {
+  +        let mut embed_cfg = *config;
+  +        embed_cfg.lr = config.lr * 1.2;
+           adamw_apply(
+               &mut self.embed.w_tok,
+               &grads.embed.d_w_tok,
+               &mut self.adam.g_w_tok,
+  -            config,
+  +            &embed_cfg,
+               bc1,
+               bc2,
+               true,
+  @@ -397,7 +399,7 @@ impl DecoderTransformer {
+  -            config,
+  +            &embed_cfg,
+               bc1,
+               bc2,
+               false,
+  +4 -2
+
+src/transformer/schedule.rs
+  @@ -11,10 +11,15 @@ pub fn cosine_warmup(
+  +    let post_warmup = (max_steps - warmup_steps).max(1);
+  +    let decay_len = ((post_warmup as f32) * 0.2).ceil() as usize;
+  +    let decay_start = max_steps.saturating_sub(decay_len);
+  +    if step < decay_start {
+  +        return base_lr;
+  +    }
+       if step >= max_steps {
+           return min_lr;
+       }
+  -    let progress = (step - warmup_steps) as f32 / (max_steps - warmup_steps).max(1) as f32;
+  -    let cos = (std::f32::consts::PI * progress).cos();
+  -    min_lr + 0.5 * (base_lr - min_lr) * (1.0 + cos)
+  +    let decay_progress = (step - decay_start) as f32 / decay_len.max(1) as f32;
+  +    base_lr + (min_lr - base_lr) * decay_progress
+   }
+  +8 -3

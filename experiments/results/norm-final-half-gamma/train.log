@@ -1,0 +1,126 @@
+   Compiling cfg_aliases v0.1.1
+   Compiling bitflags v2.11.1
+   Compiling parking_lot_core v0.9.12
+   Compiling thiserror v1.0.69
+   Compiling unicode-width v0.1.14
+   Compiling libloading v0.8.9
+   Compiling bit-vec v0.8.0
+   Compiling scopeguard v1.2.0
+   Compiling equivalent v1.0.2
+   Compiling ash v0.38.0+1.3.281
+   Compiling smallvec v1.15.1
+   Compiling bytemuck_derive v1.10.2
+   Compiling naga v23.1.0
+   Compiling thiserror-impl v1.0.69
+   Compiling termcolor v1.4.1
+   Compiling hashbrown v0.17.0
+   Compiling foldhash v0.1.5
+   Compiling khronos-egl v6.0.0
+   Compiling hashbrown v0.15.5
+   Compiling bit-set v0.8.0
+   Compiling gpu-alloc-types v0.3.0
+   Compiling spirv v0.3.0+sdk-1.3.268.0
+   Compiling gpu-descriptor-types v0.2.0
+   Compiling lock_api v0.4.14
+   Compiling codespan-reporting v0.11.1
+   Compiling wgpu-hal v23.0.1
+   Compiling arrayvec v0.7.6
+   Compiling log v0.4.29
+   Compiling unicode-xid v0.2.6
+   Compiling rustc-hash v1.1.0
+   Compiling hexf-parse v0.2.1
+   Compiling parking_lot v0.12.5
+   Compiling gpu-alloc v0.6.0
+   Compiling wgpu-types v23.0.0
+   Compiling indexmap v2.14.0
+   Compiling wgpu-core v23.0.1
+   Compiling gpu-descriptor v0.3.2
+   Compiling glow v0.14.2
+   Compiling renderdoc-sys v1.1.0
+   Compiling bytemuck v1.25.0
+   Compiling raw-window-handle v0.6.2
+   Compiling litrs v1.0.0
+   Compiling profiling v1.0.17
+   Compiling wgpu v23.0.1
+   Compiling static_assertions v1.1.0
+   Compiling rgb v0.8.53
+   Compiling pollster v0.4.0
+   Compiling document-features v0.2.12
+   Compiling textplots v0.8.7
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/norm-final-half-gamma)
+    Finished `release` profile [optimized] target(s) in 18.99s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics /home/dkrul/Projects/research-projects/aurora/experiments/results/norm-final-half-gamma/metrics.jsonl --checkpoint /home/dkrul/Projects/research-projects/aurora/experiments/results/norm-final-half-gamma/ckpt.bin`
+no checkpoint at /home/dkrul/Projects/research-projects/aurora/experiments/results/norm-final-half-gamma/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 7.4s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : /home/dkrul/Projects/research-projects/aurora/experiments/results/norm-final-half-gamma/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.238  bpb 3.497  lr 3.60e-5  gn 12.20    22.8s
+  step      24  chunk    24/641    loss 8.169  bpb 3.477  lr 7.20e-5  gn 7.05    45.6s
+  step      36  chunk    36/641    loss 8.038  bpb 3.456  lr 1.08e-4  gn 6.27    68.4s
+  step      48  chunk    48/641    loss 7.901  bpb 3.432  lr 1.44e-4  gn 6.46    90.0s
+  step      60  chunk    60/641    loss 7.752  bpb 3.406  lr 1.80e-4  gn 6.37   111.6s
+  step      72  chunk    72/641    loss 7.592  bpb 3.378  lr 2.16e-4  gn 4.89   134.4s
+  step      84  chunk    84/641    loss 7.481  bpb 3.350  lr 2.52e-4  gn 4.47   157.1s
+  step      96  chunk    96/641    loss 7.493  bpb 3.327  lr 2.88e-4  gn 4.37   179.6s
+  step     108  chunk   108/641    loss 7.439  bpb 3.307  lr 3.24e-4  gn 4.47   191.0s
+  step     120  chunk   120/641    loss 7.442  bpb 3.290  lr 3.60e-4  gn 4.63   202.2s
+  step     132  chunk   132/641    loss 7.427  bpb 3.277  lr 3.96e-4  gn 5.27   213.4s
+  step     144  chunk   144/641    loss 7.436  bpb 3.265  lr 4.32e-4  gn 6.97   235.0s
+  step     156  chunk   156/641    loss 7.315  bpb 3.252  lr 4.68e-4  gn 7.03   254.1s
+  step     168  chunk   168/641    loss 7.234  bpb 3.238  lr 5.04e-4  gn 7.43   276.6s
+  step     180  chunk   180/641    loss 7.117  bpb 3.224  lr 5.40e-4  gn 7.49   298.9s
+  step     192  chunk   192/641    loss 6.977  bpb 3.208  lr 5.76e-4  gn 8.30   320.7s
+  step     204  chunk   204/641    loss 6.930  bpb 3.192  lr 6.00e-4  gn 8.16   339.9s
+  step     216  chunk   216/641    loss 6.845  bpb 3.176  lr 5.98e-4  gn 6.74   351.2s
+  step     228  chunk   228/641    loss 6.829  bpb 3.160  lr 5.95e-4  gn 8.34   362.1s
+  step     240  chunk   240/641    loss 6.701  bpb 3.144  lr 5.90e-4  gn 7.31   373.5s
+  step     252  chunk   252/641    loss 6.795  bpb 3.130  lr 5.82e-4  gn 8.76   385.5s
+  step     264  chunk   264/641    loss 6.691  bpb 3.116  lr 5.73e-4  gn 6.91   408.0s
+  step     276  chunk   276/641    loss 6.694  bpb 3.103  lr 5.62e-4  gn 8.64   430.8s
+  step     288  chunk   288/641    loss 6.674  bpb 3.090  lr 5.50e-4  gn 7.99   450.3s
+  step     300  chunk   300/641    loss 6.583  bpb 3.078  lr 5.36e-4  gn 7.65   469.2s
+  step     312  chunk   312/641    loss 6.596  bpb 3.065  lr 5.20e-4  gn 7.83   482.5s
+  step     324  chunk   324/641    loss 6.581  bpb 3.054  lr 5.03e-4  gn 8.07   493.7s
+  step     336  chunk   336/641    loss 6.687  bpb 3.044  lr 4.84e-4  gn 8.38   505.2s
+  step     348  chunk   348/641    loss 6.554  bpb 3.035  lr 4.65e-4  gn 7.38   516.3s
+  step     360  chunk   360/641    loss 6.415  bpb 3.025  lr 4.45e-4  gn 8.52   527.3s
+  step     372  chunk   372/641    loss 6.382  bpb 3.015  lr 4.23e-4  gn 9.57   538.1s
+  step     384  chunk   384/641    loss 6.459  bpb 3.006  lr 4.01e-4  gn 8.53   549.0s
+  step     396  chunk   396/641    loss 6.374  bpb 2.996  lr 3.79e-4  gn 7.78   560.0s
+  step     408  chunk   408/641    loss 6.422  bpb 2.987  lr 3.56e-4  gn 8.48   571.0s
+  step     420  chunk   420/641    loss 6.507  bpb 2.980  lr 3.33e-4  gn 8.06   582.1s
+  step     432  chunk   432/641    loss 6.420  bpb 2.973  lr 3.10e-4  gn 7.92   593.1s
+  step     444  chunk   444/641    loss 6.351  bpb 2.964  lr 2.87e-4  gn 8.05   604.0s
+  step     456  chunk   456/641    loss 6.430  bpb 2.958  lr 2.64e-4  gn 7.57   614.9s
+  step     468  chunk   468/641    loss 6.281  bpb 2.950  lr 2.42e-4  gn 8.12   625.8s
+  step     480  chunk   480/641    loss 6.287  bpb 2.943  lr 2.21e-4  gn 8.78   636.7s
+  step     492  chunk   492/641    loss 6.297  bpb 2.936  lr 2.00e-4  gn 8.39   647.5s
+  step     504  chunk   504/641    loss 6.367  bpb 2.930  lr 1.80e-4  gn 7.50   658.4s
+  step     516  chunk   516/641    loss 6.354  bpb 2.924  lr 1.62e-4  gn 7.72   669.2s
+  step     528  chunk   528/641    loss 6.342  bpb 2.918  lr 1.44e-4  gn 10.38   680.1s
+  step     540  chunk   540/641    loss 6.331  bpb 2.912  lr 1.28e-4  gn 9.38   690.9s
+  step     552  chunk   552/641    loss 6.287  bpb 2.907  lr 1.14e-4  gn 7.83   701.8s
+  step     564  chunk   564/641    loss 6.251  bpb 2.901  lr 1.01e-4  gn 7.95   712.6s
+  step     576  chunk   576/641    loss 6.162  bpb 2.896  lr 8.93e-5  gn 8.83   723.5s
+  step     588  chunk   588/641    loss 6.362  bpb 2.890  lr 7.97e-5  gn 8.10   734.4s
+  step     600  chunk   600/641    loss 6.163  bpb 2.885  lr 7.20e-5  gn 8.50   745.5s
+  step     612  chunk   612/641    loss 6.281  bpb 2.880  lr 6.61e-5  gn 8.81   756.6s
+  step     624  chunk   624/641    loss 6.282  bpb 2.876  lr 6.22e-5  gn 8.52   767.8s
+  step     636  chunk   636/641    loss 6.223  bpb 2.872  lr 6.02e-5  gn 8.71   778.9s
+  done   train bpb 2.870  val bpb 2.663  810.4s
+  checkpoint → /home/dkrul/Projects/research-projects/aurora/experiments/results/norm-final-half-gamma/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "puter and tooked into the plays of the ordture]]. above plure the two article, thus to them in September 1932 Allaned) in [[explercially modern drropay character, holarounced where she observed the [[chiltometas]]. The Easts of compy.&quot; Maraiseopn by the peines of rich Ather of the Medioughs a transBii]] and the fial exations in many as is pony, 5. Stuke in overgee of 22 and conenous notents it of the [[L pitber, under iners where following that is a is one "
+
+Total time 862.9s   best val bpb 2.663   steps planned 641

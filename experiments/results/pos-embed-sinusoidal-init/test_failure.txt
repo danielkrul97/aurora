@@ -1,0 +1,13 @@
+FAILURES (3):
+═══════════════════════════════════════
+1. ---- cpu_transformer_argmax_sanity stdout ----
+2. thread 'cpu_transformer_argmax_sanity' (2145350) panicked at tests/transformer_smoke.rs:166:5:
+assertion `left == right` failed: model should learn identity prediction, got 3
+  left: 3
+ right: 2
+no...
+3.     cpu_transformer_argmax_sanity
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+[full output: ~/.local/share/rtk/tee/1779204696_cargo_test.log]

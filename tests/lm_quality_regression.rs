@@ -72,9 +72,9 @@ fn cpu_transformer_byte_lm_converges_under_one_epoch() {
         let input = &train[p..p + seq_len];
         let target = &train[p + 1..p + seq_len + 1];
 
-        let (_logits, cache) = model.forward(input);
+        let (logits, cache) = model.forward(input);
         grads.zero();
-        let _ = model.backward(&cache, target, &mut grads);
+        let _ = model.backward(&cache, &logits, target, &mut grads);
         DecoderTransformer::clip_grads(&mut grads, 1.0);
         model.step_adamw(&grads, &adam);
         step += 1;
@@ -129,9 +129,9 @@ fn cpu_transformer_bpe_lm_converges_under_one_epoch() {
         let input = &train[p..p + seq_len];
         let target = &train[p + 1..p + seq_len + 1];
 
-        let (_logits, cache) = model.forward(input);
+        let (logits, cache) = model.forward(input);
         grads.zero();
-        let _ = model.backward(&cache, target, &mut grads);
+        let _ = model.backward(&cache, &logits, target, &mut grads);
         DecoderTransformer::clip_grads(&mut grads, 1.0);
         model.step_adamw(&grads, &adam);
         step += 1;
@@ -158,20 +158,20 @@ fn checkpoint_v3_round_trip_preserves_loss() {
     let input = &tokens[..15];
     let target = &tokens[1..];
 
-    let (_logits_before, cache_before) = model.forward(input);
+    let (logits_before, cache_before) = model.forward(input);
     let mut grads_before = ModelGrads::zeros(&cfg);
-    let loss_before = model.clone().backward(&cache_before, target, &mut grads_before);
+    let loss_before = model.clone().backward(&cache_before, &logits_before, target, &mut grads_before);
 
     let tmp = std::env::temp_dir().join("aurora_ckpt_v3_roundtrip.bin");
     checkpoint::save(&tmp, &model, 0, model.step).expect("save");
 
     let loaded = checkpoint::load(&tmp).expect("load");
-    let (_logits_after, cache_after) = loaded.model.forward(input);
+    let (logits_after, cache_after) = loaded.model.forward(input);
     let mut grads_after = ModelGrads::zeros(&cfg);
     let loss_after = loaded
         .model
         .clone()
-        .backward(&cache_after, target, &mut grads_after);
+        .backward(&cache_after, &logits_after, target, &mut grads_after);
 
     let diff = (loss_before - loss_after).abs();
     assert!(

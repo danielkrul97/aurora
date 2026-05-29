@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.275613
+mechanism: DecoderTransformer::new override final_ln.gamma to 0.5 (vs default 1.0)
+notes: Major regression. Mechanism analysis: γ=0.5 halves logit magnitudes at init AND halves gradient flow back through layer_norm_backward (which multiplies d_x_pre_LN by γ). The entire transformer stack effectively trains at half-LR for the first hundreds of steps until γ_final recovers via AdamW. In a 641-step budget, this lost training time isn't recovered. Negative result of value: LayerNorm γ init has BOTH forward (logit magnitude) AND backward (gradient scaling) effects; the backward effect dominates. Future norm-placement ideas should avoid γ init perturbation as a no-cost knob.

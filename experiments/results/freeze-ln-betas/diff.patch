@@ -1,0 +1,55 @@
+data                     |  1 +
+ src/gpu/transformer.rs   |  7 ++++++-
+ src/transformer/model.rs | 14 +++-----------
+ 3 files changed, 10 insertions(+), 12 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/gpu/transformer.rs
+  @@ -1293,7 +1293,12 @@ impl DecoderTransformerGpu {
+  -            for op in &self.grad_ops {
+  +            for (i, op) in self.grad_ops.iter().enumerate() {
+  +                let is_beta = i == 3 || (i >= 4 && {
+  +                    let r = (i - 4) % 10;
+  +                    r == 1 || r == 7
+  +                });
+  +                if is_beta { continue; }
+                   self.adamw.dispatch_with_bind(
+                       &mut pass,
+                       &op.adamw_bind,
+  +6 -1
+
+src/transformer/model.rs
+  @@ -406,13 +406,13 @@ impl DecoderTransformer {
+  -            adamw_apply(&mut blk.ln1.beta, &bg.d_ln1.d_beta, &mut ba.ln1_beta, config, bc1, bc2, false);
+  +            let _ = (&bg.d_ln1.d_beta, &mut ba.ln1_beta);
+               adamw_apply(&mut blk.mha.w_q.w, &bg.d_mha.d_w_q.d_w, &mut ba.w_q, config, bc1, bc2, true);
+               adamw_apply(&mut blk.mha.w_k.w, &bg.d_mha.d_w_k.d_w, &mut ba.w_k, config, bc1, bc2, true);
+               adamw_apply(&mut blk.mha.w_v.w, &bg.d_mha.d_w_v.d_w, &mut ba.w_v, config, bc1, bc2, true);
+               adamw_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut ba.w_o, config, bc1, bc2, true);
+               adamw_apply(&mut blk.ln2.gamma, &bg.d_ln2.d_gamma, &mut ba.ln2_gamma, config, bc1, bc2, false);
+  -            adamw_apply(&mut blk.ln2.beta, &bg.d_ln2.d_beta, &mut ba.ln2_beta, config, bc1, bc2, false);
+  +            let _ = (&bg.d_ln2.d_beta, &mut ba.ln2_beta);
+               adamw_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut ba.w_fc, config, bc1, bc2, true);
+               adamw_apply(&mut blk.ffn.w_proj.w, &bg.d_ffn.d_w_proj.d_w, &mut ba.w_proj, config, bc1, bc2, true);
+           }
+  @@ -425,15 +425,7 @@ impl DecoderTransformer {
+  -        adamw_apply(
+  -            &mut self.final_ln.beta,
+  -            &grads.final_ln.d_beta,
+  -            &mut self.adam.g_final_beta,
+  -            config,
+  -            bc1,
+  -            bc2,
+  -            false,
+  -        );
+  +        let _ = (&grads.final_ln.d_beta, &mut self.adam.g_final_beta);
+       }
+   
+       /// Clip gradient global norm. Returns the pre-clip norm for logging.
+  +3 -11

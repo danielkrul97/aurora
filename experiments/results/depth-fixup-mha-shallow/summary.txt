@@ -1,0 +1,4 @@
+status: broken_impl
+delta_bpb: n/a (sanity gate failed — no screening run)
+mechanism: post-process w_o in DecoderTransformer::new — for blocks 0..n_layer/2 (shallow half), zero w_o.w. Deeper blocks keep baseline GPT-3 residual scaling.
+notes: smoke convergence failed at 13% drop (vs 30% threshold). Asymmetric init (block 0 zero, block 1 baseline) converges worse than either uniform init (full zero or full baseline). Possibly a complex loss landscape from depth-mixed init. The depth-decomposition question for fixup-mha-only's gain needs a different probe (full screening with multi-seed eval, not single-seed smoke).

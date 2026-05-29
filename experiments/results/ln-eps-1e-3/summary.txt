@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.015674
+mechanism: LayerNorm eps changed from 1e-5 to 1e-3 across all 9 sites (CPU LayerNorm::new + 8 GPU dispatch). Forward: y = γ·(x−μ)/√(var+1e-3)+β.
+notes: Slight regression but not catastrophic. Confirms Aurora's normalization is already well-behaved — looser denom floor just weakens normalization slightly without rescuing any pathology.

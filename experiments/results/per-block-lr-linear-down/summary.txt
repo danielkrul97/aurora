@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.017854
+mechanism: Per-block LR multiplier: block 0 = 1.5x, linearly down to block 5 = 0.5x. Mean preserved at 1.0x.
+notes: Mild regression. Counter-conventional "shallow blocks need more LR" hurt by ~0.018. Suggests the conventional intuition (deeper blocks benefit from more LR or symmetric LR) is correct for from-scratch byte-LM training. Useful data point: inverse direction `per-block-lr-linear-up` (0.5x shallow, 1.5x deep) would be the natural follow-up — likely sub-threshold win or neutral based on this signal. Worth a follow-up iter, but the per-block-LR axis as a whole has now been probed in one direction.

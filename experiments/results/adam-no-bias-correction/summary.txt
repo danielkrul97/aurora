@@ -1,0 +1,4 @@
+status: broken_impl
+delta_bpb: n/a (smoke convergence failed)
+mechanism: Removed bias correction divisions; AdamW uses raw m1, m2 directly.
+notes: cpu_transformer_converges_on_copy_task failed — loss INCREASED (last=2.18 vs first=2.06, must drop 30%). Without bias correction, m1/sqrt(m2) at step 1 ≈ 0.22 × sign(g) instead of 1.0 × sign(g), so initial steps are tiny. Combined with smoke's aggressive lr=3e-2 driving the model into bad regions before m1, m2 accumulate, the trajectory diverges. Bias correction is essential at the start of training in this regime; cannot be removed without compensating in some other way. Useful negative result for any future "warmup-free" attempts.

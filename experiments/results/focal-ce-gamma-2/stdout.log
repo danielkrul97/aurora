@@ -1,0 +1,77 @@
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/focal-ce-gamma-2)
+    Finished `release` profile [optimized] target(s) in 0.79s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics ../../results/focal-ce-gamma-2/metrics.jsonl --checkpoint ../../results/focal-ce-gamma-2/ckpt.bin`
+no checkpoint at ../../results/focal-ce-gamma-2/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 5.6s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : ../../results/focal-ce-gamma-2/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.196  bpb 3.504  lr 3.60e-5  gn 20.48    11.4s
+  step      24  chunk    24/641    loss 8.073  bpb 3.465  lr 7.20e-5  gn 13.17    22.6s
+  step      36  chunk    36/641    loss 7.840  bpb 3.427  lr 1.08e-4  gn 11.25    33.9s
+  step      48  chunk    48/641    loss 7.647  bpb 3.387  lr 1.44e-4  gn 11.23    45.1s
+  step      60  chunk    60/641    loss 7.530  bpb 3.350  lr 1.80e-4  gn 10.63    56.4s
+  step      72  chunk    72/641    loss 7.461  bpb 3.319  lr 2.16e-4  gn 7.67    67.6s
+  step      84  chunk    84/641    loss 7.426  bpb 3.295  lr 2.52e-4  gn 7.99    78.8s
+  step      96  chunk    96/641    loss 7.480  bpb 3.278  lr 2.88e-4  gn 8.31    90.1s
+  step     108  chunk   108/641    loss 7.438  bpb 3.263  lr 3.24e-4  gn 8.09   101.3s
+  step     120  chunk   120/641    loss 7.453  bpb 3.251  lr 3.60e-4  gn 8.04   112.6s
+  step     132  chunk   132/641    loss 7.431  bpb 3.241  lr 3.96e-4  gn 8.56   123.9s
+  step     144  chunk   144/641    loss 7.453  bpb 3.231  lr 4.32e-4  gn 9.33   135.2s
+  step     156  chunk   156/641    loss 7.334  bpb 3.222  lr 4.68e-4  gn 9.16   146.5s
+  step     168  chunk   168/641    loss 7.314  bpb 3.212  lr 5.04e-4  gn 8.34   157.9s
+  step     180  chunk   180/641    loss 7.262  bpb 3.202  lr 5.40e-4  gn 8.03   169.2s
+  step     192  chunk   192/641    loss 7.164  bpb 3.192  lr 5.76e-4  gn 9.43   180.5s
+  step     204  chunk   204/641    loss 7.176  bpb 3.182  lr 6.00e-4  gn 10.93   191.8s
+  step     216  chunk   216/641    loss 7.106  bpb 3.173  lr 5.98e-4  gn 9.38   203.1s
+  step     228  chunk   228/641    loss 7.036  bpb 3.162  lr 5.95e-4  gn 10.60   214.5s
+  step     240  chunk   240/641    loss 6.883  bpb 3.150  lr 5.90e-4  gn 10.39   225.8s
+  step     252  chunk   252/641    loss 6.957  bpb 3.139  lr 5.82e-4  gn 14.39   237.1s
+  step     264  chunk   264/641    loss 6.832  bpb 3.128  lr 5.73e-4  gn 10.30   248.4s
+  step     276  chunk   276/641    loss 6.859  bpb 3.116  lr 5.62e-4  gn 12.33   259.7s
+  step     288  chunk   288/641    loss 6.795  bpb 3.105  lr 5.50e-4  gn 11.60   271.0s
+  step     300  chunk   300/641    loss 6.669  bpb 3.095  lr 5.36e-4  gn 10.39   282.4s
+  step     312  chunk   312/641    loss 6.710  bpb 3.083  lr 5.20e-4  gn 11.45   293.7s
+  step     324  chunk   324/641    loss 6.697  bpb 3.073  lr 5.03e-4  gn 10.69   305.0s
+  step     336  chunk   336/641    loss 6.789  bpb 3.064  lr 4.84e-4  gn 11.58   316.3s
+  step     348  chunk   348/641    loss 6.628  bpb 3.056  lr 4.65e-4  gn 9.65   327.6s
+  step     360  chunk   360/641    loss 6.511  bpb 3.047  lr 4.45e-4  gn 11.85   339.0s
+  step     372  chunk   372/641    loss 6.495  bpb 3.037  lr 4.23e-4  gn 11.84   350.3s
+  step     384  chunk   384/641    loss 6.552  bpb 3.028  lr 4.01e-4  gn 11.90   361.6s
+  step     396  chunk   396/641    loss 6.480  bpb 3.019  lr 3.79e-4  gn 9.94   372.9s
+  step     408  chunk   408/641    loss 6.510  bpb 3.011  lr 3.56e-4  gn 11.12   384.2s
+  step     420  chunk   420/641    loss 6.576  bpb 3.004  lr 3.33e-4  gn 10.49   395.6s
+  step     432  chunk   432/641    loss 6.489  bpb 2.997  lr 3.10e-4  gn 10.59   406.9s
+  step     444  chunk   444/641    loss 6.419  bpb 2.989  lr 2.87e-4  gn 11.30   418.2s
+  step     456  chunk   456/641    loss 6.512  bpb 2.983  lr 2.64e-4  gn 9.69   429.5s
+  step     468  chunk   468/641    loss 6.380  bpb 2.976  lr 2.42e-4  gn 11.12   440.9s
+  step     480  chunk   480/641    loss 6.353  bpb 2.969  lr 2.21e-4  gn 11.92   452.2s
+  step     492  chunk   492/641    loss 6.382  bpb 2.962  lr 2.00e-4  gn 10.96   463.5s
+  step     504  chunk   504/641    loss 6.445  bpb 2.956  lr 1.80e-4  gn 10.08   474.8s
+  step     516  chunk   516/641    loss 6.443  bpb 2.950  lr 1.62e-4  gn 10.67   486.1s
+  step     528  chunk   528/641    loss 6.397  bpb 2.945  lr 1.44e-4  gn 13.55   497.4s
+  step     540  chunk   540/641    loss 6.425  bpb 2.939  lr 1.28e-4  gn 12.41   508.7s
+  step     552  chunk   552/641    loss 6.358  bpb 2.933  lr 1.14e-4  gn 10.46   520.1s
+  step     564  chunk   564/641    loss 6.330  bpb 2.928  lr 1.01e-4  gn 10.84   531.4s
+  step     576  chunk   576/641    loss 6.244  bpb 2.923  lr 8.93e-5  gn 11.56   542.7s
+  step     588  chunk   588/641    loss 6.419  bpb 2.917  lr 7.97e-5  gn 10.97   554.0s
+  step     600  chunk   600/641    loss 6.227  bpb 2.913  lr 7.20e-5  gn 11.84   565.3s
+  step     612  chunk   612/641    loss 6.354  bpb 2.908  lr 6.61e-5  gn 11.40   576.6s
+  step     624  chunk   624/641    loss 6.373  bpb 2.903  lr 6.22e-5  gn 11.32   588.0s
+  step     636  chunk   636/641    loss 6.286  bpb 2.899  lr 6.02e-5  gn 11.40   599.3s
+  done   train bpb 2.898  val bpb 2.718  2312.8s
+  checkpoint → ../../results/focal-ce-gamma-2/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "royes, thes the consequated 7 Alceed by blockm in the cleing Corged for is called ''While such as was the Union of contoven follow. In the ilients are in the g. The Paul.boertuisectia part of the imjected availtive over The Plestdiiology with Dq a most use agonobestimeism. Many free sal. Thse pigns in the most octive on the of the inuines of Aelal popular Governing took to the Chargrumys in called in the this our con'ning they are antiacus on [[world. Raks his "
+
+Total time 2365.1s   best val bpb 2.718   steps planned 641

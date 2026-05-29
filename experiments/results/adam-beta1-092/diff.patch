@@ -1,0 +1,19 @@
+data             | 1 +
+ src/optimizer.rs | 2 +-
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/optimizer.rs
+  @@ -21,7 +21,7 @@ impl Default for AdamWConfig {
+  -            beta1: 0.9,
+  +            beta1: 0.92,
+               beta2: 0.95,
+               eps: 1e-8,
+               weight_decay: 0.1,
+  +1 -1

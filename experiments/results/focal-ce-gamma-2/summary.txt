@@ -1,0 +1,3 @@
+status: loss
+delta_bpb: -0.000581
+mechanism: cross_entropy_with_grad body replaced with focal CE (gamma=2): L = (1-p_t)^2 · (-log p_t), grad scaled by per-token factor s = -dL/dp_t · p_t

@@ -1,0 +1,77 @@
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/combo-wsd-embed-both-half)
+    Finished `release` profile [optimized] target(s) in 0.79s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics ../../results/combo-wsd-embed-both-half/metrics.jsonl --checkpoint ../../results/combo-wsd-embed-both-half/ckpt.bin`
+no checkpoint at ../../results/combo-wsd-embed-both-half/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 5.8s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : ../../results/combo-wsd-embed-both-half/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.226  bpb 3.496  lr 3.60e-5  gn 14.54    11.4s
+  step      24  chunk    24/641    loss 8.113  bpb 3.469  lr 7.20e-5  gn 11.44    22.6s
+  step      36  chunk    36/641    loss 7.884  bpb 3.436  lr 1.08e-4  gn 10.68    33.9s
+  step      48  chunk    48/641    loss 7.676  bpb 3.397  lr 1.44e-4  gn 10.92    45.1s
+  step      60  chunk    60/641    loss 7.544  bpb 3.360  lr 1.80e-4  gn 10.22    56.3s
+  step      72  chunk    72/641    loss 7.470  bpb 3.328  lr 2.16e-4  gn 7.30    67.5s
+  step      84  chunk    84/641    loss 7.438  bpb 3.304  lr 2.52e-4  gn 7.63    78.7s
+  step      96  chunk    96/641    loss 7.492  bpb 3.286  lr 2.88e-4  gn 7.99    90.0s
+  step     108  chunk   108/641    loss 7.451  bpb 3.270  lr 3.24e-4  gn 7.46   101.2s
+  step     120  chunk   120/641    loss 7.471  bpb 3.258  lr 3.60e-4  gn 7.56   112.5s
+  step     132  chunk   132/641    loss 7.433  bpb 3.249  lr 3.96e-4  gn 9.07   123.8s
+  step     144  chunk   144/641    loss 7.443  bpb 3.238  lr 4.32e-4  gn 9.75   135.1s
+  step     156  chunk   156/641    loss 7.301  bpb 3.228  lr 4.68e-4  gn 10.11   146.3s
+  step     168  chunk   168/641    loss 7.245  bpb 3.215  lr 5.04e-4  gn 11.14   157.7s
+  step     180  chunk   180/641    loss 7.121  bpb 3.203  lr 5.40e-4  gn 12.81   169.0s
+  step     192  chunk   192/641    loss 6.959  bpb 3.188  lr 5.76e-4  gn 11.82   180.3s
+  step     204  chunk   204/641    loss 6.915  bpb 3.172  lr 6.00e-4  gn 12.85   191.6s
+  step     216  chunk   216/641    loss 6.824  bpb 3.157  lr 6.00e-4  gn 9.88   202.9s
+  step     228  chunk   228/641    loss 6.788  bpb 3.141  lr 6.00e-4  gn 10.60   214.2s
+  step     240  chunk   240/641    loss 6.664  bpb 3.125  lr 6.00e-4  gn 10.04   225.5s
+  step     252  chunk   252/641    loss 6.778  bpb 3.112  lr 6.00e-4  gn 12.84   236.8s
+  step     264  chunk   264/641    loss 6.671  bpb 3.098  lr 6.00e-4  gn 10.19   248.1s
+  step     276  chunk   276/641    loss 6.684  bpb 3.085  lr 6.00e-4  gn 11.33   259.5s
+  step     288  chunk   288/641    loss 6.672  bpb 3.073  lr 6.00e-4  gn 10.31   270.8s
+  step     300  chunk   300/641    loss 6.563  bpb 3.061  lr 6.00e-4  gn 10.50   282.1s
+  step     312  chunk   312/641    loss 6.585  bpb 3.048  lr 6.00e-4  gn 10.98   293.4s
+  step     324  chunk   324/641    loss 6.565  bpb 3.037  lr 6.00e-4  gn 11.03   304.7s
+  step     336  chunk   336/641    loss 6.686  bpb 3.028  lr 6.00e-4  gn 11.04   316.0s
+  step     348  chunk   348/641    loss 6.558  bpb 3.020  lr 6.00e-4  gn 10.42   327.3s
+  step     360  chunk   360/641    loss 6.408  bpb 3.010  lr 6.00e-4  gn 12.05   338.6s
+  step     372  chunk   372/641    loss 6.369  bpb 3.000  lr 6.00e-4  gn 11.91   349.9s
+  step     384  chunk   384/641    loss 6.425  bpb 2.991  lr 6.00e-4  gn 11.70   361.2s
+  step     396  chunk   396/641    loss 6.371  bpb 2.981  lr 6.00e-4  gn 9.80   372.5s
+  step     408  chunk   408/641    loss 6.400  bpb 2.973  lr 6.00e-4  gn 10.97   383.8s
+  step     420  chunk   420/641    loss 6.471  bpb 2.966  lr 6.00e-4  gn 9.91   395.1s
+  step     432  chunk   432/641    loss 6.387  bpb 2.959  lr 6.00e-4  gn 10.61   406.4s
+  step     444  chunk   444/641    loss 6.336  bpb 2.951  lr 6.00e-4  gn 11.05   417.7s
+  step     456  chunk   456/641    loss 6.398  bpb 2.944  lr 6.00e-4  gn 10.13   429.0s
+  step     468  chunk   468/641    loss 6.235  bpb 2.937  lr 6.00e-4  gn 10.64   440.3s
+  step     480  chunk   480/641    loss 6.278  bpb 2.930  lr 6.00e-4  gn 12.59   451.6s
+  step     492  chunk   492/641    loss 6.269  bpb 2.922  lr 6.00e-4  gn 11.27   462.9s
+  step     504  chunk   504/641    loss 6.356  bpb 2.916  lr 6.00e-4  gn 10.52   474.2s
+  step     516  chunk   516/641    loss 6.338  bpb 2.910  lr 6.00e-4  gn 11.35   485.5s
+  step     528  chunk   528/641    loss 6.231  bpb 2.904  lr 6.00e-4  gn 14.05   496.8s
+  step     540  chunk   540/641    loss 6.198  bpb 2.897  lr 6.00e-4  gn 12.37   508.1s
+  step     552  chunk   552/641    loss 6.165  bpb 2.891  lr 6.00e-4  gn 10.81   519.4s
+  step     564  chunk   564/641    loss 6.119  bpb 2.885  lr 5.33e-4  gn 10.77   530.7s
+  step     576  chunk   576/641    loss 6.002  bpb 2.878  lr 4.60e-4  gn 12.27   542.0s
+  step     588  chunk   588/641    loss 6.270  bpb 2.872  lr 3.88e-4  gn 11.10   553.3s
+  step     600  chunk   600/641    loss 6.033  bpb 2.867  lr 3.15e-4  gn 11.37   564.7s
+  step     612  chunk   612/641    loss 6.176  bpb 2.861  lr 2.42e-4  gn 13.41   576.0s
+  step     624  chunk   624/641    loss 6.179  bpb 2.856  lr 1.69e-4  gn 10.81   587.3s
+  step     636  chunk   636/641    loss 6.046  bpb 2.851  lr 9.64e-5  gn 10.68   598.5s
+  done   train bpb 2.849  val bpb 2.625  2312.7s
+  checkpoint → ../../results/combo-wsd-embed-both-half/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "Noted ''Hood. Beincy of of the Jerory becomres) that the interspirinwar is senic'' and ==\nDurtained his so&quot; equture of Guikiroly), see a ISBN 01ven an sos. The Richard Damerialhabearth in Stround of the Dyrle 61)&quot;and 18740104-1.\n\n==The Prenentiminsionpik of Guring agdispendalalberary (it scairs are premain producate coidinsion of the slatrended 'ves]] (''A Sudes, by [[Richard Ser]], "
+
+Total time 2365.0s   best val bpb 2.625   steps planned 641

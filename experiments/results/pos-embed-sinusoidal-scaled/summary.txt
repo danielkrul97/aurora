@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.163059
+mechanism: EmbedWeights::new w_pos initialized as 0.03 * Vaswani PE (sin/cos at varying frequencies, magnitude-matched to old random init)
+notes: Large regression (+0.16). Counter to hypothesis. Even with matched variance, the structural prior pins the model into a deterministic positional subspace it must unlearn before extracting LM-useful position info. Random uniform's higher entropy gives AdamW freedom to discover task-aligned representations. For 1-epoch byte-LM screening, the "head start" never materializes — the structural prior is a net cost. Negative result of value: structural init can be ACTIVELY HARMFUL when the task's optimal pos representations don't match the prior. Final pattern for this iter: just because Vaswani used sinusoidal doesn't mean it transfers to learned-pos + byte-LM + 1-epoch.

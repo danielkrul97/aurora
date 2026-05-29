@@ -1,0 +1,46 @@
+src/transformer/embedding.rs |  6 ++++--
+ src/transformer/schedule.rs  | 16 ++++++++++++----
+ 2 files changed, 16 insertions(+), 6 deletions(-)
+
+--- Changes ---
+
+src/transformer/embedding.rs
+  @@ -31,11 +31,13 @@ impl EmbedWeights {
+  +        let tok_scale = scale * 0.5;
+  +        let pos_scale = scale * 0.5;
+           let w_tok: Vec<f32> = (0..vocab * d_model)
+  -            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * scale)
+  +            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * tok_scale)
+               .collect();
+           let w_pos: Vec<f32> = (0..seq_len_max * d_model)
+  -            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * scale)
+  +            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * pos_scale)
+               .collect();
+           Self {
+               w_tok,
+  +4 -2
+
+src/transformer/schedule.rs
+  @@ -1,4 +1,7 @@
+  -//! Cosine LR schedule with linear warmup.
+  +//! Warmup-stable-decay (WSD) LR schedule. Function name retained from
+  +//! the previous cosine implementation so callers stay untouched; the
+  +//! body now does stable+linear-decay over the tail 20% of post-warmup
+  +//! steps.
+   
+   #[must_use]
+   pub fn cosine_warmup(
+  @@ -14,7 +17,12 @@ pub fn cosine_warmup(
+  -    let progress = (step - warmup_steps) as f32 / (max_steps - warmup_steps).max(1) as f32;
+  -    let cos = (std::f32::consts::PI * progress).cos();
+  -    min_lr + 0.5 * (base_lr - min_lr) * (1.0 + cos)
+  +    let post_warmup = (max_steps - warmup_steps).max(1);
+  +    let decay_len = ((post_warmup as f32) * 0.2).ceil() as usize;
+  +    let decay_start = max_steps.saturating_sub(decay_len);
+  +    if step < decay_start {
+  +        return base_lr;
+  +    }
+  +    let decay_progress = (step - decay_start) as f32 / decay_len.max(1) as f32;
+  +    base_lr + (min_lr - base_lr) * decay_progress
+   }
+  +12 -4

@@ -1,0 +1,76 @@
+    Finished `release` profile [optimized] target(s) in 0.17s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics ../../results/ffn-fc-half-std/metrics.jsonl --checkpoint ../../results/ffn-fc-half-std/ckpt.bin`
+no checkpoint at ../../results/ffn-fc-half-std/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 10.4s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : ../../results/ffn-fc-half-std/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.185  bpb 3.504  lr 3.60e-5  gn 29.12    11.5s
+  step      24  chunk    24/641    loss 8.060  bpb 3.462  lr 7.20e-5  gn 15.47    22.9s
+  step      36  chunk    36/641    loss 7.820  bpb 3.423  lr 1.08e-4  gn 12.14    34.4s
+  step      48  chunk    48/641    loss 7.629  bpb 3.381  lr 1.44e-4  gn 11.63    45.7s
+  step      60  chunk    60/641    loss 7.534  bpb 3.346  lr 1.80e-4  gn 11.27    56.9s
+  step      72  chunk    72/641    loss 7.471  bpb 3.318  lr 2.16e-4  gn 7.92    68.1s
+  step      84  chunk    84/641    loss 7.427  bpb 3.295  lr 2.52e-4  gn 12.31    79.3s
+  step      96  chunk    96/641    loss 7.472  bpb 3.278  lr 2.88e-4  gn 9.54    90.4s
+  step     108  chunk   108/641    loss 7.406  bpb 3.261  lr 3.24e-4  gn 10.90   101.5s
+  step     120  chunk   120/641    loss 7.384  bpb 3.247  lr 3.60e-4  gn 10.14   112.5s
+  step     132  chunk   132/641    loss 7.323  bpb 3.234  lr 3.96e-4  gn 10.33   123.6s
+  step     144  chunk   144/641    loss 7.335  bpb 3.221  lr 4.32e-4  gn 12.77   134.6s
+  step     156  chunk   156/641    loss 7.155  bpb 3.208  lr 4.68e-4  gn 11.63   145.7s
+  step     168  chunk   168/641    loss 7.088  bpb 3.193  lr 5.04e-4  gn 12.78   156.8s
+  step     180  chunk   180/641    loss 6.966  bpb 3.177  lr 5.40e-4  gn 10.99   167.8s
+  step     192  chunk   192/641    loss 6.822  bpb 3.160  lr 5.76e-4  gn 12.83   178.9s
+  step     204  chunk   204/641    loss 6.781  bpb 3.143  lr 6.00e-4  gn 11.88   190.3s
+  step     216  chunk   216/641    loss 6.736  bpb 3.126  lr 5.98e-4  gn 10.38   201.8s
+  step     228  chunk   228/641    loss 6.698  bpb 3.109  lr 5.95e-4  gn 11.93   213.1s
+  step     240  chunk   240/641    loss 6.600  bpb 3.094  lr 5.90e-4  gn 11.53   224.6s
+  step     252  chunk   252/641    loss 6.698  bpb 3.081  lr 5.82e-4  gn 12.26   236.2s
+  step     264  chunk   264/641    loss 6.611  bpb 3.067  lr 5.73e-4  gn 10.32   247.7s
+  step     276  chunk   276/641    loss 6.632  bpb 3.054  lr 5.62e-4  gn 11.93   259.1s
+  step     288  chunk   288/641    loss 6.609  bpb 3.042  lr 5.50e-4  gn 11.12   270.5s
+  step     300  chunk   300/641    loss 6.498  bpb 3.030  lr 5.36e-4  gn 11.39   281.8s
+  step     312  chunk   312/641    loss 6.499  bpb 3.018  lr 5.20e-4  gn 11.06   293.1s
+  step     324  chunk   324/641    loss 6.499  bpb 3.007  lr 5.03e-4  gn 11.50   304.4s
+  step     336  chunk   336/641    loss 6.620  bpb 2.998  lr 4.84e-4  gn 11.97   315.7s
+  step     348  chunk   348/641    loss 6.473  bpb 2.989  lr 4.65e-4  gn 10.38   327.1s
+  step     360  chunk   360/641    loss 6.310  bpb 2.979  lr 4.45e-4  gn 12.38   338.4s
+  step     372  chunk   372/641    loss 6.279  bpb 2.969  lr 4.23e-4  gn 12.54   349.8s
+  step     384  chunk   384/641    loss 6.358  bpb 2.960  lr 4.01e-4  gn 11.61   361.1s
+  step     396  chunk   396/641    loss 6.289  bpb 2.950  lr 3.79e-4  gn 10.68   372.5s
+  step     408  chunk   408/641    loss 6.324  bpb 2.942  lr 3.56e-4  gn 11.76   383.9s
+  step     420  chunk   420/641    loss 6.431  bpb 2.935  lr 3.33e-4  gn 11.19   395.3s
+  step     432  chunk   432/641    loss 6.333  bpb 2.928  lr 3.10e-4  gn 11.14   406.6s
+  step     444  chunk   444/641    loss 6.251  bpb 2.920  lr 2.87e-4  gn 11.57   417.8s
+  step     456  chunk   456/641    loss 6.333  bpb 2.913  lr 2.64e-4  gn 10.88   429.1s
+  step     468  chunk   468/641    loss 6.161  bpb 2.906  lr 2.42e-4  gn 11.18   440.5s
+  step     480  chunk   480/641    loss 6.185  bpb 2.899  lr 2.21e-4  gn 12.61   451.8s
+  step     492  chunk   492/641    loss 6.170  bpb 2.891  lr 2.00e-4  gn 11.80   463.1s
+  step     504  chunk   504/641    loss 6.285  bpb 2.885  lr 1.80e-4  gn 10.28   474.4s
+  step     516  chunk   516/641    loss 6.258  bpb 2.880  lr 1.62e-4  gn 11.12   485.8s
+  step     528  chunk   528/641    loss 6.227  bpb 2.874  lr 1.44e-4  gn 13.75   497.1s
+  step     540  chunk   540/641    loss 6.255  bpb 2.868  lr 1.28e-4  gn 12.67   508.5s
+  step     552  chunk   552/641    loss 6.165  bpb 2.862  lr 1.14e-4  gn 10.89   519.8s
+  step     564  chunk   564/641    loss 6.138  bpb 2.857  lr 1.01e-4  gn 11.12   531.2s
+  step     576  chunk   576/641    loss 6.029  bpb 2.851  lr 8.93e-5  gn 12.17   542.7s
+  step     588  chunk   588/641    loss 6.251  bpb 2.845  lr 7.97e-5  gn 10.97   554.1s
+  step     600  chunk   600/641    loss 6.043  bpb 2.841  lr 7.20e-5  gn 12.33   565.6s
+  step     612  chunk   612/641    loss 6.172  bpb 2.835  lr 6.61e-5  gn 11.48   577.0s
+  step     624  chunk   624/641    loss 6.176  bpb 2.831  lr 6.22e-5  gn 11.59   588.5s
+  step     636  chunk   636/641    loss 6.095  bpb 2.827  lr 6.02e-5  gn 11.70   600.1s
+  done   train bpb 2.825  val bpb 2.619  633.2s
+  checkpoint → ../../results/ffn-fc-half-std/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "largest frther]]. The deestern year.\n. Dured by whose geel. The ft. Salious a directed communice of the Greek. This is blall || &lt;/math&gt;s as when three than his wA citiencing to to physical ended by Aripire, was remained estimributed to uninto the gieds include this cand cilsia, was the way there is laventc..\n\n==-cam used to pucvation; at is the pate is abber]] [[Aamumism can be turations have very own from ''25th type of states 'ning; in structioned by while begivalical ofis"
+
+Total time 687.1s   best val bpb 2.619   steps planned 641

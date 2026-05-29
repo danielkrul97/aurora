@@ -1,0 +1,77 @@
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/combo-fixup-mha-only-wsd)
+    Finished `release` profile [optimized] target(s) in 0.78s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics ../../results/combo-fixup-mha-only-wsd/metrics.jsonl --checkpoint ../../results/combo-fixup-mha-only-wsd/ckpt.bin`
+no checkpoint at ../../results/combo-fixup-mha-only-wsd/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 5.5s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : ../../results/combo-fixup-mha-only-wsd/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.199  bpb 3.505  lr 3.60e-5  gn 24.43    11.4s
+  step      24  chunk    24/641    loss 8.063  bpb 3.464  lr 7.20e-5  gn 13.86    22.6s
+  step      36  chunk    36/641    loss 7.825  bpb 3.425  lr 1.08e-4  gn 11.46    33.8s
+  step      48  chunk    48/641    loss 7.636  bpb 3.384  lr 1.44e-4  gn 11.22    45.1s
+  step      60  chunk    60/641    loss 7.533  bpb 3.348  lr 1.80e-4  gn 10.71    56.3s
+  step      72  chunk    72/641    loss 7.468  bpb 3.317  lr 2.16e-4  gn 7.95    67.5s
+  step      84  chunk    84/641    loss 7.424  bpb 3.306  lr 2.52e-4  gn 8.40    78.7s
+  step      96  chunk    96/641    loss 7.470  bpb 3.286  lr 2.88e-4  gn 9.67    89.9s
+  step     108  chunk   108/641    loss 7.367  bpb 3.268  lr 3.24e-4  gn 9.85   101.2s
+  step     120  chunk   120/641    loss 7.330  bpb 3.251  lr 3.60e-4  gn 20.22   112.4s
+  step     132  chunk   132/641    loss 7.210  bpb 3.234  lr 3.96e-4  gn 19.10   123.6s
+  step     144  chunk   144/641    loss 7.132  bpb 3.216  lr 4.32e-4  gn 16.84   134.9s
+  step     156  chunk   156/641    loss 6.899  bpb 3.195  lr 4.68e-4  gn 16.37   146.3s
+  step     168  chunk   168/641    loss 6.825  bpb 3.173  lr 5.04e-4  gn 18.69   157.6s
+  step     180  chunk   180/641    loss 6.731  bpb 3.152  lr 5.40e-4  gn 15.91   168.9s
+  step     192  chunk   192/641    loss 6.601  bpb 3.130  lr 5.76e-4  gn 19.67   180.2s
+  step     204  chunk   204/641    loss 6.549  bpb 3.109  lr 6.00e-4  gn 18.12   191.5s
+  step     216  chunk   216/641    loss 6.482  bpb 3.089  lr 6.00e-4  gn 17.03   202.8s
+  step     228  chunk   228/641    loss 6.444  bpb 3.069  lr 6.00e-4  gn 14.91   214.1s
+  step     240  chunk   240/641    loss 6.337  bpb 3.050  lr 6.00e-4  gn 17.49   225.5s
+  step     252  chunk   252/641    loss 6.382  bpb 3.033  lr 6.00e-4  gn 17.97   236.8s
+  step     264  chunk   264/641    loss 6.316  bpb 3.016  lr 6.00e-4  gn 16.81   248.1s
+  step     276  chunk   276/641    loss 6.319  bpb 2.998  lr 6.00e-4  gn 19.38   259.4s
+  step     288  chunk   288/641    loss 6.262  bpb 2.983  lr 6.00e-4  gn 17.64   270.7s
+  step     300  chunk   300/641    loss 6.102  bpb 2.967  lr 6.00e-4  gn 15.93   282.1s
+  step     312  chunk   312/641    loss 6.079  bpb 2.950  lr 6.00e-4  gn 15.33   293.4s
+  step     324  chunk   324/641    loss 6.021  bpb 2.935  lr 6.00e-4  gn 17.29   304.7s
+  step     336  chunk   336/641    loss 6.210  bpb 2.922  lr 6.00e-4  gn 17.32   316.0s
+  step     348  chunk   348/641    loss 6.014  bpb 2.909  lr 6.00e-4  gn 15.26   327.3s
+  step     360  chunk   360/641    loss 5.794  bpb 2.895  lr 6.00e-4  gn 18.81   338.7s
+  step     372  chunk   372/641    loss 5.733  bpb 2.881  lr 6.00e-4  gn 17.94   350.0s
+  step     384  chunk   384/641    loss 5.803  bpb 2.868  lr 6.00e-4  gn 17.08   361.3s
+  step     396  chunk   396/641    loss 5.758  bpb 2.855  lr 6.00e-4  gn 15.62   372.6s
+  step     408  chunk   408/641    loss 5.772  bpb 2.842  lr 6.00e-4  gn 16.10   383.9s
+  step     420  chunk   420/641    loss 5.896  bpb 2.831  lr 6.00e-4  gn 16.35   395.2s
+  step     432  chunk   432/641    loss 5.739  bpb 2.821  lr 6.00e-4  gn 15.18   406.5s
+  step     444  chunk   444/641    loss 5.737  bpb 2.809  lr 6.00e-4  gn 16.73   417.8s
+  step     456  chunk   456/641    loss 5.765  bpb 2.799  lr 6.00e-4  gn 14.68   429.1s
+  step     468  chunk   468/641    loss 5.525  bpb 2.788  lr 6.00e-4  gn 15.71   440.4s
+  step     480  chunk   480/641    loss 5.624  bpb 2.778  lr 6.00e-4  gn 18.20   451.7s
+  step     492  chunk   492/641    loss 5.580  bpb 2.767  lr 6.00e-4  gn 15.73   463.0s
+  step     504  chunk   504/641    loss 5.740  bpb 2.758  lr 6.00e-4  gn 14.92   474.3s
+  step     516  chunk   516/641    loss 5.671  bpb 2.749  lr 6.00e-4  gn 15.94   485.6s
+  step     528  chunk   528/641    loss 5.525  bpb 2.740  lr 6.00e-4  gn 17.81   496.9s
+  step     540  chunk   540/641    loss 5.551  bpb 2.731  lr 6.00e-4  gn 17.68   508.2s
+  step     552  chunk   552/641    loss 5.412  bpb 2.720  lr 6.00e-4  gn 14.86   519.6s
+  step     564  chunk   564/641    loss 5.401  bpb 2.711  lr 5.33e-4  gn 15.49   530.8s
+  step     576  chunk   576/641    loss 5.231  bpb 2.703  lr 4.60e-4  gn 17.36   542.1s
+  step     588  chunk   588/641    loss 5.551  bpb 2.694  lr 3.88e-4  gn 14.36   553.4s
+  step     600  chunk   600/641    loss 5.294  bpb 2.686  lr 3.15e-4  gn 15.35   564.7s
+  step     612  chunk   612/641    loss 5.337  bpb 2.677  lr 2.42e-4  gn 15.13   576.0s
+  step     624  chunk   624/641    loss 5.558  bpb 2.669  lr 1.69e-4  gn 15.03   587.3s
+  step     636  chunk   636/641    loss 5.351  bpb 2.662  lr 9.64e-5  gn 14.76   598.6s
+  done   train bpb 2.660  val bpb 2.343  2309.5s
+  checkpoint → ../../results/combo-fixup-mha-only-wsd/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "part to eninscripatient laws, traditions of flower ince the authorialways constitution, Solocrated and a weondences in foreign authority of the find]]'s ''Deaddition to have been probably derived other bottated) but in President of the works returned to Zerients, while was remarked into Origarreferred [[Bleninian instance, ''abbeyacces as a ap of Bans in Aynastess Baron]]'' have no Warhility]]''. She between an 's which were in time use the Viet. A bertinev"
+
+Total time 2361.7s   best val bpb 2.343   steps planned 641

@@ -1,0 +1,33 @@
+src/transformer/attention.rs | 4 ++--
+ src/transformer/ffn.rs       | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+--- Changes ---
+
+src/transformer/attention.rs
+  @@ -38,12 +38,12 @@ impl MhaWeights {
+  -        let resid_scale = (2.0_f32 * n_layer as f32).sqrt().recip();
+  +        let _ = n_layer;
+           Self {
+               w_q: LinearProj::new(d_model, d_model, rng),
+               w_k: LinearProj::new(d_model, d_model, rng),
+               w_v: LinearProj::new(d_model, d_model, rng),
+  -            w_o: LinearProj::new_scaled(d_model, d_model, resid_scale, rng),
+  +            w_o: LinearProj::new_scaled(d_model, d_model, 0.0, rng),
+               n_head,
+               d_head,
+               d_model,
+  +2 -2
+
+src/transformer/ffn.rs
+  @@ -25,10 +25,10 @@ pub struct FfnWeights {
+  -        let resid_scale = (2.0_f32 * n_layer as f32).sqrt().recip();
+  +        let _ = n_layer;
+           Self {
+               w_fc: LinearProj::new(d_model, d_ff, rng),
+  -            w_proj: LinearProj::new_scaled(d_ff, d_model, resid_scale, rng),
+  +            w_proj: LinearProj::new_scaled(d_ff, d_model, 0.0, rng),
+               d_model,
+               d_ff,
+           }
+  +2 -2

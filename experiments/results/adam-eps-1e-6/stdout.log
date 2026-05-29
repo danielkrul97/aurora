@@ -1,0 +1,77 @@
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/adam-eps-1e-6)
+    Finished `release` profile [optimized] target(s) in 0.79s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics ../../results/adam-eps-1e-6/metrics.jsonl --checkpoint ../../results/adam-eps-1e-6/ckpt.bin`
+no checkpoint at ../../results/adam-eps-1e-6/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 5.5s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : ../../results/adam-eps-1e-6/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.201  bpb 3.506  lr 3.60e-5  gn 20.39    11.4s
+  step      24  chunk    24/641    loss 8.079  bpb 3.467  lr 7.20e-5  gn 13.10    22.7s
+  step      36  chunk    36/641    loss 7.847  bpb 3.430  lr 1.08e-4  gn 11.16    33.9s
+  step      48  chunk    48/641    loss 7.657  bpb 3.389  lr 1.44e-4  gn 11.11    45.1s
+  step      60  chunk    60/641    loss 7.543  bpb 3.353  lr 1.80e-4  gn 10.52    56.4s
+  step      72  chunk    72/641    loss 7.477  bpb 3.322  lr 2.16e-4  gn 7.59    67.6s
+  step      84  chunk    84/641    loss 7.441  bpb 3.299  lr 2.52e-4  gn 7.89    78.8s
+  step      96  chunk    96/641    loss 7.495  bpb 3.282  lr 2.88e-4  gn 8.21    90.0s
+  step     108  chunk   108/641    loss 7.453  bpb 3.267  lr 3.24e-4  gn 7.94   101.3s
+  step     120  chunk   120/641    loss 7.468  bpb 3.255  lr 3.60e-4  gn 7.85   112.5s
+  step     132  chunk   132/641    loss 7.448  bpb 3.246  lr 3.96e-4  gn 8.48   123.8s
+  step     144  chunk   144/641    loss 7.471  bpb 3.236  lr 4.32e-4  gn 9.19   135.1s
+  step     156  chunk   156/641    loss 7.355  bpb 3.227  lr 4.68e-4  gn 9.14   146.4s
+  step     168  chunk   168/641    loss 7.335  bpb 3.217  lr 5.04e-4  gn 8.34   157.7s
+  step     180  chunk   180/641    loss 7.287  bpb 3.208  lr 5.40e-4  gn 8.25   169.0s
+  step     192  chunk   192/641    loss 7.182  bpb 3.198  lr 5.76e-4  gn 9.15   180.3s
+  step     204  chunk   204/641    loss 7.192  bpb 3.188  lr 6.00e-4  gn 10.37   191.6s
+  step     216  chunk   216/641    loss 7.128  bpb 3.179  lr 5.98e-4  gn 9.24   203.0s
+  step     228  chunk   228/641    loss 7.059  bpb 3.168  lr 5.95e-4  gn 9.48   214.3s
+  step     240  chunk   240/641    loss 6.908  bpb 3.157  lr 5.90e-4  gn 10.86   225.6s
+  step     252  chunk   252/641    loss 6.975  bpb 3.146  lr 5.82e-4  gn 10.34   236.9s
+  step     264  chunk   264/641    loss 6.852  bpb 3.134  lr 5.73e-4  gn 10.34   248.2s
+  step     276  chunk   276/641    loss 6.877  bpb 3.123  lr 5.62e-4  gn 12.11   259.5s
+  step     288  chunk   288/641    loss 6.821  bpb 3.113  lr 5.50e-4  gn 10.54   270.9s
+  step     300  chunk   300/641    loss 6.718  bpb 3.103  lr 5.36e-4  gn 10.09   282.2s
+  step     312  chunk   312/641    loss 6.751  bpb 3.091  lr 5.20e-4  gn 10.64   293.5s
+  step     324  chunk   324/641    loss 6.741  bpb 3.082  lr 5.03e-4  gn 10.89   304.8s
+  step     336  chunk   336/641    loss 6.827  bpb 3.073  lr 4.84e-4  gn 11.42   316.1s
+  step     348  chunk   348/641    loss 6.677  bpb 3.065  lr 4.65e-4  gn 9.93   327.4s
+  step     360  chunk   360/641    loss 6.557  bpb 3.056  lr 4.45e-4  gn 11.79   338.8s
+  step     372  chunk   372/641    loss 6.536  bpb 3.047  lr 4.23e-4  gn 11.33   350.1s
+  step     384  chunk   384/641    loss 6.586  bpb 3.038  lr 4.01e-4  gn 11.20   361.4s
+  step     396  chunk   396/641    loss 6.530  bpb 3.029  lr 3.79e-4  gn 10.12   372.7s
+  step     408  chunk   408/641    loss 6.554  bpb 3.021  lr 3.56e-4  gn 10.87   384.0s
+  step     420  chunk   420/641    loss 6.614  bpb 3.015  lr 3.33e-4  gn 10.03   395.3s
+  step     432  chunk   432/641    loss 6.532  bpb 3.008  lr 3.10e-4  gn 10.35   406.6s
+  step     444  chunk   444/641    loss 6.469  bpb 3.000  lr 2.87e-4  gn 10.89   417.9s
+  step     456  chunk   456/641    loss 6.558  bpb 2.994  lr 2.64e-4  gn 9.52   429.3s
+  step     468  chunk   468/641    loss 6.431  bpb 2.987  lr 2.42e-4  gn 10.70   440.6s
+  step     480  chunk   480/641    loss 6.399  bpb 2.980  lr 2.21e-4  gn 11.31   451.9s
+  step     492  chunk   492/641    loss 6.432  bpb 2.974  lr 2.00e-4  gn 10.57   463.2s
+  step     504  chunk   504/641    loss 6.496  bpb 2.968  lr 1.80e-4  gn 9.85   474.5s
+  step     516  chunk   516/641    loss 6.483  bpb 2.962  lr 1.62e-4  gn 10.26   485.8s
+  step     528  chunk   528/641    loss 6.446  bpb 2.957  lr 1.44e-4  gn 15.57   497.2s
+  step     540  chunk   540/641    loss 6.472  bpb 2.952  lr 1.28e-4  gn 12.20   508.5s
+  step     552  chunk   552/641    loss 6.411  bpb 2.946  lr 1.14e-4  gn 9.91   519.8s
+  step     564  chunk   564/641    loss 6.385  bpb 2.941  lr 1.01e-4  gn 10.45   531.1s
+  step     576  chunk   576/641    loss 6.301  bpb 2.936  lr 8.93e-5  gn 11.22   542.4s
+  step     588  chunk   588/641    loss 6.465  bpb 2.931  lr 7.97e-5  gn 10.93   553.7s
+  step     600  chunk   600/641    loss 6.286  bpb 2.926  lr 7.20e-5  gn 10.87   565.1s
+  step     612  chunk   612/641    loss 6.404  bpb 2.921  lr 6.61e-5  gn 10.82   576.4s
+  step     624  chunk   624/641    loss 6.429  bpb 2.917  lr 6.22e-5  gn 11.47   587.7s
+  step     636  chunk   636/641    loss 6.339  bpb 2.913  lr 6.02e-5  gn 10.96   599.0s
+  done   train bpb 2.911  val bpb 2.721  2313.2s
+  checkpoint → ../../results/adam-eps-1e-6/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "natural ape [[God, voting continuing completed by God he first foundedboth a tena See in Constound was the &quot;The Migape, 19044]])\n*[[1867.\n\nIparward and them in Glilanter to letters exfounded Israasary to question of which the put who ly Sace, became &quot;Lattalthaion was time, the successstartive defeted in s, and have ance and wter in and Koage 1 [[moperes to flought in the arcece of cachent scrial fuling ', &quot;Inof extats. Heace about the signs his "
+
+Total time 2365.5s   best val bpb 2.721   steps planned 641

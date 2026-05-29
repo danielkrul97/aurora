@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.086751
+mechanism: 4-way composite: WSD-tail20 + β2=0.98 + per-block-lr [0.2,1.8] + embed-lr 1.1x
+notes: NEW BANK-BEST. Beats the 3-way iter 59 (-0.0825) by ~0.004. The milder embed-lr 1.1x (vs 1.2x which broke smoke in iter 64) cleared the smoke gate. Linear-sum prediction was ~-0.103 (-0.044 + -0.010 + -0.025 + ~-0.024); actual -0.0868 → SUB-additive by ~0.016. The embed-lr axis composes much less cleanly than the schedule/optimizer/depth axes did (those 3 were near-linear/super-additive). Embed-LR overlaps mechanistically with per-block-LR — both modulate per-group AdamW step size — so stacking them hits diminishing returns. val_bpb 2.300197. Cumulative from old baseline 2.7188 → 2.300 = -0.419 BPB. Worth multi-seed validation; strong merge candidate (marginally better than iter 59).

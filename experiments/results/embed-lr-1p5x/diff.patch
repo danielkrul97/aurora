@@ -1,0 +1,57 @@
+diff --git a/data b/data
+new file mode 120000
+index 0000000..b28914a
+--- /dev/null
++++ b/data
+@@ -0,0 +1 @@
++/home/dkrul/Projects/research-projects/aurora/data
+\ No newline at end of file
+diff --git a/src/gpu/transformer.rs b/src/gpu/transformer.rs
+index f0a81af..e0ab307 100644
+--- a/src/gpu/transformer.rs
++++ b/src/gpu/transformer.rs
+@@ -1293,13 +1293,14 @@ impl DecoderTransformerGpu {
+                 timestamp_writes: None,
+             });
+             pass.set_pipeline(&self.adamw.pipeline);
+-            for op in &self.grad_ops {
++            for (i, op) in self.grad_ops.iter().enumerate() {
++                let lr_mult = if i < 2 { 1.5 } else { 1.0 };
+                 self.adamw.dispatch_with_bind(
+                     &mut pass,
+                     &op.adamw_bind,
+                     op.n,
+                     op.apply_wd,
+-                    config.lr,
++                    config.lr * lr_mult,
+                     config.beta1,
+                     config.beta2,
+                     config.eps,
+diff --git a/src/transformer/model.rs b/src/transformer/model.rs
+index ba233b9..aba7d3d 100644
+--- a/src/transformer/model.rs
++++ b/src/transformer/model.rs
+@@ -384,11 +384,13 @@ impl DecoderTransformer {
+         self.step += 1;
+         let (bc1, bc2) = bias_correction(self.step as usize, config.beta1, config.beta2);
+ 
++        let mut embed_cfg = *config;
++        embed_cfg.lr = config.lr * 1.5;
+         adamw_apply(
+             &mut self.embed.w_tok,
+             &grads.embed.d_w_tok,
+             &mut self.adam.g_w_tok,
+-            config,
++            &embed_cfg,
+             bc1,
+             bc2,
+             true,
+@@ -397,7 +399,7 @@ impl DecoderTransformer {
+             &mut self.embed.w_pos,
+             &grads.embed.d_w_pos,
+             &mut self.adam.g_w_pos,
+-            config,
++            &embed_cfg,
+             bc1,
+             bc2,
+             false,

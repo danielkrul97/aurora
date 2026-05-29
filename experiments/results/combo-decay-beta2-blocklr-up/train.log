@@ -1,0 +1,126 @@
+   Compiling cfg_aliases v0.1.1
+   Compiling bitflags v2.11.1
+   Compiling parking_lot_core v0.9.12
+   Compiling thiserror v1.0.69
+   Compiling libloading v0.8.9
+   Compiling bit-vec v0.8.0
+   Compiling smallvec v1.15.1
+   Compiling scopeguard v1.2.0
+   Compiling hashbrown v0.17.0
+   Compiling equivalent v1.0.2
+   Compiling bytemuck_derive v1.10.2
+   Compiling thiserror-impl v1.0.69
+   Compiling naga v23.1.0
+   Compiling khronos-egl v6.0.0
+   Compiling ash v0.38.0+1.3.281
+   Compiling unicode-width v0.1.14
+   Compiling termcolor v1.4.1
+   Compiling foldhash v0.1.5
+   Compiling bit-set v0.8.0
+   Compiling gpu-alloc-types v0.3.0
+   Compiling spirv v0.3.0+sdk-1.3.268.0
+   Compiling gpu-descriptor-types v0.2.0
+   Compiling hashbrown v0.15.5
+   Compiling lock_api v0.4.14
+   Compiling wgpu-hal v23.0.1
+   Compiling codespan-reporting v0.11.1
+   Compiling hexf-parse v0.2.1
+   Compiling arrayvec v0.7.6
+   Compiling log v0.4.29
+   Compiling rustc-hash v1.1.0
+   Compiling unicode-xid v0.2.6
+   Compiling parking_lot v0.12.5
+   Compiling gpu-alloc v0.6.0
+   Compiling wgpu-types v23.0.0
+   Compiling wgpu-core v23.0.1
+   Compiling indexmap v2.14.0
+   Compiling renderdoc-sys v1.1.0
+   Compiling gpu-descriptor v0.3.2
+   Compiling litrs v1.0.0
+   Compiling glow v0.14.2
+   Compiling bytemuck v1.25.0
+   Compiling profiling v1.0.17
+   Compiling raw-window-handle v0.6.2
+   Compiling wgpu v23.0.1
+   Compiling static_assertions v1.1.0
+   Compiling rgb v0.8.53
+   Compiling pollster v0.4.0
+   Compiling document-features v0.2.12
+   Compiling textplots v0.8.7
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/combo-decay-beta2-blocklr-up)
+    Finished `release` profile [optimized] target(s) in 16.58s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics /home/dkrul/Projects/research-projects/aurora/experiments/results/combo-decay-beta2-blocklr-up/metrics.jsonl --checkpoint /home/dkrul/Projects/research-projects/aurora/experiments/results/combo-decay-beta2-blocklr-up/ckpt.bin`
+no checkpoint at /home/dkrul/Projects/research-projects/aurora/experiments/results/combo-decay-beta2-blocklr-up/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 5.4s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : /home/dkrul/Projects/research-projects/aurora/experiments/results/combo-decay-beta2-blocklr-up/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.198  bpb 3.505  lr 3.60e-5  gn 24.26    10.4s
+  step      24  chunk    24/641    loss 8.056  bpb 3.463  lr 7.20e-5  gn 13.23    20.9s
+  step      36  chunk    36/641    loss 7.809  bpb 3.423  lr 1.08e-4  gn 11.07    31.2s
+  step      48  chunk    48/641    loss 7.620  bpb 3.380  lr 1.44e-4  gn 10.92    41.6s
+  step      60  chunk    60/641    loss 7.529  bpb 3.344  lr 1.80e-4  gn 10.49    51.9s
+  step      72  chunk    72/641    loss 7.472  bpb 3.315  lr 2.16e-4  gn 7.68    62.3s
+  step      84  chunk    84/641    loss 7.436  bpb 3.292  lr 2.52e-4  gn 8.19    72.7s
+  step      96  chunk    96/641    loss 7.488  bpb 3.276  lr 2.88e-4  gn 8.90    83.0s
+  step     108  chunk   108/641    loss 7.450  bpb 3.262  lr 3.24e-4  gn 11.62    93.4s
+  step     120  chunk   120/641    loss 7.432  bpb 3.250  lr 3.60e-4  gn 10.66   103.9s
+  step     132  chunk   132/641    loss 7.351  bpb 3.239  lr 3.96e-4  gn 14.07   114.3s
+  step     144  chunk   144/641    loss 7.293  bpb 3.226  lr 4.32e-4  gn 17.86   124.7s
+  step     156  chunk   156/641    loss 7.044  bpb 3.209  lr 4.68e-4  gn 18.49   135.1s
+  step     168  chunk   168/641    loss 6.929  bpb 3.189  lr 5.04e-4  gn 20.89   145.6s
+  step     180  chunk   180/641    loss 6.806  bpb 3.170  lr 5.40e-4  gn 21.28   156.0s
+  step     192  chunk   192/641    loss 6.662  bpb 3.149  lr 5.76e-4  gn 23.45   166.4s
+  step     204  chunk   204/641    loss 6.621  bpb 3.128  lr 5.96e-4  gn 24.56   176.8s
+  step     216  chunk   216/641    loss 6.528  bpb 3.108  lr 5.79e-4  gn 24.89   187.3s
+  step     228  chunk   228/641    loss 6.490  bpb 3.088  lr 5.63e-4  gn 19.56   197.7s
+  step     240  chunk   240/641    loss 6.366  bpb 3.069  lr 5.49e-4  gn 23.94   208.1s
+  step     252  chunk   252/641    loss 6.399  bpb 3.052  lr 5.36e-4  gn 22.85   218.6s
+  step     264  chunk   264/641    loss 6.343  bpb 3.034  lr 5.23e-4  gn 21.68   229.0s
+  step     276  chunk   276/641    loss 6.342  bpb 3.017  lr 5.12e-4  gn 25.05   239.4s
+  step     288  chunk   288/641    loss 6.289  bpb 3.001  lr 5.01e-4  gn 21.47   249.8s
+  step     300  chunk   300/641    loss 6.131  bpb 2.985  lr 4.91e-4  gn 20.22   260.3s
+  step     312  chunk   312/641    loss 6.083  bpb 2.967  lr 4.81e-4  gn 19.35   270.7s
+  step     324  chunk   324/641    loss 6.030  bpb 2.952  lr 4.72e-4  gn 22.25   281.1s
+  step     336  chunk   336/641    loss 6.224  bpb 2.938  lr 4.64e-4  gn 22.59   291.5s
+  step     348  chunk   348/641    loss 6.033  bpb 2.925  lr 4.56e-4  gn 18.75   302.0s
+  step     360  chunk   360/641    loss 5.818  bpb 2.911  lr 4.48e-4  gn 22.62   312.4s
+  step     372  chunk   372/641    loss 5.777  bpb 2.897  lr 4.41e-4  gn 25.61   322.8s
+  step     384  chunk   384/641    loss 5.826  bpb 2.884  lr 4.34e-4  gn 21.23   333.2s
+  step     396  chunk   396/641    loss 5.785  bpb 2.870  lr 4.27e-4  gn 20.40   343.7s
+  step     408  chunk   408/641    loss 5.804  bpb 2.857  lr 4.21e-4  gn 23.75   354.1s
+  step     420  chunk   420/641    loss 5.902  bpb 2.846  lr 4.15e-4  gn 19.29   364.5s
+  step     432  chunk   432/641    loss 5.774  bpb 2.835  lr 4.09e-4  gn 20.03   374.9s
+  step     444  chunk   444/641    loss 5.763  bpb 2.823  lr 4.03e-4  gn 21.34   385.4s
+  step     456  chunk   456/641    loss 5.783  bpb 2.813  lr 3.98e-4  gn 18.37   395.8s
+  step     468  chunk   468/641    loss 5.546  bpb 2.802  lr 3.93e-4  gn 20.08   406.2s
+  step     480  chunk   480/641    loss 5.620  bpb 2.791  lr 3.88e-4  gn 22.30   416.6s
+  step     492  chunk   492/641    loss 5.624  bpb 2.780  lr 3.83e-4  gn 20.67   427.1s
+  step     504  chunk   504/641    loss 5.746  bpb 2.771  lr 3.78e-4  gn 18.00   437.5s
+  step     516  chunk   516/641    loss 5.672  bpb 2.762  lr 3.74e-4  gn 21.09   447.9s
+  step     528  chunk   528/641    loss 5.556  bpb 2.754  lr 3.70e-4  gn 24.08   458.3s
+  step     540  chunk   540/641    loss 5.597  bpb 2.744  lr 3.65e-4  gn 24.07   468.8s
+  step     552  chunk   552/641    loss 5.459  bpb 2.734  lr 3.61e-4  gn 20.21   479.2s
+  step     564  chunk   564/641    loss 5.437  bpb 2.725  lr 3.58e-4  gn 19.37   489.6s
+  step     576  chunk   576/641    loss 5.272  bpb 2.716  lr 3.54e-4  gn 22.51   500.0s
+  step     588  chunk   588/641    loss 5.573  bpb 2.707  lr 3.50e-4  gn 19.00   510.5s
+  step     600  chunk   600/641    loss 5.347  bpb 2.699  lr 3.47e-4  gn 21.35   520.9s
+  step     612  chunk   612/641    loss 5.376  bpb 2.690  lr 3.43e-4  gn 21.22   531.3s
+  step     624  chunk   624/641    loss 5.560  bpb 2.683  lr 3.40e-4  gn 20.20   541.7s
+  step     636  chunk   636/641    loss 5.354  bpb 2.675  lr 3.37e-4  gn 20.64   552.1s
+  done   train bpb 2.672  val bpb 2.355  581.6s
+  checkpoint → /home/dkrul/Projects/research-projects/aurora/experiments/results/combo-decay-beta2-blocklr-up/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "collection to fice was elected around the defeat Morester between his government, having revenalways standing, just a discreated centuries. \n\nDuring them, will cause series give a democquarter, it was spession as many of the earliest with house's Marn [[Webes]]s (physical faster to remember of Jayed by the Court's years, follower]], [[Ibe]]s of the Abornarkine]], [[Syribead]] chic system, but suitch quacia]], it is an oldest work temperature, were "
+
+Total time 633.6s   best val bpb 2.355   steps planned 641

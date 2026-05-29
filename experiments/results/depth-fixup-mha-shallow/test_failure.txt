@@ -1,0 +1,39 @@
+failing test: cpu_transformer_converges_on_copy_task
+
+Last output:
+running 3 tests
+test cpu_transformer_step_does_not_nan ... ok
+test cpu_transformer_argmax_sanity ... ok
+test cpu_transformer_converges_on_copy_task ... FAILED
+
+failures:
+---- cpu_transformer_converges_on_copy_task stdout ----
+thread 'cpu_transformer_converges_on_copy_task' panicked at tests/transformer_smoke.rs:69:5:
+loss did not decrease: first=2.0769897, last=1.8059723, baseline=2.0794415
+
+Test invariant: last_loss < first_loss * 0.7
+  first_loss * 0.7 = 1.4539
+  last_loss = 1.8060
+  actual relative drop = 13.0%, required 30.0%
+
+failures:
+    cpu_transformer_converges_on_copy_task
+
+Interpretation: Smoke test uses cfg.n_layer = 2. With shallow_cutoff =
+2/2 = 1, only block 0's w_o is zeroed; block 1 keeps baseline GPT-3
+residual scaling. This ASYMMETRIC init has worse smoke convergence
+than either the FULL zero-init (iter 22 fixup-mha-only) or baseline.
+
+The asymmetry creates a more complex loss landscape where 200 steps
+at lr=3e-2 isn't enough to recover. fixup-mha-only with all blocks
+zeroed passed the same test — uniform init (whether random or all-zero)
+is well-behaved; mixed init isn't.
+
+Math is correct, no NaN, no compile error. Per RESEARCHER.md spec,
+smoke failure → broken_impl.
+
+This is actually informative: it suggests depth-asymmetric init has
+inherent convergence issues unrelated to BPB. The full-screening BPB
+result (which I can't see because of the gate) is therefore harder
+to interpret cleanly anyway. The "where does fixup-mha-only's gain
+come from" question may need a different diagnostic approach.

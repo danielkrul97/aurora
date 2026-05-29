@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.446825
+mechanism: EmbedWeights::new w_tok initialized to zeros (counterpart to pos-embed-zero-init which won on old baseline)
+notes: Catastrophic regression (+0.45). The pos vs tok asymmetry is real: token identity is critical for byte-LM and cannot be recovered from zero-init within 641 steps. Tied LM head amplifies the cost — w_tok needs to grow at BOTH the input embedding pathway (for token distinguishability) AND the output LM head pathway (for logit production). The "head-start hurts" intuition that made pos-embed-zero work does NOT generalize: it applies when the random init information is largely SPURIOUS (positional structure model can rediscover via attention) but BACKFIRES when the random init carries genuine task-critical signal (token identities for next-byte prediction). Strong negative result: zero-init is task-conditional, not universally beneficial.

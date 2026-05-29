@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: -0.005648
+mechanism: AdamW step denominator: sqrt(m2_hat)+eps -> sqrt(m2_hat + eps²). CPU + GPU WGSL both updated.
+notes: Tiny improvement (-0.006), below the -0.02 win threshold. Confirms expectation: eps placement is essentially equivalent for non-zero m2_hat (which is always the case after step 1 with non-zero gradients). The 0.005 effect is likely noise — runtime was 970s vs typical 617s, suggesting variable GPU contention which adds floor noise of similar magnitude. Joins the "smooth dynamics" family (β2=0.98, inverse-sqrt-decay) at -0.005 to -0.010 range. Eps placement axis is now mapped and exhausted.

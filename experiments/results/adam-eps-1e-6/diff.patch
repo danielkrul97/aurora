@@ -1,0 +1,13 @@
+src/optimizer.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- Changes ---
+
+src/optimizer.rs
+  @@ -23,7 +23,7 @@ impl Default for AdamWConfig {
+  -            eps: 1e-8,
+  +            eps: 1e-6,
+               weight_decay: 0.1,
+           }
+       }
+  +1 -1

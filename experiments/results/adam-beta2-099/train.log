@@ -1,0 +1,126 @@
+   Compiling cfg_aliases v0.1.1
+   Compiling bitflags v2.11.1
+   Compiling parking_lot_core v0.9.12
+   Compiling thiserror v1.0.69
+   Compiling equivalent v1.0.2
+   Compiling libloading v0.8.9
+   Compiling termcolor v1.4.1
+   Compiling smallvec v1.15.1
+   Compiling khronos-egl v6.0.0
+   Compiling hashbrown v0.17.0
+   Compiling foldhash v0.1.5
+   Compiling bytemuck_derive v1.10.2
+   Compiling naga v23.1.0
+   Compiling thiserror-impl v1.0.69
+   Compiling unicode-width v0.1.14
+   Compiling bit-vec v0.8.0
+   Compiling ash v0.38.0+1.3.281
+   Compiling scopeguard v1.2.0
+   Compiling gpu-alloc-types v0.3.0
+   Compiling gpu-descriptor-types v0.2.0
+   Compiling lock_api v0.4.14
+   Compiling codespan-reporting v0.11.1
+   Compiling spirv v0.3.0+sdk-1.3.268.0
+   Compiling hashbrown v0.15.5
+   Compiling bit-set v0.8.0
+   Compiling wgpu-hal v23.0.1
+   Compiling arrayvec v0.7.6
+   Compiling unicode-xid v0.2.6
+   Compiling log v0.4.29
+   Compiling hexf-parse v0.2.1
+   Compiling rustc-hash v1.1.0
+   Compiling parking_lot v0.12.5
+   Compiling gpu-alloc v0.6.0
+   Compiling wgpu-types v23.0.0
+   Compiling wgpu-core v23.0.1
+   Compiling indexmap v2.14.0
+   Compiling profiling v1.0.17
+   Compiling raw-window-handle v0.6.2
+   Compiling gpu-descriptor v0.3.2
+   Compiling glow v0.14.2
+   Compiling bytemuck v1.25.0
+   Compiling litrs v1.0.0
+   Compiling renderdoc-sys v1.1.0
+   Compiling wgpu v23.0.1
+   Compiling static_assertions v1.1.0
+   Compiling rgb v0.8.53
+   Compiling pollster v0.4.0
+   Compiling document-features v0.2.12
+   Compiling textplots v0.8.7
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/adam-beta2-099)
+    Finished `release` profile [optimized] target(s) in 16.19s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics /home/dkrul/Projects/research-projects/aurora/experiments/results/adam-beta2-099/metrics.jsonl --checkpoint /home/dkrul/Projects/research-projects/aurora/experiments/results/adam-beta2-099/ckpt.bin`
+no checkpoint at /home/dkrul/Projects/research-projects/aurora/experiments/results/adam-beta2-099/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 5.2s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : /home/dkrul/Projects/research-projects/aurora/experiments/results/adam-beta2-099/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.197  bpb 3.505  lr 3.60e-5  gn 24.35    10.5s
+  step      24  chunk    24/641    loss 8.055  bpb 3.463  lr 7.20e-5  gn 13.79    20.8s
+  step      36  chunk    36/641    loss 7.803  bpb 3.422  lr 1.08e-4  gn 11.37    31.2s
+  step      48  chunk    48/641    loss 7.613  bpb 3.379  lr 1.44e-4  gn 11.12    41.5s
+  step      60  chunk    60/641    loss 7.526  bpb 3.343  lr 1.80e-4  gn 10.76    51.9s
+  step      72  chunk    72/641    loss 7.468  bpb 3.313  lr 2.16e-4  gn 7.97    62.2s
+  step      84  chunk    84/641    loss 7.425  bpb 3.291  lr 2.52e-4  gn 8.80    72.6s
+  step      96  chunk    96/641    loss 7.467  bpb 3.274  lr 2.88e-4  gn 10.79    83.0s
+  step     108  chunk   108/641    loss 7.387  bpb 3.257  lr 3.24e-4  gn 10.54    93.4s
+  step     120  chunk   120/641    loss 7.338  bpb 3.242  lr 3.60e-4  gn 12.97   103.9s
+  step     132  chunk   132/641    loss 7.221  bpb 3.227  lr 3.96e-4  gn 16.02   114.3s
+  step     144  chunk   144/641    loss 7.154  bpb 3.210  lr 4.32e-4  gn 15.25   124.7s
+  step     156  chunk   156/641    loss 6.903  bpb 3.189  lr 4.68e-4  gn 17.61   135.1s
+  step     168  chunk   168/641    loss 6.828  bpb 3.168  lr 5.04e-4  gn 14.09   145.5s
+  step     180  chunk   180/641    loss 6.719  bpb 3.147  lr 5.40e-4  gn 13.51   156.0s
+  step     192  chunk   192/641    loss 6.626  bpb 3.126  lr 5.76e-4  gn 18.16   166.4s
+  step     204  chunk   204/641    loss 6.550  bpb 3.105  lr 6.00e-4  gn 16.59   176.8s
+  step     216  chunk   216/641    loss 6.503  bpb 3.085  lr 5.98e-4  gn 15.62   187.2s
+  step     228  chunk   228/641    loss 6.451  bpb 3.065  lr 5.95e-4  gn 14.74   197.7s
+  step     240  chunk   240/641    loss 6.359  bpb 3.047  lr 5.90e-4  gn 16.40   208.1s
+  step     252  chunk   252/641    loss 6.377  bpb 3.030  lr 5.82e-4  gn 16.79   218.5s
+  step     264  chunk   264/641    loss 6.328  bpb 3.013  lr 5.73e-4  gn 15.82   228.9s
+  step     276  chunk   276/641    loss 6.323  bpb 2.996  lr 5.62e-4  gn 18.28   239.4s
+  step     288  chunk   288/641    loss 6.279  bpb 2.981  lr 5.50e-4  gn 16.56   249.8s
+  step     300  chunk   300/641    loss 6.110  bpb 2.965  lr 5.36e-4  gn 15.13   260.2s
+  step     312  chunk   312/641    loss 6.080  bpb 2.948  lr 5.20e-4  gn 14.84   270.6s
+  step     324  chunk   324/641    loss 6.042  bpb 2.934  lr 5.03e-4  gn 16.52   281.0s
+  step     336  chunk   336/641    loss 6.227  bpb 2.921  lr 4.84e-4  gn 15.53   291.4s
+  step     348  chunk   348/641    loss 6.042  bpb 2.909  lr 4.65e-4  gn 15.26   301.9s
+  step     360  chunk   360/641    loss 5.790  bpb 2.895  lr 4.45e-4  gn 17.13   312.3s
+  step     372  chunk   372/641    loss 5.746  bpb 2.881  lr 4.23e-4  gn 18.06   322.7s
+  step     384  chunk   384/641    loss 5.836  bpb 2.868  lr 4.01e-4  gn 16.87   333.1s
+  step     396  chunk   396/641    loss 5.783  bpb 2.855  lr 3.79e-4  gn 15.32   343.6s
+  step     408  chunk   408/641    loss 5.790  bpb 2.842  lr 3.56e-4  gn 16.03   354.0s
+  step     420  chunk   420/641    loss 5.907  bpb 2.832  lr 3.33e-4  gn 15.07   364.4s
+  step     432  chunk   432/641    loss 5.776  bpb 2.821  lr 3.10e-4  gn 15.81   374.8s
+  step     444  chunk   444/641    loss 5.757  bpb 2.810  lr 2.87e-4  gn 16.79   385.2s
+  step     456  chunk   456/641    loss 5.792  bpb 2.800  lr 2.64e-4  gn 14.17   395.6s
+  step     468  chunk   468/641    loss 5.561  bpb 2.789  lr 2.42e-4  gn 15.47   406.1s
+  step     480  chunk   480/641    loss 5.644  bpb 2.780  lr 2.21e-4  gn 18.06   416.5s
+  step     492  chunk   492/641    loss 5.634  bpb 2.769  lr 2.00e-4  gn 16.15   426.9s
+  step     504  chunk   504/641    loss 5.770  bpb 2.761  lr 1.80e-4  gn 14.50   437.3s
+  step     516  chunk   516/641    loss 5.704  bpb 2.752  lr 1.62e-4  gn 16.10   447.7s
+  step     528  chunk   528/641    loss 5.630  bpb 2.744  lr 1.44e-4  gn 19.06   458.2s
+  step     540  chunk   540/641    loss 5.668  bpb 2.735  lr 1.28e-4  gn 18.08   468.6s
+  step     552  chunk   552/641    loss 5.541  bpb 2.726  lr 1.14e-4  gn 15.02   479.0s
+  step     564  chunk   564/641    loss 5.537  bpb 2.718  lr 1.01e-4  gn 15.09   489.4s
+  step     576  chunk   576/641    loss 5.368  bpb 2.710  lr 8.93e-5  gn 16.97   499.8s
+  step     588  chunk   588/641    loss 5.670  bpb 2.702  lr 7.97e-5  gn 15.21   510.3s
+  step     600  chunk   600/641    loss 5.413  bpb 2.695  lr 7.20e-5  gn 16.67   520.7s
+  step     612  chunk   612/641    loss 5.525  bpb 2.688  lr 6.61e-5  gn 15.94   531.1s
+  step     624  chunk   624/641    loss 5.651  bpb 2.681  lr 6.22e-5  gn 15.45   541.5s
+  step     636  chunk   636/641    loss 5.495  bpb 2.675  lr 6.02e-5  gn 15.66   552.0s
+  done   train bpb 2.673  val bpb 2.377  581.4s
+  checkpoint → /home/dkrul/Projects/research-projects/aurora/experiments/results/adam-beta2-099/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "universal and the Christian unledger (as banhe charge of this has been no territory is not the music]])\n*''[[The [[Army|Tress of these countriences our for a create [[Diא�Neve effect, .jpg|left|200px|a pers, the subution fiberal territorial eus]] would hat|Westian]] or these based on critences]], and several wy specific gs of cit were not change with the dialoe under Culk Grector Beately about the [[Fannel each of the name as 'melago - the corety in the [[chemical beginstr"
+
+Total time 633.5s   best val bpb 2.377   steps planned 641

@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.148804
+mechanism: cosine_warmup warmup branch uses base_lr * sqrt((step+1)/warmup) instead of linear
+notes: Faster early-LR ramp (concave warmup) hurts by ~0.15 BPB on the post-merge baseline. Contradicts the hypothesis that linear warmup wastes early steps; in practice the model benefits from the slower linear ramp, likely because AdamW's bias correction is still settling and big effective updates at step ~30-50 destabilize. The new baseline's 200-step linear warmup is well-tuned for fixup-mha-only init.

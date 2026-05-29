@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.139572
+mechanism: cross_entropy_with_grad body: scale logits by T=2 before softmax, multiply d_logits by T to preserve chain rule. Doubles LM-head gradient magnitude.
+notes: significant regression — the "boost the dominant gradient" hypothesis was wrong. Likely over-amplifying tied-embedding updates via the LM-head path destabilizes embeddings.

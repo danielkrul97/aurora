@@ -1,0 +1,12 @@
+WIN: Δ_BPB = -0.026737 vs post-merge baseline (2.386948 → 2.360211).
+
+Tenth win of the post-merge-baseline session. New independent axis.
+
+Mechanism: w_tok + w_pos AdamW step uses 1.2× base LR. Transformer blocks and final_ln keep base LR. Diff: 8 LoC (CPU model.rs + GPU transformer.rs).
+
+This is a NEW per-param-group LR axis: embedding group, orthogonal to per-block-lr (transformer blocks). The 1.5× variant (iter 62) broke smoke at the test's aggressive lr=3e-2; 1.2× is the safe operating point.
+
+Composes with iter 59 bank-best (WSD-tail20 + β2=0.98 + per-block-lr [0.2,1.8]):
+predicted 4-way linear sum -0.044 + -0.010 + -0.025 + -0.027 = -0.106.
+
+Worth multi-seed validation. High-priority 4-way composite follow-up.

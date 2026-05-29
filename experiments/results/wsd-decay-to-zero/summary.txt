@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.041817
+mechanism: WSD-tail30 schedule decaying base_lr → 0 (instead of → min_lr 6e-5).
+notes: Win, but WEAKER than wsd-tail30-with-min_lr-floor (iter 61, -0.044996) by ~0.003. The min_lr=6e-5 floor is mildly beneficial — keeping a tiny non-zero LR in the final steps beats fully freezing at 0. Confirms the baseline's min_lr floor is a (small) positive design choice; the bank-best composite (iter 70) correctly uses the min_lr floor. Decay-target axis mapped: decay-to-min_lr > decay-to-0 by ~0.003. Kept as a clean win per spec but superseded by the min_lr-floor variant.

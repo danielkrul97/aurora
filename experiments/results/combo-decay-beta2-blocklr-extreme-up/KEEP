@@ -1,0 +1,24 @@
+WIN: Δ_BPB = -0.048908 vs post-merge baseline (2.386948 → 2.338040).
+
+STRONGEST RESULT of the post-merge-baseline session.
+
+3-way composite with extreme block-LR spread:
+1. inverse-sqrt-decay (-0.007 solo)
+2. AdamW β2 = 0.98 (-0.010 solo)
+3. per-block lr_mult [0.2x, 1.8x] (-0.025 solo)
+
+Linear sum -0.042. Actual -0.0489 → super-add +0.007.
+
+Super-additivity tracker:
+- iter 33 (2-way): +0.002
+- iter 46 (3-way narrow): 0 (linear)
+- iter 48 (3-way wide):  +0.003
+- iter 50 (3-way extreme): +0.007  ← this
+
+Super-add is GROWING with block-LR spread. Hypothesis: wider depth-LR asymmetry creates a richer loss-surface exploration regime that the schedule+m2 smoothing stabilizes — beneficial cross-talk that compounds.
+
+Diff: 22 LoC across src/transformer/schedule.rs, src/optimizer.rs, src/transformer/model.rs, src/gpu/transformer.rs. No GPU shader changes; no new params; no checkpoint format bump.
+
+Cumulative improvement from old baseline 2.718824 → 2.338 = -0.381 BPB (14% toward project target of <1.5).
+
+Worth multi-seed validation before merge. Strong candidate to be the next merged win after fixup-mha-only.

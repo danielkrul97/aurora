@@ -1,0 +1,3 @@
+status: broken_impl
+delta_bpb: n/a (sanity gate failed — no screening run)
+mechanism: composite (w_o + w_proj + w_pos all zero-init); smoke convergence test on 200-step copy task failed — 22% relative loss drop (test threshold 30%). Math is correct, just slower warm-up than the test window.

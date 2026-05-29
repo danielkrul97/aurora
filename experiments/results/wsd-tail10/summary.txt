@@ -1,0 +1,7 @@
+status: win
+delta_bpb: -0.033405
+mechanism: WSD schedule with 10% linear-decay tail (flat at base_lr 90%, decay 10%).
+notes: Win, but WEAKER than wsd-tail20 (-0.044). Tail-fraction mapping:
+- tail10: -0.033 (this)
+- tail20: -0.044 (iter 58)
+10% tail is too short — the model needs the longer annealing phase to consolidate before training ends. The "stay-high-longer" theme has a limit: cutting the decay tail below 20% sacrifices end-of-training convergence. 20% is better than 10%; 20% may be near the peak or tail30 could be marginally better. wsd-tail20 remains the schedule component to use in composites (iter 59 bank-best).

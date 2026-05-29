@@ -1,0 +1,40 @@
+failing test: mha_causal_backward_matches_numerical
+
+Last 40 lines (cargo test --release --test transformer_primitives):
+
+running 6 tests
+test gelu_backward_matches_numerical ... ok
+test ffn_backward_matches_numerical ... ok
+test token_pos_embed_backward_scatters_correctly ... ok
+test mha_causal_mask_blocks_future ... ok
+test tied_lm_head_gradient_accumulates_through_both_paths ... ok
+test mha_causal_backward_matches_numerical ... FAILED
+
+failures:
+---- mha_causal_backward_matches_numerical stdout ----
+thread 'mha_causal_backward_matches_numerical' panicked at tests/transformer_primitives.rs:64:9:
+dx[6]: analytic 0.00033708662 vs numeric 0.00030919907 (err 0.08273111)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
+    mha_causal_backward_matches_numerical
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+
+Interpretation: The test runs central-difference numerical gradient check
+with EPS=1e-3 and TOL=5e-2 (relative). Test uses d_model=8, d_head=4 (very
+small), so attention softmax operates on only 4 logits per query.
+
+He-uniform init has bound = sqrt(6/d_in) = sqrt(6/8) = 0.866 for square
+matrices, vs Xavier-uniform sqrt(6/(d_in+d_out)) = sqrt(6/16) = 0.612. That's
+1.41× wider Q/K weights → ~2× larger QK^T variance → much sharper softmax
+in this micro-test setup. Sharp softmax produces a quasi-discontinuous
+forward(); finite differences with EPS=1e-3 cannot resolve gradients
+accurately at TOL=5e-2 there.
+
+This is a TOLERANCE limitation of the test in the He-init regime, not a
+bug in the math. The same code passes:
+  - transformer_smoke (3/3) — convergence on copy task
+  - gpu_parity (13/13) — analytic CPU↔GPU drift
+
+But per RESEARCHER.md spec, primitives failure ⇒ broken_impl.

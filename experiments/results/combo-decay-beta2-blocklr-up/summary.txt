@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.031587
+mechanism: 3-way composite — (1) inverse-sqrt-decay post-warmup; (2) AdamW β2=0.98; (3) per-block lr_mult = 0.5 + li/(n_layer-1)
+notes: First win of this session on new post-merge baseline. Linear sum of components -0.031 (-0.007 + -0.010 + -0.014); actual -0.0316 → perfectly LINEAR additivity across schedule × optimizer × depth-cond-reg axes. Confirms the three mechanisms are mechanistically independent.

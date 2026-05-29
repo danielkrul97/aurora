@@ -1,0 +1,9 @@
+status: win
+delta_bpb: -0.048908
+mechanism: 3-way composite with EXTREME block-LR spread: (1) inverse-sqrt-decay; (2) AdamW β2=0.98; (3) per-block lr_mult = 0.2 + 1.6·li/(n_layer-1)
+notes: STRONGEST result of post-merge-baseline session. Linear sum prediction -0.042; actual -0.0489 → super-add +0.007 (more than 2× the +0.003 expected from prior pattern). Super-additivity is GROWING with spread width:
+- iter 33 (2-way decay × β2): +0.002 super-add
+- iter 46 (3-way narrow [0.5,1.5]): 0 (linear exact)
+- iter 48 (3-way wide [0.3,1.7]): +0.003 super-add
+- iter 50 (3-way extreme [0.2,1.8]): +0.007 super-add
+Hypothesis: deeper blocks at high LR explore loss surface more aggressively; schedule + m2 smoothing stabilizes that exploration → super-additive synergy. Bank-best for new baseline. Worth multi-seed validation; also try even wider spread [0.1, 1.9] in solo + composite probes.

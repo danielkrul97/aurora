@@ -1,0 +1,55 @@
+data                     |  1 +
+ src/gpu/transformer.rs   | 10 +++++-----
+ src/transformer/model.rs | 10 +++++-----
+ 3 files changed, 11 insertions(+), 10 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/gpu/transformer.rs
+  @@ -530,17 +530,17 @@ fn build_grad_ops(
+  -    push(&p.w_tok, &p.g_w_tok, &p.m1_w_tok, &p.m2_w_tok, (v * d) as u32, true);
+  +    push(&p.w_tok, &p.g_w_tok, &p.m1_w_tok, &p.m2_w_tok, (v * d) as u32, false);
+       push(&p.w_pos, &p.g_w_pos, &p.m1_w_pos, &p.m2_w_pos, (seq_max * d) as u32, false);
+       push(&p.final_gamma, &p.g_final_gamma, &p.m1_final_gamma, &p.m2_final_gamma, d as u32, false);
+       push(&p.final_beta, &p.g_final_beta, &p.m1_final_beta, &p.m2_final_beta, d as u32, false);
+       for blk in &p.blocks {
+           push(&blk.ln1_gamma, &blk.g_ln1_gamma, &blk.m1.ln1_gamma, &blk.m2.ln1_gamma, d as u32, false);
+           push(&blk.ln1_beta, &blk.g_ln1_beta, &blk.m1.ln1_beta, &blk.m2.ln1_beta, d as u32, false);
+  -        push(&blk.w_q, &blk.g_w_q, &blk.m1.w_q, &blk.m2.w_q, (d * d) as u32, true);
+  -        push(&blk.w_k, &blk.g_w_k, &blk.m1.w_k, &blk.m2.w_k, (d * d) as u32, true);
+  -        push(&blk.w_v, &blk.g_w_v, &blk.m1.w_v, &blk.m2.w_v, (d * d) as u32, true);
+  -        push(&blk.w_o, &blk.g_w_o, &blk.m1.w_o, &blk.m2.w_o, (d * d) as u32, true);
+  +        push(&blk.w_q, &blk.g_w_q, &blk.m1.w_q, &blk.m2.w_q, (d * d) as u32, false);
+  +        push(&blk.w_k, &blk.g_w_k, &blk.m1.w_k, &blk.m2.w_k, (d * d) as u32, false);
+  +        push(&blk.w_v, &blk.g_w_v, &blk.m1.w_v, &blk.m2.w_v, (d * d) as u32, false);
+  +        push(&blk.w_o, &blk.g_w_o, &blk.m1.w_o, &blk.m2.w_o, (d * d) as u32, false);
+           push(&blk.ln2_gamma, &blk.g_ln2_gamma, &blk.m1.ln2_gamma, &blk.m2.ln2_gamma, d as u32, false);
+           push(&blk.ln2_beta, &blk.g_ln2_beta, &blk.m1.ln2_beta, &blk.m2.ln2_beta, d as u32, false);
+           push(&blk.w_fc, &blk.g_w_fc, &blk.m1.w_fc, &blk.m2.w_fc, (d * d_ff) as u32, true);
+  +5 -5
+
+src/transformer/model.rs
+  @@ -391,7 +391,7 @@ impl DecoderTransformer {
+  -            true,
+  +            false,
+           );
+           adamw_apply(
+               &mut self.embed.w_pos,
+  @@ -407,10 +407,10 @@ impl DecoderTransformer {
+  -            adamw_apply(&mut blk.mha.w_q.w, &bg.d_mha.d_w_q.d_w, &mut ba.w_q, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.mha.w_k.w, &bg.d_mha.d_w_k.d_w, &mut ba.w_k, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.mha.w_v.w, &bg.d_mha.d_w_v.d_w, &mut ba.w_v, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut ba.w_o, config, bc1, bc2, true);
+  +            adamw_apply(&mut blk.mha.w_q.w, &bg.d_mha.d_w_q.d_w, &mut ba.w_q, config, bc1, bc2, false);
+  +            adamw_apply(&mut blk.mha.w_k.w, &bg.d_mha.d_w_k.d_w, &mut ba.w_k, config, bc1, bc2, false);
+  +            adamw_apply(&mut blk.mha.w_v.w, &bg.d_mha.d_w_v.d_w, &mut ba.w_v, config, bc1, bc2, false);
+  +            adamw_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut ba.w_o, config, bc1, bc2, false);
+               adamw_apply(&mut blk.ln2.gamma, &bg.d_ln2.d_gamma, &mut ba.ln2_gamma, config, bc1, bc2, false);
+               adamw_apply(&mut blk.ln2.beta, &bg.d_ln2.d_beta, &mut ba.ln2_beta, config, bc1, bc2, false);
+               adamw_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut ba.w_fc, config, bc1, bc2, true);
+  +5 -5

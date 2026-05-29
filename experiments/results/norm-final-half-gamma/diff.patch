@@ -1,0 +1,20 @@
+data                     | 1 +
+ src/transformer/model.rs | 3 ++-
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/transformer/model.rs
+  @@ -101,7 +101,8 @@ impl DecoderTransformer {
+  -        let final_ln = LayerNorm::new(config.d_model);
+  +        let mut final_ln = LayerNorm::new(config.d_model);
+  +        final_ln.gamma.fill(0.5);
+   
+           let d = config.d_model;
+           let d_ff = config.d_ff;
+  +2 -1

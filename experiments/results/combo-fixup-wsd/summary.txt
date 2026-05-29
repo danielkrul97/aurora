@@ -1,0 +1,3 @@
+status: win
+delta_bpb: -0.308441
+mechanism: fixup zero-init (w_o + w_proj) + WSD schedule (warmup → stable base_lr → linear decay over tail 20%); two independent-area wins composed

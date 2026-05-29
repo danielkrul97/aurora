@@ -26,6 +26,7 @@ pub mod gelu;
 pub mod kv_cache;
 pub mod layer_norm;
 pub mod matmul;
+pub mod muon;
 pub mod optimizer;
 pub mod reduce;
 pub mod softmax_ce;
@@ -39,6 +40,10 @@ pub use gelu::{GeluBackwardKernel, GeluKernel};
 pub use kv_cache::{KvBlockGpu, KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
 pub use layer_norm::{LayerNormBackwardKernel, LayerNormForwardKernel};
 pub use matmul::{cpu_gemm, cpu_gemm_transpose_b, GemmKernel, GemmTransposeBKernel};
+pub use muon::{
+    MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel, MuonLoadStoreKernel,
+    MuonMomentumKernel, MuonStepXKernel,
+};
 pub use optimizer::AdamWKernel;
 pub use reduce::{
     EmbedScatterReduceKernel, GradNormFinalizeKernel, GradNormSqReduceKernel,

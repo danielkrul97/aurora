@@ -1,0 +1,4 @@
+status: broken_impl
+delta_bpb: n/a (smoke argmax sanity failed)
+mechanism: AdamWConfig::default beta1: 0.9 -> 0.95
+notes: cpu_transformer_argmax_sanity failed (got argmax=0 expected 2). β1=0.95 combined with smoke test's aggressive lr=3e-2 → momentum builds too slowly to reach the identity-prediction milestone within 100 steps. Full screening at lr=6e-4 would likely behave very differently (β2=0.98 with same baseline passed both gates) but spec gates on smoke. Test interaction: smoke's aggressive lr × slower momentum = under-converged in 100 steps. β1 above 0.95 likely also breaks; β1=0.92 or 0.93 might pass — a follow-up could probe the boundary.

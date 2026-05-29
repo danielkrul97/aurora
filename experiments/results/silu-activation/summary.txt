@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.023765
+mechanism: FFN activation GELU → SiLU (x·sigmoid(x)). CPU linalg.rs + GPU gelu.rs WGSL forward/backward.
+notes: Mild regression. SiLU underperforms GELU by ~0.024 BPB on this byte-LM at 1-epoch. GELU and SiLU are close functions but GELU's slightly different curvature (tanh-approx shape, small negative dip near x≈-0.7 to 0) is evidently better-tuned for the baseline — likely because the init magnitudes (Xavier in FFN, GPT-3 residual scaling) were implicitly calibrated for GELU. SiLU shifts the activation distribution enough to cost ~0.024. Useful negative result: the GELU choice is not arbitrary; swapping it is a net loss without re-tuning init. Activation-function axis: GELU is the right choice for Aurora.

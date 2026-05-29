@@ -1,0 +1,11 @@
+WIN: Δ_BPB = -0.020598 vs post-merge baseline (2.386948 → 2.366350).
+
+Second win of the post-merge-baseline session. Solo iter, no composite.
+
+Mechanism: per-block AdamW LR multiplier from 0.3× (block 0) linearly up to 1.7× (block 5). Wider spread version of iter 45's [0.5, 1.5] (which was sub-threshold at -0.014). Near-linear scaling confirms depth-LR asymmetry doesn't saturate at moderate spreads.
+
+Diff: 16 LoC across src/transformer/model.rs and src/gpu/transformer.rs. No GPU shader changes; no new params; no checkpoint format bump.
+
+Composes naturally with iter 46's combo (substituting this wider variant for the [0.5, 1.5] block-LR component). Expected combined Δ ~−0.038 if linear additivity holds (-0.007 inverse-sqrt + -0.010 β2-098 + -0.0206 this).
+
+Worth multi-seed validation before merge.

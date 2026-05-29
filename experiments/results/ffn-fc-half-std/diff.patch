@@ -1,0 +1,13 @@
+src/transformer/ffn.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- Changes ---
+
+src/transformer/ffn.rs
+  @@ -27,7 +27,7 @@ impl FfnWeights {
+  -            w_fc: LinearProj::new(d_model, d_ff, rng),
+  +            w_fc: LinearProj::new_scaled(d_model, d_ff, 0.5, rng),
+               w_proj: LinearProj::new_scaled(d_ff, d_model, resid_scale, rng),
+               d_model,
+               d_ff,
+  +1 -1

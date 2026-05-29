@@ -1,0 +1,4 @@
+status: broken_impl
+delta_bpb: n/a (sanity gate failed — no screening run)
+mechanism: combo w_o=0, w_proj=0 (fixup) + w_pos at 0.5x baseline magnitude + WSD schedule. smoke argmax sanity failed: predicted 0 instead of 2 after 100 steps on identity copy task.
+notes: 3rd broken composite trying to add pos-init reduction to fixup+WSD. Boundary is non-monotonic — different sub-tests fail at different magnitudes. Quarter (iter 13) passed argmax but failed convergence; half passes convergence-equivalent reasoning but fails argmax. Smoke gate is multi-constraint and adversarial for 3-ingredient zero-init combos.

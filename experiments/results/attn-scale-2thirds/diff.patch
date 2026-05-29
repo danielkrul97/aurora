@@ -1,0 +1,41 @@
+src/attention.rs     | 2 +-
+ src/gpu/attention.rs | 8 ++++----
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+--- Changes ---
+
+src/attention.rs
+  @@ -271,7 +271,7 @@ pub fn scaled_dot_product_attention(
+  -    let scale = (d_k as f32).sqrt().recip();
+  +    let scale = (d_k as f32).sqrt().recip() * (2.0 / 3.0);
+       let mut probs = vec![0.0_f32; t_q * t_k];
+   
+       for i in 0..t_q {
+  +1 -1
+
+src/gpu/attention.rs
+  @@ -410,7 +410,7 @@ impl CausalMhaForwardKernel {
+  -        let scale = (d_head as f32).sqrt().recip();
+  +        let scale = (d_head as f32).sqrt().recip() * (2.0 / 3.0);
+           let p = AttnParams {
+               t,
+               d_head,
+  @@ -472,7 +472,7 @@ impl CausalMhaForwardKernel {
+  -        let scale = (d_head as f32).sqrt().recip();
+  +        let scale = (d_head as f32).sqrt().recip() * (2.0 / 3.0);
+           let p = AttnParams {
+               t, d_head, n_head, _pad0: 0, scale, _p0: 0, _p1: 0, _p2: 0,
+           };
+  @@ -594,7 +594,7 @@ impl CausalMhaBackwardKernel {
+  -        let scale = (d_head as f32).sqrt().recip();
+  +        let scale = (d_head as f32).sqrt().recip() * (2.0 / 3.0);
+           let p = AttnParams {
+               t,
+               d_head,
+  @@ -762,7 +762,7 @@ impl CausalMhaBackwardKernel {
+  -        let scale = (d_head as f32).sqrt().recip();
+  +        let scale = (d_head as f32).sqrt().recip() * (2.0 / 3.0);
+           let p = AttnParams {
+               t, d_head, n_head, _pad0: 0, scale, _p0: 0, _p1: 0, _p2: 0,
+           };
+  +4 -4

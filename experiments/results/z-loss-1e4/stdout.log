@@ -1,0 +1,126 @@
+   Compiling cfg_aliases v0.1.1
+   Compiling bitflags v2.11.1
+   Compiling thiserror v1.0.69
+   Compiling parking_lot_core v0.9.12
+   Compiling smallvec v1.15.1
+   Compiling libloading v0.8.9
+   Compiling hashbrown v0.17.0
+   Compiling unicode-width v0.1.14
+   Compiling ash v0.38.0+1.3.281
+   Compiling scopeguard v1.2.0
+   Compiling equivalent v1.0.2
+   Compiling bytemuck_derive v1.10.2
+   Compiling naga v23.1.0
+   Compiling thiserror-impl v1.0.69
+   Compiling bit-vec v0.8.0
+   Compiling termcolor v1.4.1
+   Compiling khronos-egl v6.0.0
+   Compiling foldhash v0.1.5
+   Compiling gpu-descriptor-types v0.2.0
+   Compiling spirv v0.3.0+sdk-1.3.268.0
+   Compiling gpu-alloc-types v0.3.0
+   Compiling bit-set v0.8.0
+   Compiling codespan-reporting v0.11.1
+   Compiling hashbrown v0.15.5
+   Compiling lock_api v0.4.14
+   Compiling wgpu-hal v23.0.1
+   Compiling log v0.4.29
+   Compiling rustc-hash v1.1.0
+   Compiling hexf-parse v0.2.1
+   Compiling unicode-xid v0.2.6
+   Compiling arrayvec v0.7.6
+   Compiling parking_lot v0.12.5
+   Compiling gpu-alloc v0.6.0
+   Compiling indexmap v2.14.0
+   Compiling wgpu-types v23.0.0
+   Compiling wgpu-core v23.0.1
+   Compiling profiling v1.0.17
+   Compiling gpu-descriptor v0.3.2
+   Compiling litrs v1.0.0
+   Compiling glow v0.14.2
+   Compiling bytemuck v1.25.0
+   Compiling raw-window-handle v0.6.2
+   Compiling renderdoc-sys v1.1.0
+   Compiling wgpu v23.0.1
+   Compiling static_assertions v1.1.0
+   Compiling rgb v0.8.53
+   Compiling pollster v0.4.0
+   Compiling document-features v0.2.12
+   Compiling textplots v0.8.7
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/z-loss-1e4)
+    Finished `release` profile [optimized] target(s) in 16.84s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics ../../results/z-loss-1e4/metrics.jsonl --checkpoint ../../results/z-loss-1e4/ckpt.bin`
+no checkpoint at ../../results/z-loss-1e4/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 5.5s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : ../../results/z-loss-1e4/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.208  bpb 3.509  lr 3.60e-5  gn 20.39    11.6s
+  step      24  chunk    24/641    loss 8.085  bpb 3.470  lr 7.20e-5  gn 13.09    22.8s
+  step      36  chunk    36/641    loss 7.854  bpb 3.433  lr 1.08e-4  gn 11.16    34.1s
+  step      48  chunk    48/641    loss 7.663  bpb 3.392  lr 1.44e-4  gn 11.11    45.3s
+  step      60  chunk    60/641    loss 7.549  bpb 3.356  lr 1.80e-4  gn 10.52    56.5s
+  step      72  chunk    72/641    loss 7.483  bpb 3.325  lr 2.16e-4  gn 7.59    67.8s
+  step      84  chunk    84/641    loss 7.448  bpb 3.302  lr 2.52e-4  gn 7.90    79.0s
+  step      96  chunk    96/641    loss 7.501  bpb 3.285  lr 2.88e-4  gn 8.21    90.3s
+  step     108  chunk   108/641    loss 7.460  bpb 3.270  lr 3.24e-4  gn 7.95   101.6s
+  step     120  chunk   120/641    loss 7.475  bpb 3.258  lr 3.60e-4  gn 7.86   112.9s
+  step     132  chunk   132/641    loss 7.454  bpb 3.249  lr 3.96e-4  gn 8.33   124.2s
+  step     144  chunk   144/641    loss 7.479  bpb 3.239  lr 4.32e-4  gn 9.46   135.5s
+  step     156  chunk   156/641    loss 7.361  bpb 3.230  lr 4.68e-4  gn 8.93   146.9s
+  step     168  chunk   168/641    loss 7.344  bpb 3.220  lr 5.04e-4  gn 8.35   158.2s
+  step     180  chunk   180/641    loss 7.293  bpb 3.211  lr 5.40e-4  gn 8.13   169.5s
+  step     192  chunk   192/641    loss 7.189  bpb 3.201  lr 5.76e-4  gn 9.16   180.8s
+  step     204  chunk   204/641    loss 7.201  bpb 3.191  lr 6.00e-4  gn 10.49   192.1s
+  step     216  chunk   216/641    loss 7.139  bpb 3.182  lr 5.98e-4  gn 8.84   203.5s
+  step     228  chunk   228/641    loss 7.066  bpb 3.171  lr 5.95e-4  gn 9.99   214.8s
+  step     240  chunk   240/641    loss 6.913  bpb 3.160  lr 5.90e-4  gn 9.96   226.1s
+  step     252  chunk   252/641    loss 6.978  bpb 3.149  lr 5.82e-4  gn 10.92   237.4s
+  step     264  chunk   264/641    loss 6.862  bpb 3.137  lr 5.73e-4  gn 10.50   248.7s
+  step     276  chunk   276/641    loss 6.891  bpb 3.126  lr 5.62e-4  gn 11.91   260.1s
+  step     288  chunk   288/641    loss 6.824  bpb 3.116  lr 5.50e-4  gn 11.05   271.4s
+  step     300  chunk   300/641    loss 6.718  bpb 3.106  lr 5.36e-4  gn 10.39   282.7s
+  step     312  chunk   312/641    loss 6.749  bpb 3.094  lr 5.20e-4  gn 10.72   294.0s
+  step     324  chunk   324/641    loss 6.747  bpb 3.085  lr 5.03e-4  gn 10.65   305.4s
+  step     336  chunk   336/641    loss 6.830  bpb 3.076  lr 4.84e-4  gn 11.14   316.7s
+  step     348  chunk   348/641    loss 6.681  bpb 3.068  lr 4.65e-4  gn 9.43   328.0s
+  step     360  chunk   360/641    loss 6.563  bpb 3.059  lr 4.45e-4  gn 11.61   339.3s
+  step     372  chunk   372/641    loss 6.543  bpb 3.050  lr 4.23e-4  gn 11.48   350.7s
+  step     384  chunk   384/641    loss 6.592  bpb 3.041  lr 4.01e-4  gn 11.35   362.0s
+  step     396  chunk   396/641    loss 6.530  bpb 3.032  lr 3.79e-4  gn 9.55   373.3s
+  step     408  chunk   408/641    loss 6.557  bpb 3.024  lr 3.56e-4  gn 10.56   384.6s
+  step     420  chunk   420/641    loss 6.617  bpb 3.017  lr 3.33e-4  gn 9.89   396.0s
+  step     432  chunk   432/641    loss 6.535  bpb 3.010  lr 3.10e-4  gn 10.15   407.3s
+  step     444  chunk   444/641    loss 6.469  bpb 3.003  lr 2.87e-4  gn 10.85   418.6s
+  step     456  chunk   456/641    loss 6.559  bpb 2.996  lr 2.64e-4  gn 9.65   429.9s
+  step     468  chunk   468/641    loss 6.427  bpb 2.990  lr 2.42e-4  gn 10.45   441.2s
+  step     480  chunk   480/641    loss 6.405  bpb 2.983  lr 2.21e-4  gn 11.49   452.6s
+  step     492  chunk   492/641    loss 6.439  bpb 2.976  lr 2.00e-4  gn 10.76   463.9s
+  step     504  chunk   504/641    loss 6.499  bpb 2.970  lr 1.80e-4  gn 9.90   475.2s
+  step     516  chunk   516/641    loss 6.491  bpb 2.965  lr 1.62e-4  gn 10.38   486.5s
+  step     528  chunk   528/641    loss 6.457  bpb 2.959  lr 1.44e-4  gn 13.75   497.8s
+  step     540  chunk   540/641    loss 6.475  bpb 2.954  lr 1.28e-4  gn 12.64   509.2s
+  step     552  chunk   552/641    loss 6.413  bpb 2.949  lr 1.14e-4  gn 9.93   520.5s
+  step     564  chunk   564/641    loss 6.388  bpb 2.943  lr 1.01e-4  gn 10.44   531.8s
+  step     576  chunk   576/641    loss 6.305  bpb 2.938  lr 8.93e-5  gn 11.23   543.1s
+  step     588  chunk   588/641    loss 6.469  bpb 2.933  lr 7.97e-5  gn 10.99   554.5s
+  step     600  chunk   600/641    loss 6.289  bpb 2.928  lr 7.20e-5  gn 11.00   565.8s
+  step     612  chunk   612/641    loss 6.411  bpb 2.924  lr 6.61e-5  gn 11.05   577.1s
+  step     624  chunk   624/641    loss 6.433  bpb 2.920  lr 6.22e-5  gn 10.60   588.4s
+  step     636  chunk   636/641    loss 6.341  bpb 2.916  lr 6.02e-5  gn 10.86   599.7s
+  done   train bpb 2.914  val bpb 2.720  2316.0s
+  checkpoint → ../../results/z-loss-1e4/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "defees, Tfarect fripa language with estimveran Indiisennnful a markd went at the late &quot; ([[cotest. Th: The I types in the Nclue in Peatconcest.\n\n==After levels ==The [[Sanenamation an Animate titinages medt Dis of political protypency A]]''s of actory===\nCs]].\n\nIf [[ongs setic]] specie their condieinsion his Proording to Diseara sorts. \n\n==.\n\nLritodans in the early in #Golly is have been in Nores are through Europate [[W"
+
+Total time 2368.3s   best val bpb 2.720   steps planned 641

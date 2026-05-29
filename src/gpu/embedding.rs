@@ -7,7 +7,7 @@ use super::softmax_ce::storage_entry;
 use super::GpuContext;
 
 const EMBED_FORWARD_WGSL: &str = "
-struct P { t: u32, d: u32, vocab: u32, seq_max: u32 };
+struct P { t: u32, d: u32, vocab: u32, seq_max: u32, tok_offset: u32 };
 @group(0) @binding(0) var<storage, read>       tokens: array<u32>;
 @group(0) @binding(1) var<storage, read>       w_tok: array<f32>;
 @group(0) @binding(2) var<storage, read>       w_pos: array<f32>;
@@ -21,13 +21,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= total) { return; }
     let ti = i / p.d;
     let c = i % p.d;
-    let tok = tokens[ti];
+    let tok = tokens[p.tok_offset + ti];
     out[i] = w_tok[tok * p.d + c] + w_pos[ti * p.d + c];
 }
 ";
 
 const EMBED_BACKWARD_WGSL: &str = "
-struct P { t: u32, d: u32, vocab: u32, seq_max: u32 };
+struct P { t: u32, d: u32, vocab: u32, seq_max: u32, tok_offset: u32 };
 @group(0) @binding(0) var<storage, read>       tokens: array<u32>;
 @group(0) @binding(1) var<storage, read>       dy: array<f32>;
 @group(0) @binding(2) var<storage, read_write> d_w_tok_per_pos: array<f32>;
@@ -57,6 +57,9 @@ struct EmbedParams {
     d: u32,
     vocab: u32,
     seq_max: u32,
+    /// Read tokens starting at this flat index — lets one `B·T` token
+    /// buffer feed per-sequence embed dispatches without re-uploading.
+    tok_offset: u32,
 }
 
 pub struct TokenPosEmbedKernel {
@@ -91,7 +94,7 @@ impl TokenPosEmbedKernel {
                 bind_group_layouts: &[&bgl],
                 push_constant_ranges: &[wgpu::PushConstantRange {
                     stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..16,
+                    range: 0..20,
                 }],
             });
         let pipeline = ctx
@@ -123,7 +126,7 @@ impl TokenPosEmbedKernel {
         vocab: u32,
         seq_max: u32,
     ) {
-        let p = EmbedParams { t, d, vocab, seq_max };
+        let p = EmbedParams { t, d, vocab, seq_max, tok_offset: 0 };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora embed fwd bind"),
             layout: &self.bgl,
@@ -173,8 +176,9 @@ impl TokenPosEmbedKernel {
         d: u32,
         vocab: u32,
         seq_max: u32,
+        tok_offset: u32,
     ) {
-        let p = EmbedParams { t, d, vocab, seq_max };
+        let p = EmbedParams { t, d, vocab, seq_max, tok_offset };
         pass.set_bind_group(0, bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups((t * d).div_ceil(256), 1, 1);
@@ -217,7 +221,7 @@ impl EmbedScatterAddKernel {
                 bind_group_layouts: &[&bgl],
                 push_constant_ranges: &[wgpu::PushConstantRange {
                     stages: wgpu::ShaderStages::COMPUTE,
-                    range: 0..16,
+                    range: 0..20,
                 }],
             });
         let pipeline = ctx
@@ -249,7 +253,7 @@ impl EmbedScatterAddKernel {
         vocab: u32,
         seq_max: u32,
     ) {
-        let p = EmbedParams { t, d, vocab, seq_max };
+        let p = EmbedParams { t, d, vocab, seq_max, tok_offset: 0 };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora embed bwd bind"),
             layout: &self.bgl,
@@ -305,8 +309,9 @@ impl EmbedScatterAddKernel {
         d: u32,
         vocab: u32,
         seq_max: u32,
+        tok_offset: u32,
     ) {
-        let p = EmbedParams { t, d, vocab, seq_max };
+        let p = EmbedParams { t, d, vocab, seq_max, tok_offset };
         pass.set_bind_group(0, bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups((t * d).div_ceil(256), 1, 1);

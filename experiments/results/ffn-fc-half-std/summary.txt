@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.231589
+mechanism: FfnWeights::new w_fc = LinearProj::new_scaled(d_model, d_ff, 0.5, rng)
+notes: Halving the FFN input projection init on top of post-merge baseline (fixup-mha-only already baked in) caused a large +0.23 BPB regression. Confirms the same anti-stacking pattern as iter 19 (combo-fixup-wsd-tok-half) and iter 25 (combo-fixup-mha-only-embed-both-half): combining MHA-residual-zero init with ANY further upstream/intra-block init-magnitude reduction starves the model of signal at start, and AdamW can't recover within the 1-epoch screening budget. The new baseline already lives at the "minimum viable signal strength" floor.

@@ -1,0 +1,7 @@
+TECHNICAL WIN vs BASELINE: delta_bpb = -0.073631 (2.718824 → 2.645193). But this is a SIGNIFICANT REGRESSION vs the bank's best composite combo-fixup-wsd (-0.308). Adding tok-half to the parent combo destroyed -0.234 BPB of gain.
+
+Interpretation: with fixup zeroing residual branches, the tied LM head becomes the model's only working learning channel at init. Halving w_tok weakens this channel, slowing convergence. The two ingredients are anti-correlated.
+
+Worktree kept per spec (status=win), but in practice the bank's best is still combo-fixup-wsd. Consider this entry as a negative composability data point — it's a useful refutation of "all winning single-tensor ideas stack additively".
+
+Multi-seed validation would be a waste here. The lesson is about composition theory, not this specific tensor combo.

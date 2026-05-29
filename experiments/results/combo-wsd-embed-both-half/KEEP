@@ -1,0 +1,11 @@
+WIN: delta_bpb = -0.093604 (2.718824 → 2.625220). Third-best result in the bank after combo-fixup-wsd (-0.308) and fixup-resid-zero-init (-0.251). This is the best "no-fixup" composite tested so far.
+
+Composability map update:
+- combo-fixup-wsd (init × optimizer): super-additive +0.008
+- combo-embed-both-half (embed × embed): super-additive +0.009
+- combo-wsd-embed-both-half (optimizer × embed): SUB-additive +0.008
+- combo-fixup-wsd-tok-half (init × init): anti-stacks -0.234 (~half the parent gain destroyed)
+
+The pattern: cross-area composability is NOT uniformly super-additive. The fixup+WSD combo benefits from completely independent mechanisms; embedding-half + WSD share some "smaller late-training updates" character which causes mild overlap.
+
+Multi-seed validation recommended. The combo is meaningfully better than baseline but the additivity surprise suggests careful interpretation: WSD and embedding-half can substitute for each other to a small degree.

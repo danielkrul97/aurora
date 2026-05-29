@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.022380
+mechanism: w_pos init scaled to 0.5x baseline magnitude (uniform[-0.0173, +0.0173]) instead of full uniform[-0.0346, +0.0346]. Less random positional noise initially, positional info learned from gradient as before.
+notes: Approximately linear win in (1 - magnitude_factor). Combined with iter 6 (zero, Δ=-0.040), the dial is well-characterized: linear interpolation across [0, 1] for w_pos init magnitude.

@@ -1,0 +1,60 @@
+src/gpu/transformer.rs   | 16 +++++++++-------
+ src/transformer/model.rs | 14 ++++++++------
+ 2 files changed, 17 insertions(+), 13 deletions(-)
+
+--- Changes ---
+
+src/gpu/transformer.rs
+  @@ -528,17 +528,19 @@ fn build_grad_ops(
+  -    for blk in &p.blocks {
+  +    let n_layer = p.blocks.len();
+  +    for (li, blk) in p.blocks.iter().enumerate() {
+  +        let wd = li >= n_layer / 2;
+           push(&blk.ln1_gamma, &blk.g_ln1_gamma, &blk.m1.ln1_gamma, &blk.m2.ln1_gamma, d as u32, false);
+           push(&blk.ln1_beta, &blk.g_ln1_beta, &blk.m1.ln1_beta, &blk.m2.ln1_beta, d as u32, false);
+  -        push(&blk.w_q, &blk.g_w_q, &blk.m1.w_q, &blk.m2.w_q, (d * d) as u32, true);
+  -        push(&blk.w_k, &blk.g_w_k, &blk.m1.w_k, &blk.m2.w_k, (d * d) as u32, true);
+  -        push(&blk.w_v, &blk.g_w_v, &blk.m1.w_v, &blk.m2.w_v, (d * d) as u32, true);
+  -        push(&blk.w_o, &blk.g_w_o, &blk.m1.w_o, &blk.m2.w_o, (d * d) as u32, true);
+  +        push(&blk.w_q, &blk.g_w_q, &blk.m1.w_q, &blk.m2.w_q, (d * d) as u32, wd);
+  +        push(&blk.w_k, &blk.g_w_k, &blk.m1.w_k, &blk.m2.w_k, (d * d) as u32, wd);
+  +        push(&blk.w_v, &blk.g_w_v, &blk.m1.w_v, &blk.m2.w_v, (d * d) as u32, wd);
+  +        push(&blk.w_o, &blk.g_w_o, &blk.m1.w_o, &blk.m2.w_o, (d * d) as u32, wd);
+           push(&blk.ln2_gamma, &blk.g_ln2_gamma, &blk.m1.ln2_gamma, &blk.m2.ln2_gamma, d as u32, false);
+           push(&blk.ln2_beta, &blk.g_ln2_beta, &blk.m1.ln2_beta, &blk.m2.ln2_beta, d as u32, false);
+  -        push(&blk.w_fc, &blk.g_w_fc, &blk.m1.w_fc, &blk.m2.w_fc, (d * d_ff) as u32, true);
+  -        push(&blk.w_proj, &blk.g_w_proj, &blk.m1.w_proj, &blk.m2.w_proj, (d * d_ff) as u32, true);
+  +        push(&blk.w_fc, &blk.g_w_fc, &blk.m1.w_fc, &blk.m2.w_fc, (d * d_ff) as u32, wd);
+  +        push(&blk.w_proj, &blk.g_w_proj, &blk.m1.w_proj, &blk.m2.w_proj, (d * d_ff) as u32, wd);
+       }
+       ops
+   }
+  +9 -7
+
+src/transformer/model.rs
+  @@ -402,19 +402,21 @@ impl DecoderTransformer {
+  +        let n_layer = self.blocks.len();
+           for (li, blk) in self.blocks.iter_mut().enumerate() {
+  +            let wd = li >= n_layer / 2;
+               let ba = &mut self.adam.blocks[li];
+               let bg = &grads.blocks[li];
+               adamw_apply(&mut blk.ln1.gamma, &bg.d_ln1.d_gamma, &mut ba.ln1_gamma, config, bc1, bc2, false);
+               adamw_apply(&mut blk.ln1.beta, &bg.d_ln1.d_beta, &mut ba.ln1_beta, config, bc1, bc2, false);
+  -            adamw_apply(&mut blk.mha.w_q.w, &bg.d_mha.d_w_q.d_w, &mut ba.w_q, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.mha.w_k.w, &bg.d_mha.d_w_k.d_w, &mut ba.w_k, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.mha.w_v.w, &bg.d_mha.d_w_v.d_w, &mut ba.w_v, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut ba.w_o, config, bc1, bc2, true);
+  +            adamw_apply(&mut blk.mha.w_q.w, &bg.d_mha.d_w_q.d_w, &mut ba.w_q, config, bc1, bc2, wd);
+  +            adamw_apply(&mut blk.mha.w_k.w, &bg.d_mha.d_w_k.d_w, &mut ba.w_k, config, bc1, bc2, wd);
+  +            adamw_apply(&mut blk.mha.w_v.w, &bg.d_mha.d_w_v.d_w, &mut ba.w_v, config, bc1, bc2, wd);
+  +            adamw_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut ba.w_o, config, bc1, bc2, wd);
+               adamw_apply(&mut blk.ln2.gamma, &bg.d_ln2.d_gamma, &mut ba.ln2_gamma, config, bc1, bc2, false);
+               adamw_apply(&mut blk.ln2.beta, &bg.d_ln2.d_beta, &mut ba.ln2_beta, config, bc1, bc2, false);
+  -            adamw_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut ba.w_fc, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.ffn.w_proj.w, &bg.d_ffn.d_w_proj.d_w, &mut ba.w_proj, config, bc1, bc2, true);
+  +            adamw_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut ba.w_fc, config, bc1, bc2, wd);
+  +            adamw_apply(&mut blk.ffn.w_proj.w, &bg.d_ffn.d_w_proj.d_w, &mut ba.w_proj, config, bc1, bc2, wd);
+           }
+           adamw_apply(
+               &mut self.final_ln.gamma,
+  +8 -6

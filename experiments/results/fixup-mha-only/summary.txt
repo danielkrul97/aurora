@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.331873
+mechanism: Zero-init w_o (MHA output projection) only; w_proj (FFN output) keeps baseline GPT-3 1/sqrt(2N) residual scaling. At init: MHA sublayer = 0 (identity), FFN sublayer = small random GPT-3-scaled contribution.
+notes: SURPRISE — bigger win than full fixup (-0.251). Keeping FFN sublayer non-zero at init outperforms zeroing both branches. New bank-best single-change. The "full identity stack" interpretation of fixup's win is WRONG; the dominant gain is from killing MHA noise specifically, while preserving FFN's contribution helps further. New best single-change in bank.

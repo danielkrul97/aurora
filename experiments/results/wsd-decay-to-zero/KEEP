@@ -1,0 +1,14 @@
+WIN: Δ_BPB = -0.041817 vs post-merge baseline (2.386948 → 2.345131).
+
+WSD-tail30 schedule decaying to 0 instead of min_lr. Win, but weaker
+than wsd-tail30-with-min_lr-floor (iter 61, -0.045) by ~0.003.
+
+Finding: the min_lr=6e-5 floor is mildly beneficial — a tiny non-zero
+final LR beats freezing at 0. The bank-best composite (iter 70) uses
+the min_lr floor, which is the correct choice.
+
+Diff: 14 LoC in src/transformer/schedule.rs.
+
+Kept per spec (win > -0.02 threshold) but NOT a merge candidate —
+wsd-tail30 with min_lr floor dominates. Kept for the decay-target
+data point: decay-to-min_lr > decay-to-0.

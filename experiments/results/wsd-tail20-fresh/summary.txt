@@ -1,0 +1,7 @@
+status: win
+delta_bpb: -0.043713
+mechanism: WSD-tail20 schedule on new baseline. Post-warmup: flat at base_lr for 80% of remaining, linear decay to min_lr in last 20%.
+notes: STRONG SOLO WIN. 6× bigger than inverse-sqrt-decay (-0.007) at the same schedule-axis position. Major finding: the inverse-sqrt-decay choice in iter 50's bank-best composite was significantly SUB-OPTIMAL. WSD-tail20 is a much better schedule curve for the new baseline. Substitution into the winning composite (combo-wsd-beta2-blocklr-extreme-up) predicts:
+- Linear sum: -0.044 + -0.010 + -0.025 = -0.079
+- With typical 3-way super-add +0.005: -0.084
+This would be ~2x current bank-best (-0.049). High-priority follow-up. Worth multi-seed validation.

@@ -1,0 +1,3 @@
+status: loss
+delta_bpb: +0.000931
+mechanism: L = L_ce + 1e-4 · (log Σ exp logit)², grad adds 2λz·softmax to d_logits

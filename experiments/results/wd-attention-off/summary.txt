@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: -0.001556
+mechanism: AdamW apply_wd=false for w_tok, w_q, w_k, w_v, w_o (per block). WD kept on w_fc, w_proj.
+notes: Near-zero effect (-0.002, below the -0.02 win threshold). WD at λ=0.1 with lr=6e-4 produces per-step param shrinkage of ~0.006% — too small to matter in 641 steps regardless of which params it applies to. Confirms the same insight as embed-no-wd (Δ=+0.001): WD-targeting in this configuration is a no-op. The optimizer area's three losses now triangulate a clear picture — small AdamW config tweaks don't move the needle.

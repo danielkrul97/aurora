@@ -1,0 +1,16 @@
+TECHNICAL WIN, BUT MAJOR REGRESSION vs parent. delta_bpb vs baseline = -0.093 (2.718824 → 2.625622), but vs the parent fixup-mha-only (-0.332) this is +0.239 BPB of damage.
+
+The hypothesis was that fixup-mha-only's preserved FFN sublayer would avoid the anti-stacking seen with full-fixup + tok-half (iter 19). It didn't — the anti-stacking still fires. Combining ANY residual-init zero with ANY embedding-magnitude reduction reliably destroys most of the init's gain.
+
+Composability rule update:
+- init-residual-zero × init-residual-zero (fixup-mha+ffn / iter 4): partial damage in joint (+0.056 interaction)
+- init-residual-zero × embedding-magnitude-halve (this, iter 19): MAJOR damage (~+0.24)
+- init-residual-zero × LR schedule (iter 10, 23): clean SUPER-additive (+0.005 to +0.008)
+- embedding × embedding (iter 20): clean SUPER-additive (+0.009)
+- embedding × LR schedule (iter 21): mild SUB-additive (+0.008)
+
+The init-residual-zero changes share a mechanism with embedding-magnitude reduction: both reduce the **signal strength at the LM head** at init. Combining them creates a starting state too "weak" for AdamW to recover from within the 1-epoch budget.
+
+Worktree kept per spec but combo-fixup-mha-only-wsd (-0.376) remains the bank-best.
+
+Multi-seed validation would be wasted here. The lesson is structural: avoid mixing residual-zero with embedding-half.

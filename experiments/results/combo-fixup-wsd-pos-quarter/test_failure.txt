@@ -1,0 +1,43 @@
+failing test: cpu_transformer_converges_on_copy_task
+
+Last output:
+running 3 tests
+test cpu_transformer_step_does_not_nan ... ok
+test cpu_transformer_argmax_sanity ... ok
+test cpu_transformer_converges_on_copy_task ... FAILED
+
+failures:
+---- cpu_transformer_converges_on_copy_task stdout ----
+thread 'cpu_transformer_converges_on_copy_task' panicked at tests/transformer_smoke.rs:69:5:
+loss did not decrease: first=1.8379273, last=1.3211389, baseline=2.0794415
+
+Test invariant: last_loss < first_loss * 0.7
+  first_loss * 0.7 = 1.2865
+  last_loss = 1.3211
+  actual relative drop = 28.1%, required 30.0%
+
+failures:
+    cpu_transformer_converges_on_copy_task
+
+Interpretation: Quartering w_pos init (from uniform[±0.0346] to
+uniform[±0.0087]) on top of fixup zero-init for w_o + w_proj reduces
+the model's warm-up speed below the smoke threshold by ~2 percentage
+points. The earlier triple-zero combo (combo-fixup-pos-zero) failed
+at 22% drop; quarter-pos recovers ~6 pp but not enough.
+
+To pass smoke while combining fixup + pos attenuation we'd need
+pos init at >½ original magnitude — at which point the standalone
+pos-embed gain (-0.040 from pos=zero) is likely diluted enough that
+the composite doesn't beat plain combo-fixup-wsd.
+
+The smoke test's 30% threshold acts as a "warm-up speed minimum" on
+combined zero/near-zero inits. This iteration confirms the boundary
+sits between quarter-pos and half-pos magnitude.
+
+(The proposal predicted PASS — wrong. Smoke barrier was tighter than
+expected given iter 7's data point at 22%.)
+
+WSD change was not applied to schedule.rs (Write was blocked by
+unread file at the time); schedule remains cosine in this worktree.
+This doesn't change the smoke outcome since smoke uses its own fixed
+LR rather than cosine_warmup.

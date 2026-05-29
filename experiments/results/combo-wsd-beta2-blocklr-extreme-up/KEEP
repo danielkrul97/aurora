@@ -1,0 +1,25 @@
+WIN: Δ_BPB = -0.082544 vs post-merge baseline (2.386948 → 2.304404).
+
+STRONGEST result of the post-merge-baseline session. Seventh win.
+
+3-way composite:
+1. WSD-tail20 schedule (-0.044 solo) — warmup → flat at base_lr 80% → linear decay 20%
+2. AdamW β2 = 0.98 (-0.010 solo)
+3. per-block lr_mult [0.2x, 1.8x] linear (-0.025 solo)
+
+Linear sum -0.079. Actual -0.0825 → super-add +0.004.
+
+Diff: 32 LoC across src/transformer/schedule.rs, src/optimizer.rs, src/transformer/model.rs, src/gpu/transformer.rs. No GPU shader changes; no new params; no checkpoint bump.
+
+Key story: this is iter 50's composite with the schedule component upgraded. Iter 50 used inverse-sqrt-decay (-0.007 solo); swapping in WSD-tail20 (-0.044 solo) lifted the composite from -0.0489 to -0.0825 (+69%). The schedule axis was the bottleneck.
+
+Cumulative: old baseline 2.718824 → 2.304404 = -0.414 BPB total.
+
+Bank-best for the new baseline. Strong merge candidate after multi-seed validation.
+
+Super-additivity tracker (all 3-way composites):
+- iter 46 (inv-sqrt narrow):  linear exact
+- iter 48 (inv-sqrt wide):    +0.003
+- iter 50 (inv-sqrt extreme): +0.007
+- iter 59 (WSD extreme):      +0.004
+3-axis composites consistently show small super-additivity.

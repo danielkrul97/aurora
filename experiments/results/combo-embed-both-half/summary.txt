@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.052525
+mechanism: w_tok AND w_pos init both scaled to 0.5x baseline magnitude. embed_forward halved.
+notes: Slightly super-additive (predicted additive sum -0.044, observed -0.053; +0.009 interaction). Confirms pos-half and tok-half wins are NOT redundant — they have different mechanisms that compose constructively. Still much worse than combo-fixup-wsd (-0.308); fixup remains the dominant win.

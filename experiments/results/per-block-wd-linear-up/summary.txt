@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: -0.001143
+mechanism: Per-block weight decay multiplier 0.5x (block 0) linearly up to 1.5x (block 5). Mean preserved at 1.0. CPU+GPU step_adamw.
+notes: Essentially neutral. WD's per-step impact is bounded (lr × wd × |param| ~ 1.2e-6 typical for matmul weights), so per-block scaling can't move the needle. Confirms what's intuitive but worth confirming: WD is NOT the right axis for depth-asymmetric scaling. Per-block-LR is the active mechanism in this family. wd-attention-off (iter 30) was similarly neutral. WD-targeting in general is exhausted as a winning axis.

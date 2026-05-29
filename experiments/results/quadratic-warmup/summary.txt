@@ -1,0 +1,8 @@
+status: loss
+delta_bpb: +0.002429
+mechanism: Quadratic warmup curve: lr(step) = base_lr * ((step+1)/warmup)². Convex shape, slower than linear early.
+notes: Essentially neutral. Warmup curve axis fully mapped:
+- sqrt (concave, faster early):  +0.149 (catastrophic)
+- linear (baseline):              0
+- quadratic (convex, slower early): +0.002 (this)
+Linear warmup is well-tuned; both faster-early (sqrt) and slower-early (quadratic) variants don't help. The 200-step linear ramp is the right shape for AdamW bias correction to settle while not wasting too much budget. Warmup-curve axis exhausted.

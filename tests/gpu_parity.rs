@@ -580,14 +580,14 @@ fn full_transformer_forward_matches_cpu() {
         seq_len_max: 16,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
-    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx);
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
 
     let tokens: Vec<u32> = (0..8u32).map(|i| i % cfg.vocab as u32).collect();
     let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
 
     let (cpu_logits, cpu_cache) = cpu_model.forward(&tokens);
     let mut cpu_grads = ModelGrads::zeros(&cfg);
-    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &targets, &mut cpu_grads);
+    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &cpu_logits, &targets, &mut cpu_grads);
 
     gpu_model.zero_grad();
     let gpu_loss = gpu_model.train_step(&tokens, &targets);
@@ -619,7 +619,7 @@ fn full_transformer_training_step_matches_cpu_direction() {
         seq_len_max: 16,
     };
     let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
-    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx);
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
     let adam = AdamWConfig {
         lr: 3e-3,
         weight_decay: 0.0,
@@ -630,20 +630,20 @@ fn full_transformer_training_step_matches_cpu_direction() {
     let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
 
     // Reference initial loss
-    let (_, cache0) = cpu_model.forward(&tokens);
+    let (logits0, cache0) = cpu_model.forward(&tokens);
     let mut grads = ModelGrads::zeros(&cfg);
-    let initial_loss = cpu_model.clone().backward(&cache0, &targets, &mut grads);
+    let initial_loss = cpu_model.clone().backward(&cache0, &logits0, &targets, &mut grads);
 
     // 3 CPU steps
     for _ in 0..3 {
         grads.zero();
-        let (_, cache) = cpu_model.forward(&tokens);
-        let _ = cpu_model.backward(&cache, &targets, &mut grads);
+        let (lg, cache) = cpu_model.forward(&tokens);
+        let _ = cpu_model.backward(&cache, &lg, &targets, &mut grads);
         DecoderTransformer::clip_grads(&mut grads, 1.0);
         cpu_model.step_adamw(&grads, &adam);
     }
-    let (_, cache_after) = cpu_model.forward(&tokens);
-    let cpu_final_loss = cpu_model.clone().backward(&cache_after, &targets, &mut grads);
+    let (logits_after, cache_after) = cpu_model.forward(&tokens);
+    let cpu_final_loss = cpu_model.clone().backward(&cache_after, &logits_after, &targets, &mut grads);
     assert!(cpu_final_loss < initial_loss, "CPU loss didn't drop");
 
     // 3 GPU steps
@@ -691,7 +691,7 @@ fn softmax_ce_grad_matches_cpu() {
     kernel.dispatch_into(
         &ctx, &mut enc,
         &logits_gpu, &d_logits_gpu, &loss_seq_gpu, &targets_gpu,
-        v as u32, t as u32, 1, loss_scale,
+        v as u32, t as u32, 1, loss_scale, 0,
     );
     ctx.queue.submit(Some(enc.finish()));
 
@@ -736,7 +736,7 @@ fn evaluate_gpu_matches_cpu_evaluate() {
         seq_len_max: 32,
     };
     let cpu = DecoderTransformer::new(cfg.clone(), &mut rng);
-    let gpu = DecoderTransformerGpu::from_cpu(&cpu, ctx);
+    let gpu = DecoderTransformerGpu::from_cpu(&cpu, ctx, 1);
 
     let seq_len: usize = 32;
     let val_len: usize = 320;
@@ -804,7 +804,7 @@ fn train_step_loss_matches_cpu_baseline() {
         seq_len_max: 16,
     };
     let cpu = DecoderTransformer::new(cfg.clone(), &mut rng);
-    let mut gpu = DecoderTransformerGpu::from_cpu(&cpu, ctx);
+    let mut gpu = DecoderTransformerGpu::from_cpu(&cpu, ctx, 1);
 
     let t: usize = 8;
     let tokens: Vec<u32> = (0..t as u32).map(|i| i % cfg.vocab as u32).collect();
@@ -812,8 +812,8 @@ fn train_step_loss_matches_cpu_baseline() {
 
     // CPU loss (mean cross-entropy).
     let mut grads = ModelGrads::zeros(&cfg);
-    let (_, cache) = cpu.forward(&tokens);
-    let cpu_loss = cpu.clone().backward(&cache, &targets, &mut grads);
+    let (cpu_logits, cache) = cpu.forward(&tokens);
+    let cpu_loss = cpu.clone().backward(&cache, &cpu_logits, &targets, &mut grads);
 
     let gpu_loss = gpu.train_step(&tokens, &targets);
 
@@ -821,5 +821,236 @@ fn train_step_loss_matches_cpu_baseline() {
     assert!(
         diff < 5e-3,
         "train_step loss drift: cpu {cpu_loss} vs gpu {gpu_loss} (diff {diff})"
+    );
+}
+
+/// `train_step_batch` (one encoder / one submit / one readback) must
+/// produce gradients and loss identical to running the same B sequences
+/// through `train_step` one at a time. Validates the per-element offset
+/// wiring (tokens → embed, targets/NLL → softmax, tokens → scatter-reduce)
+/// in the batched path.
+#[test]
+fn train_step_batch_matches_sequential() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x5EED_BA7C);
+    let cfg = TransformerConfig {
+        vocab: 32,
+        d_model: 16,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 32,
+        seq_len_max: 16,
+    };
+    let cpu = DecoderTransformer::new(cfg.clone(), &mut rng);
+
+    let b = 4usize;
+    let t = 8usize;
+    let seqs: Vec<Vec<u32>> = (0..b)
+        .map(|s| (0..t as u32).map(|i| (i + s as u32 * 3) % cfg.vocab as u32).collect())
+        .collect();
+    let tgts: Vec<Vec<u32>> = seqs
+        .iter()
+        .map(|s| s.iter().map(|&x| (x + 1) % cfg.vocab as u32).collect())
+        .collect();
+
+    // Batched path.
+    let mut gpu_batched = DecoderTransformerGpu::from_cpu(&cpu, ctx.clone(), b);
+    gpu_batched.zero_grad();
+    let inputs: Vec<&[u32]> = seqs.iter().map(Vec::as_slice).collect();
+    let tgt_refs: Vec<&[u32]> = tgts.iter().map(Vec::as_slice).collect();
+    let loss_batched = gpu_batched.train_step_batch(&inputs, &tgt_refs);
+
+    // Sequential path: B separate train_step calls accumulating into grads.
+    let mut gpu_seq = DecoderTransformerGpu::from_cpu(&cpu, ctx, 1);
+    gpu_seq.zero_grad();
+    let mut loss_seq = 0.0_f32;
+    for i in 0..b {
+        loss_seq += gpu_seq.train_step(&seqs[i], &tgts[i]);
+    }
+
+    assert!(
+        (loss_batched - loss_seq).abs() < 1e-3,
+        "batched loss {loss_batched} vs sequential {loss_seq}"
+    );
+
+    for (label, va, vs) in [
+        (
+            "g_w_q",
+            gpu_batched.p.blocks[0].g_w_q.download(&gpu_batched.ctx),
+            gpu_seq.p.blocks[0].g_w_q.download(&gpu_seq.ctx),
+        ),
+        (
+            "g_w_proj",
+            gpu_batched.p.blocks[0].g_w_proj.download(&gpu_batched.ctx),
+            gpu_seq.p.blocks[0].g_w_proj.download(&gpu_seq.ctx),
+        ),
+        (
+            "g_w_tok",
+            gpu_batched.p.g_w_tok.download(&gpu_batched.ctx),
+            gpu_seq.p.g_w_tok.download(&gpu_seq.ctx),
+        ),
+        (
+            "g_w_pos",
+            gpu_batched.p.g_w_pos.download(&gpu_batched.ctx),
+            gpu_seq.p.g_w_pos.download(&gpu_seq.ctx),
+        ),
+        (
+            "g_final_gamma",
+            gpu_batched.p.g_final_gamma.download(&gpu_batched.ctx),
+            gpu_seq.p.g_final_gamma.download(&gpu_seq.ctx),
+        ),
+    ] {
+        let max_abs = va
+            .iter()
+            .zip(&vs)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_abs < 2e-3, "{label} batched vs sequential drift {max_abs}");
+    }
+}
+
+// ─── Sprint 62 (GPU port): Muon hybrid step parity ───────────────────────
+
+/// One full Muon step on identical CPU + GPU models must produce
+/// parameter buffers that agree within f32 tolerance. NS5 amplifies
+/// per-element noise vs AdamW (because the orthogonalization is
+/// nonlinear in the input matrix), but for the small 32×32 test
+/// matrices below the worst relative drift stays well under 5e-2.
+#[test]
+fn muon_hybrid_step_matches_cpu() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::optimizer::{AdamWConfig, MuonConfig};
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x4_6_0_5_5);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+    };
+    let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..8u32).map(|i| i % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let muon = MuonConfig {
+        lr: 0.02,
+        momentum: 0.95,
+        nesterov: true,
+        weight_decay: 0.0,
+        ns_steps: 5,
+    };
+    let adam = AdamWConfig {
+        lr: 3e-3,
+        weight_decay: 0.0,
+        ..AdamWConfig::default()
+    };
+
+    // CPU side: forward + backward + Muon step.
+    let mut grads = ModelGrads::zeros(&cfg);
+    let (cpu_logits, cache) = cpu_model.forward(&tokens);
+    let _ = cpu_model.backward(&cache, &cpu_logits, &targets, &mut grads);
+    DecoderTransformer::clip_grads_adamw_subset(&mut grads, 1.0);
+    cpu_model.step_muon_hybrid(&grads, &muon, &adam);
+
+    // GPU side: same.
+    gpu_model.zero_grad();
+    let _ = gpu_model.train_step(&tokens, &targets);
+    let _ = gpu_model.clip_grads_adamw_subset(1.0, false);
+    gpu_model.step_muon_hybrid(&muon, &adam);
+
+    // Spot-check params across all kinds (matrix, embed, LN).
+    let gpu_w_q = gpu_model.p.blocks[0].w_q.download(&gpu_model.ctx);
+    let err_wq = max_rel_err(&cpu_model.blocks[0].mha.w_q.w, &gpu_w_q);
+    assert!(err_wq < 5e-2, "w_q[0] drift {err_wq}");
+
+    let gpu_w_o = gpu_model.p.blocks[1].w_o.download(&gpu_model.ctx);
+    let err_wo = max_rel_err(&cpu_model.blocks[1].mha.w_o.w, &gpu_w_o);
+    assert!(err_wo < 5e-2, "w_o[1] drift {err_wo}");
+
+    let gpu_w_fc = gpu_model.p.blocks[0].w_fc.download(&gpu_model.ctx);
+    let err_fc = max_rel_err(&cpu_model.blocks[0].ffn.w_fc.w, &gpu_w_fc);
+    assert!(err_fc < 5e-2, "w_fc[0] drift {err_fc}");
+
+    let gpu_w_proj = gpu_model.p.blocks[1].w_proj.download(&gpu_model.ctx);
+    let err_proj = max_rel_err(&cpu_model.blocks[1].ffn.w_proj.w, &gpu_w_proj);
+    assert!(err_proj < 5e-2, "w_proj[1] drift {err_proj}");
+
+    let gpu_tok = gpu_model.p.w_tok.download(&gpu_model.ctx);
+    let err_tok = max_rel_err(&cpu_model.embed.w_tok, &gpu_tok);
+    assert!(err_tok < 5e-2, "w_tok drift {err_tok}");
+
+    let gpu_ln_g = gpu_model.p.blocks[0].ln1_gamma.download(&gpu_model.ctx);
+    let err_ln = max_rel_err(&cpu_model.blocks[0].ln1.gamma, &gpu_ln_g);
+    assert!(err_ln < 5e-2, "ln1.gamma[0] drift {err_ln}");
+}
+
+/// Loss must drop after a handful of Muon steps on GPU — same shape as
+/// `train_step_then_adam_loss_decreases` but routed through
+/// `step_muon_hybrid`.
+#[test]
+fn gpu_muon_hybrid_drops_loss_on_overfit() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::optimizer::{AdamWConfig, MuonConfig};
+    use aurora::transformer::{DecoderTransformer, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x4_6_0_5_6);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+    };
+    let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..8u32).map(|i| i % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let muon = MuonConfig {
+        lr: 0.02,
+        momentum: 0.95,
+        nesterov: true,
+        weight_decay: 0.0,
+        ns_steps: 5,
+    };
+    let adam = AdamWConfig {
+        lr: 3e-3,
+        weight_decay: 0.0,
+        ..AdamWConfig::default()
+    };
+
+    gpu_model.zero_grad();
+    let initial_loss = gpu_model.train_step(&tokens, &targets);
+    // Undo the grad accumulation from the loss probe before training.
+    gpu_model.zero_grad();
+
+    for _ in 0..5 {
+        gpu_model.zero_grad();
+        let _ = gpu_model.train_step(&tokens, &targets);
+        let _ = gpu_model.clip_grads_adamw_subset(1.0, true);
+        gpu_model.step_muon_hybrid(&muon, &adam);
+    }
+
+    gpu_model.zero_grad();
+    let final_loss = gpu_model.train_step(&tokens, &targets);
+    assert!(
+        final_loss.is_finite(),
+        "GPU muon: final loss NaN/Inf ({final_loss})"
+    );
+    assert!(
+        final_loss < initial_loss,
+        "GPU muon: loss did not drop: initial {initial_loss} → final {final_loss}"
     );
 }

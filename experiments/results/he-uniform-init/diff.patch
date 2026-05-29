@@ -1,0 +1,23 @@
+src/attention.rs | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+--- Changes ---
+
+src/attention.rs
+  @@ -151,9 +151,10 @@ pub struct LinearProj {
+  -    /// Xavier-uniform init.
+  +    /// He/Kaiming-uniform init matched to GELU's ReLU-like positive
+  +    /// activation: `bound = sqrt(6 / d_in)`.
+       pub fn new(d_in: usize, d_out: usize, rng: &mut impl Rng) -> Self {
+  -        let bound = (6.0_f32 / (d_in + d_out) as f32).sqrt();
+  +        let bound = (6.0_f32 / d_in as f32).sqrt();
+           let w = (0..d_in * d_out)
+               .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * bound)
+               .collect();
+  @@ -164,7 +165,7 @@ impl LinearProj {
+  -        let bound = (6.0_f32 / (d_in + d_out) as f32).sqrt() * scale;
+  +        let bound = (6.0_f32 / d_in as f32).sqrt() * scale;
+           let w = (0..d_in * d_out)
+               .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * bound)
+               .collect();
+  +4 -3

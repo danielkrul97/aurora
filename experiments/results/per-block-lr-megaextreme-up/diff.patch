@@ -1,0 +1,72 @@
+data                     |  1 +
+ src/gpu/transformer.rs   | 11 +++++++++--
+ src/transformer/model.rs | 28 ++++++++++++++++++----------
+ 3 files changed, 28 insertions(+), 12 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/gpu/transformer.rs
+  @@ -1293,13 +1293,20 @@ impl DecoderTransformerGpu {
+  -            for op in &self.grad_ops {
+  +            let n_layer = self.config.n_layer;
+  +            for (i, op) in self.grad_ops.iter().enumerate() {
+  +                let lr_mult = if i >= 4 && n_layer > 1 {
+  +                    let block_i = (i - 4) / 10;
+  +                    0.1 + 1.8 * (block_i as f32 / (n_layer - 1) as f32)
+  +                } else {
+  +                    1.0
+  +                };
+                   self.adamw.dispatch_with_bind(
+                       &mut pass,
+                       &op.adamw_bind,
+                       op.n,
+                       op.apply_wd,
+  -                    config.lr,
+  +                    config.lr * lr_mult,
+                       config.beta1,
+                       config.beta2,
+                       config.eps,
+  +9 -2
+
+src/transformer/model.rs
+  @@ -402,19 +402,27 @@ impl DecoderTransformer {
+  +        let n_layer = self.blocks.len();
+           for (li, blk) in self.blocks.iter_mut().enumerate() {
+               let ba = &mut self.adam.blocks[li];
+               let bg = &grads.blocks[li];
+  -            adamw_apply(&mut blk.ln1.gamma, &bg.d_ln1.d_gamma, &mut ba.ln1_gamma, config, bc1, bc2, false);
+  -            adamw_apply(&mut blk.ln1.beta, &bg.d_ln1.d_beta, &mut ba.ln1_beta, config, bc1, bc2, false);
+  -            adamw_apply(&mut blk.mha.w_q.w, &bg.d_mha.d_w_q.d_w, &mut ba.w_q, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.mha.w_k.w, &bg.d_mha.d_w_k.d_w, &mut ba.w_k, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.mha.w_v.w, &bg.d_mha.d_w_v.d_w, &mut ba.w_v, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut ba.w_o, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.ln2.gamma, &bg.d_ln2.d_gamma, &mut ba.ln2_gamma, config, bc1, bc2, false);
+  -            adamw_apply(&mut blk.ln2.beta, &bg.d_ln2.d_beta, &mut ba.ln2_beta, config, bc1, bc2, false);
+  -            adamw_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut ba.w_fc, config, bc1, bc2, true);
+  -            adamw_apply(&mut blk.ffn.w_proj.w, &bg.d_ffn.d_w_proj.d_w, &mut ba.w_proj, config, bc1, bc2, true);
+  +            let lr_mult = if n_layer > 1 {
+  +                0.1 + 1.8 * (li as f32 / (n_layer - 1) as f32)
+  +            } else {
+  +                1.0
+  +            };
+  +            let mut cfg_l = *config;
+  +            cfg_l.lr = config.lr * lr_mult;
+  +            adamw_apply(&mut blk.ln1.gamma, &bg.d_ln1.d_gamma, &mut ba.ln1_gamma, &cfg_l, bc1, bc2, false);
+  +            adamw_apply(&mut blk.ln1.beta, &bg.d_ln1.d_beta, &mut ba.ln1_beta, &cfg_l, bc1, bc2, false);
+  +            adamw_apply(&mut blk.mha.w_q.w, &bg.d_mha.d_w_q.d_w, &mut ba.w_q, &cfg_l, bc1, bc2, true);
+  +            adamw_apply(&mut blk.mha.w_k.w, &bg.d_mha.d_w_k.d_w, &mut ba.w_k, &cfg_l, bc1, bc2, true);
+  +            adamw_apply(&mut blk.mha.w_v.w, &bg.d_mha.d_w_v.d_w, &mut ba.w_v, &cfg_l, bc1, bc2, true);
+  +            adamw_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut ba.w_o, &cfg_l, bc1, bc2, true);
+  +            adamw_apply(&mut blk.ln2.gamma, &bg.d_ln2.d_gamma, &mut ba.ln2_gamma, &cfg_l, bc1, bc2, false);
+  +            adamw_apply(&mut blk.ln2.beta, &bg.d_ln2.d_beta, &mut ba.ln2_beta, &cfg_l, bc1, bc2, false);
+  +            adamw_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut ba.w_fc, &cfg_l, bc1, bc2, true);
+  +            adamw_apply(&mut blk.ffn.w_proj.w, &bg.d_ffn.d_w_proj.d_w, &mut ba.w_proj, &cfg_l, bc1, bc2, true);
+           }
+           adamw_apply(
+               &mut self.final_ln.gamma,
+  +18 -10

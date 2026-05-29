@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.073631
+mechanism: fixup (w_o=w_proj=0) + WSD schedule + w_tok at 0.5x baseline magnitude
+notes: ANTI-STACKING. Wins vs baseline (-0.073) but loses badly vs the parent combo-fixup-wsd (-0.308). Adding tok-half destroys ~0.234 BPB of the parent's gain (-0.308 → -0.074). The two ingredients interact destructively: with zero residual branches the model is essentially identity stack + tied LM head, and halving w_tok weakens the only learning channel that's actually working at init. Composability is NOT trivial — orthogonal-area additivity (combo-fixup-wsd) does not generalize to "any win added to the combo helps".

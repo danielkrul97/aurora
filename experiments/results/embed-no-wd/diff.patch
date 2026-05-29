@@ -1,0 +1,23 @@
+src/gpu/transformer.rs   | 2 +-
+ src/transformer/model.rs | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+--- Changes ---
+
+src/gpu/transformer.rs
+  @@ -524,7 +524,7 @@ fn build_grad_ops(
+  -    push(&p.w_tok, &p.g_w_tok, &p.m1_w_tok, &p.m2_w_tok, (v * d) as u32, true);
+  +    push(&p.w_tok, &p.g_w_tok, &p.m1_w_tok, &p.m2_w_tok, (v * d) as u32, false);
+       push(&p.w_pos, &p.g_w_pos, &p.m1_w_pos, &p.m2_w_pos, (seq_max * d) as u32, false);
+       push(&p.final_gamma, &p.g_final_gamma, &p.m1_final_gamma, &p.m2_final_gamma, d as u32, false);
+       push(&p.final_beta, &p.g_final_beta, &p.m1_final_beta, &p.m2_final_beta, d as u32, false);
+  +1 -1
+
+src/transformer/model.rs
+  @@ -391,7 +391,7 @@ impl DecoderTransformer {
+  -            true,
+  +            false,
+           );
+           adamw_apply(
+               &mut self.embed.w_pos,
+  +1 -1

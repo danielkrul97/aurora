@@ -1,0 +1,136 @@
+diff --git a/data b/data
+new file mode 120000
+index 0000000..b28914a
+--- /dev/null
++++ b/data
+@@ -0,0 +1 @@
++/home/dkrul/Projects/research-projects/aurora/data
+\ No newline at end of file
+diff --git a/src/gpu/transformer.rs b/src/gpu/transformer.rs
+index f0a81af..30bc9fa 100644
+--- a/src/gpu/transformer.rs
++++ b/src/gpu/transformer.rs
+@@ -1293,13 +1293,22 @@ impl DecoderTransformerGpu {
+                 timestamp_writes: None,
+             });
+             pass.set_pipeline(&self.adamw.pipeline);
+-            for op in &self.grad_ops {
++            let n_layer = self.config.n_layer;
++            for (i, op) in self.grad_ops.iter().enumerate() {
++                let lr_mult = if i < 2 {
++                    1.2
++                } else if i >= 4 && n_layer > 1 {
++                    let block_i = (i - 4) / 10;
++                    0.2 + 1.6 * (block_i as f32 / (n_layer - 1) as f32)
++                } else {
++                    1.0
++                };
+                 self.adamw.dispatch_with_bind(
+                     &mut pass,
+                     &op.adamw_bind,
+                     op.n,
+                     op.apply_wd,
+-                    config.lr,
++                    config.lr * lr_mult,
+                     config.beta1,
+                     config.beta2,
+                     config.eps,
+diff --git a/src/optimizer.rs b/src/optimizer.rs
+index a35a833..591313d 100644
+--- a/src/optimizer.rs
++++ b/src/optimizer.rs
+@@ -22,7 +22,7 @@ impl Default for AdamWConfig {
+         Self {
+             lr: 6e-4,
+             beta1: 0.9,
+-            beta2: 0.95,
++            beta2: 0.98,
+             eps: 1e-8,
+             weight_decay: 0.1,
+         }
+diff --git a/src/transformer/model.rs b/src/transformer/model.rs
+index ba233b9..09b0b60 100644
+--- a/src/transformer/model.rs
++++ b/src/transformer/model.rs
+@@ -384,11 +384,13 @@ impl DecoderTransformer {
+         self.step += 1;
+         let (bc1, bc2) = bias_correction(self.step as usize, config.beta1, config.beta2);
+ 
++        let mut embed_cfg = *config;
++        embed_cfg.lr = config.lr * 1.2;
+         adamw_apply(
+             &mut self.embed.w_tok,
+             &grads.embed.d_w_tok,
+             &mut self.adam.g_w_tok,
+-            config,
++            &embed_cfg,
+             bc1,
+             bc2,
+             true,
+@@ -397,24 +399,32 @@ impl DecoderTransformer {
+             &mut self.embed.w_pos,
+             &grads.embed.d_w_pos,
+             &mut self.adam.g_w_pos,
+-            config,
++            &embed_cfg,
+             bc1,
+             bc2,
+             false,
+         );
++        let n_layer = self.blocks.len();
+         for (li, blk) in self.blocks.iter_mut().enumerate() {
+             let ba = &mut self.adam.blocks[li];
+             let bg = &grads.blocks[li];
+-            adamw_apply(&mut blk.ln1.gamma, &bg.d_ln1.d_gamma, &mut ba.ln1_gamma, config, bc1, bc2, false);
+-            adamw_apply(&mut blk.ln1.beta, &bg.d_ln1.d_beta, &mut ba.ln1_beta, config, bc1, bc2, false);
+-            adamw_apply(&mut blk.mha.w_q.w, &bg.d_mha.d_w_q.d_w, &mut ba.w_q, config, bc1, bc2, true);
+-            adamw_apply(&mut blk.mha.w_k.w, &bg.d_mha.d_w_k.d_w, &mut ba.w_k, config, bc1, bc2, true);
+-            adamw_apply(&mut blk.mha.w_v.w, &bg.d_mha.d_w_v.d_w, &mut ba.w_v, config, bc1, bc2, true);
+-            adamw_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut ba.w_o, config, bc1, bc2, true);
+-            adamw_apply(&mut blk.ln2.gamma, &bg.d_ln2.d_gamma, &mut ba.ln2_gamma, config, bc1, bc2, false);
+-            adamw_apply(&mut blk.ln2.beta, &bg.d_ln2.d_beta, &mut ba.ln2_beta, config, bc1, bc2, false);
+-            adamw_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut ba.w_fc, config, bc1, bc2, true);
+-            adamw_apply(&mut blk.ffn.w_proj.w, &bg.d_ffn.d_w_proj.d_w, &mut ba.w_proj, config, bc1, bc2, true);
++            let lr_mult = if n_layer > 1 {
++                0.2 + 1.6 * (li as f32 / (n_layer - 1) as f32)
++            } else {
++                1.0
++            };
++            let mut cfg_l = *config;
++            cfg_l.lr = config.lr * lr_mult;
++            adamw_apply(&mut blk.ln1.gamma, &bg.d_ln1.d_gamma, &mut ba.ln1_gamma, &cfg_l, bc1, bc2, false);
++            adamw_apply(&mut blk.ln1.beta, &bg.d_ln1.d_beta, &mut ba.ln1_beta, &cfg_l, bc1, bc2, false);
++            adamw_apply(&mut blk.mha.w_q.w, &bg.d_mha.d_w_q.d_w, &mut ba.w_q, &cfg_l, bc1, bc2, true);
++            adamw_apply(&mut blk.mha.w_k.w, &bg.d_mha.d_w_k.d_w, &mut ba.w_k, &cfg_l, bc1, bc2, true);
++            adamw_apply(&mut blk.mha.w_v.w, &bg.d_mha.d_w_v.d_w, &mut ba.w_v, &cfg_l, bc1, bc2, true);
++            adamw_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut ba.w_o, &cfg_l, bc1, bc2, true);
++            adamw_apply(&mut blk.ln2.gamma, &bg.d_ln2.d_gamma, &mut ba.ln2_gamma, &cfg_l, bc1, bc2, false);
++            adamw_apply(&mut blk.ln2.beta, &bg.d_ln2.d_beta, &mut ba.ln2_beta, &cfg_l, bc1, bc2, false);
++            adamw_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut ba.w_fc, &cfg_l, bc1, bc2, true);
++            adamw_apply(&mut blk.ffn.w_proj.w, &bg.d_ffn.d_w_proj.d_w, &mut ba.w_proj, &cfg_l, bc1, bc2, true);
+         }
+         adamw_apply(
+             &mut self.final_ln.gamma,
+diff --git a/src/transformer/schedule.rs b/src/transformer/schedule.rs
+index eaf1831..7fdd604 100644
+--- a/src/transformer/schedule.rs
++++ b/src/transformer/schedule.rs
+@@ -11,10 +11,15 @@ pub fn cosine_warmup(
+     if step < warmup_steps {
+         return base_lr * (step as f32 + 1.0) / warmup_steps.max(1) as f32;
+     }
++    let post_warmup = (max_steps - warmup_steps).max(1);
++    let decay_len = ((post_warmup as f32) * 0.2).ceil() as usize;
++    let decay_start = max_steps.saturating_sub(decay_len);
++    if step < decay_start {
++        return base_lr;
++    }
+     if step >= max_steps {
+         return min_lr;
+     }
+-    let progress = (step - warmup_steps) as f32 / (max_steps - warmup_steps).max(1) as f32;
+-    let cos = (std::f32::consts::PI * progress).cos();
+-    min_lr + 0.5 * (base_lr - min_lr) * (1.0 + cos)
++    let decay_progress = (step - decay_start) as f32 / decay_len.max(1) as f32;
++    base_lr + (min_lr - base_lr) * decay_progress
+ }

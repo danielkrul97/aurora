@@ -1,0 +1,10 @@
+═══════════════════════════════════════
+1. ---- cpu_transformer_converges_on_copy_task stdout ----
+2. thread 'cpu_transformer_converges_on_copy_task' (2240761) panicked at tests/transformer_smoke.rs:69:5:
+loss did not decrease: first=2.0554414, last=2.1809318, baseline=2.0794415
+note: run with `RUS...
+3.     cpu_transformer_converges_on_copy_task
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+[full output: ~/.local/share/rtk/tee/1779224631_cargo_test.log]

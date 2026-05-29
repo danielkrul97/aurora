@@ -1,0 +1,71 @@
+src/gpu/transformer.rs   |  4 ++--
+ src/transformer/loss.rs  | 28 ++++++++++++++++++++++++++++
+ src/transformer/model.rs |  4 ++--
+ 3 files changed, 32 insertions(+), 4 deletions(-)
+
+--- Changes ---
+
+src/gpu/transformer.rs
+  @@ -21,7 +21,7 @@ use super::{
+  -use crate::transformer::loss::cross_entropy_with_grad;
+  +use crate::transformer::loss::cross_entropy_with_grad_zloss;
+   use crate::transformer::{DecoderTransformer, TransformerConfig};
+   
+   const GN_GROUPS_PER_TENSOR: u32 = 8;
+  @@ -989,7 +989,7 @@ impl DecoderTransformerGpu {
+  -            let (loss, grad) = cross_entropy_with_grad(row, targets[ti] as usize);
+  +            let (loss, grad) = cross_entropy_with_grad_zloss(row, targets[ti] as usize);
+               total_loss += loss;
+               for c in 0..v {
+                   d_logits[ti * v + c] = grad[c] / t as f32;
+  +2 -2
+
+src/transformer/loss.rs
+  @@ -21,6 +21,34 @@ pub fn cross_entropy_with_grad(logits: &[f32], target: usize) -> (f32, Vec<f32>)
+  +/// PaLM-style z-loss coefficient: anchors `log Σ exp(logit)` near zero
+  +/// so the partition function cannot drift mid-training. 1e-4 matches
+  +/// PaLM / Chinchilla.
+  +pub const Z_LOSS_COEF: f32 = 1e-4;
+  +
+  +/// Cross-entropy + PaLM-style z-loss. Adds `λ · z²` to the loss, where
+  +/// `z = log Σ_j exp(logit_j)`, and the matching `2λ z · softmax_j` term
+  +/// to each logit's gradient. Used in training paths only; `evaluate()`
+  +/// keeps pure CE so reported `val_bpb` stays directly comparable to
+  +/// baseline runs.
+  +#[must_use]
+  +pub fn cross_entropy_with_grad_zloss(logits: &[f32], target: usize) -> (f32, Vec<f32>) {
+  +    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+  +    let exps: Vec<f32> = logits.iter().map(|&v| (v - max).exp()).collect();
+  +    let sum: f32 = exps.iter().sum();
+  +    let log_z = max + sum.ln();
+  +    let mut grad: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+  +    let p_target = grad[target].max(1e-12);
+  +    let ce_loss = -p_target.ln();
+  +    let z_term = Z_LOSS_COEF * log_z * log_z;
+  +    let scale = 1.0 + 2.0 * Z_LOSS_COEF * log_z;
+  +    for p in grad.iter_mut() {
+  +        *p *= scale;
+  +    }
+  +    grad[target] -= 1.0;
+  +    (ce_loss + z_term, grad)
+  +}
+  +
+   #[must_use]
+   pub fn argmax(logits: &[f32]) -> usize {
+       let mut best = 0;
+  +28 -0
+
+src/transformer/model.rs
+  @@ -16,7 +16,7 @@ use crate::attention::{layer_norm_backward, layer_norm_forward, LayerNorm, Layer
+  -use crate::transformer::loss::cross_entropy_with_grad;
+  +use crate::transformer::loss::cross_entropy_with_grad_zloss;
+   
+   #[derive(Clone, Debug)]
+   pub struct TransformerConfig {
+  @@ -332,7 +332,7 @@ impl DecoderTransformer {
+  -            let (loss, mut grad) = cross_entropy_with_grad(row, targets[ti] as usize);
+  +            let (loss, mut grad) = cross_entropy_with_grad_zloss(row, targets[ti] as usize);
+               total_loss += loss;
+               for c in 0..v {
+                   d_logits[ti * v + c] = grad[c] / t as f32;
+  +2 -2

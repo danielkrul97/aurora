@@ -1,0 +1,14 @@
+2. thread 'cpu_transformer_argmax_sanity' (2282170) panicked at tests/transformer_smoke.rs:166:5:
+assertion `left == right` failed: model should learn identity prediction, got 3
+  left: 3
+ right: 2
+no...
+3. ---- cpu_transformer_converges_on_copy_task stdout ----
+4. thread 'cpu_transformer_converges_on_copy_task' (2282171) panicked at tests/transformer_smoke.rs:69:5:
+loss did not decrease: first=2.0554414, last=1.826104, baseline=2.0794415
+5.     cpu_transformer_argmax_sanity
+    cpu_transformer_converges_on_copy_task
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+[full output: ~/.local/share/rtk/tee/1779232754_cargo_test.log]

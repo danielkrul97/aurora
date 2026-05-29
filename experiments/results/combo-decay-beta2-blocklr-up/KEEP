@@ -1,0 +1,12 @@
+WIN: Δ_BPB = -0.031587 vs post-merge baseline (2.386948 → 2.355361).
+
+First win of the post-merge-baseline iter session. 3-way composite of independent smoother-dynamics axes:
+1. inverse-sqrt-decay (-0.007)
+2. β2 = 0.98 (-0.010)
+3. per-block lr_mult linear-up 0.5x → 1.5x (-0.014)
+
+Component sum = -0.031 → composite -0.0316 = perfectly LINEAR additivity, mechanisms independent.
+
+Diff: 22 LoC across src/transformer/schedule.rs, src/optimizer.rs, src/transformer/model.rs, src/gpu/transformer.rs. No GPU shader changes; no new params; no checkpoint format bump.
+
+Worth multi-seed validation before merge to confirm seed-robustness (current single-seed gain is ~3x noise floor of ~0.01).

@@ -53,9 +53,9 @@ fn cpu_transformer_converges_on_copy_task() {
         let input: Vec<u32> = tokens[..11].to_vec();
         let target: Vec<u32> = tokens[1..].to_vec();
 
-        let (_logits, cache) = model.forward(&input);
+        let (logits, cache) = model.forward(&input);
         grads.zero();
-        let loss = model.backward(&cache, &target, &mut grads);
+        let loss = model.backward(&cache, &logits, &target, &mut grads);
         DecoderTransformer::clip_grads(&mut grads, 1.0);
         model.step_adamw(&grads, &adam);
 
@@ -98,7 +98,7 @@ fn cpu_transformer_step_does_not_nan() {
         assert!(v.is_finite(), "logits contain NaN/Inf");
     }
     let mut grads = ModelGrads::zeros(&cfg);
-    let loss = model.backward(&cache, target, &mut grads);
+    let loss = model.backward(&cache, &logits, target, &mut grads);
     assert!(loss.is_finite(), "loss is NaN/Inf");
 
     let pre_clip_norm = DecoderTransformer::clip_grads(&mut grads, 1.0);
@@ -149,9 +149,9 @@ fn cpu_transformer_argmax_sanity() {
         let tok = rng.random_range(0..cfg.vocab as u32);
         let input: Vec<u32> = vec![tok; 4];
         let target: Vec<u32> = vec![tok; 4];
-        let (_, cache) = model.forward(&input);
+        let (logits, cache) = model.forward(&input);
         grads.zero();
-        let _ = model.backward(&cache, &target, &mut grads);
+        let _ = model.backward(&cache, &logits, &target, &mut grads);
         DecoderTransformer::clip_grads(&mut grads, 1.0);
         model.step_adamw(&grads, &adam);
     }

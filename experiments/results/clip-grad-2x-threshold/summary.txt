@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.055389
+mechanism: Both CPU and GPU clip_grads internally use max_norm*2.0 as the cap. CLI grad_clip=1.0 stays, internal cap = 2.0 (CPU pre-scaled) / 32.0 (GPU with batch_size mul).
+notes: Moderate regression. The 1.0 grad_clip threshold IS well-tuned — letting 2× larger gradients through destabilized training by ~0.055 BPB. Baseline observation was correct that grad_norm ≈ 16 was clipping ~1.3% off each step, but that small shaving is doing useful work. Useful negative result: the conservative clip is not over-aggressive; it's calibrated to the post-fixup-mha-only baseline's gradient distribution.

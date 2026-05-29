@@ -1,0 +1,4 @@
+status: broken_impl
+delta_bpb: n/a (sanity gate failed — no screening run)
+mechanism: combo w_o=0, w_proj=0 (fixup) + w_pos scaled to 1/4 baseline magnitude (intended also WSD schedule but not applied due to read-before-write). smoke 28% drop, threshold 30%.
+notes: confirms pos-init attenuation must stay above ~half magnitude when combined with fixup zero-init, else smoke convergence fails. Boundary lives between 1/4 and 1/2 baseline magnitude.

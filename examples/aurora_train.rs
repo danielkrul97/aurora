@@ -35,7 +35,7 @@ use aurora::bpe::BpeTokenizer;
 use aurora::checkpoint;
 #[cfg(feature = "gpu")]
 use aurora::gpu::{DecoderTransformerGpu, GpuContext};
-use aurora::optimizer::AdamWConfig;
+use aurora::optimizer::{AdamWConfig, MuonConfig};
 use aurora::text_io::{bits_per_byte, load_corpus, sample_token};
 use aurora::transformer::loss::softmax;
 #[cfg(feature = "viz")]
@@ -73,6 +73,8 @@ struct Cli {
     sample_temp: f32,
     gpu: bool,
     viz: bool,
+    muon_lr: f32,
+    muon_momentum: f32,
 }
 
 impl Cli {
@@ -99,6 +101,8 @@ impl Cli {
         let mut sample_temp: f32 = 0.8;
         let mut gpu: bool = false;
         let mut viz: bool = false;
+        let mut muon_lr: f32 = 0.02;
+        let mut muon_momentum: f32 = 0.95;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -203,6 +207,14 @@ impl Cli {
                     viz = true;
                     i += 1;
                 }
+                "--muon-lr" => {
+                    muon_lr = val(i, arg)?.parse().map_err(|e| format!("--muon-lr: {e}"))?;
+                    i += 2;
+                }
+                "--muon-momentum" => {
+                    muon_momentum = val(i, arg)?.parse().map_err(|e| format!("--muon-momentum: {e}"))?;
+                    i += 2;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
@@ -245,6 +257,8 @@ impl Cli {
             sample_temp,
             gpu,
             viz,
+            muon_lr,
+            muon_momentum,
         })
     }
 }
@@ -366,7 +380,7 @@ fn main() -> ExitCode {
         match GpuContext::new() {
             Ok(ctx) => {
                 let name = ctx.adapter_info().name.clone();
-                let gpu = DecoderTransformerGpu::from_cpu(&model, ctx);
+                let gpu = DecoderTransformerGpu::from_cpu(&model, ctx, cli.batch_size);
                 gpu_backend = Some(gpu);
                 format!("GPU ({name})")
             }
@@ -476,6 +490,54 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// One CPU optimizer step over a full batch, parallelized across batch
+/// elements with rayon. Each element runs forward+backward into its own
+/// `batch_grads[b]` (no shared mutable state); the per-element grads are
+/// then summed into `grads`, scaled by 1/B, clipped over the AdamW subset,
+/// and applied with the Muon-hybrid stepper. Returns `(batch_loss,
+/// grad_norm)`; `batch_loss` is the sum of per-element mean cross-entropies
+/// — identical to the previous serial accumulation.
+#[cfg(not(feature = "viz"))]
+#[allow(clippy::too_many_arguments)]
+fn cpu_optimizer_step(
+    model: &mut DecoderTransformer,
+    train_toks: &[u32],
+    stream_len: usize,
+    chunk_idx: usize,
+    seq_len: usize,
+    grad_clip: f32,
+    grads: &mut ModelGrads,
+    batch_grads: &mut [ModelGrads],
+    muon_cfg: &MuonConfig,
+    adam: &AdamWConfig,
+) -> (f32, f32) {
+    use rayon::prelude::*;
+
+    let batch_size = batch_grads.len();
+    let model_ref: &DecoderTransformer = model;
+    let batch_loss: f32 = batch_grads
+        .par_iter_mut()
+        .enumerate()
+        .map(|(b, g)| {
+            g.zero();
+            let p = b * stream_len + chunk_idx * seq_len;
+            let input = &train_toks[p..p + seq_len];
+            let target = &train_toks[p + 1..p + seq_len + 1];
+            let (logits, cache) = model_ref.forward(input);
+            model_ref.backward(&cache, &logits, target, g)
+        })
+        .sum();
+
+    grads.zero();
+    for g in batch_grads.iter() {
+        grads.add_assign(g);
+    }
+    grads.scale(1.0 / batch_size as f32);
+    let grad_norm = DecoderTransformer::clip_grads_adamw_subset(grads, grad_clip);
+    model.step_muon_hybrid(grads, muon_cfg, adam);
+    (batch_loss, grad_norm)
+}
+
 fn run_training_loop(mut ctx: TrainCtx) {
     let train_toks = &ctx.tokens[..ctx.n_train];
     let val_toks = &ctx.tokens[ctx.n_train..];
@@ -508,9 +570,36 @@ fn run_training_loop(mut ctx: TrainCtx) {
     }
 
     let mut grads = ModelGrads::zeros(&ctx.model.config);
+
+    // Per-batch-element gradient scratch for the CPU stepper: rayon runs
+    // forward+backward for each element into its own buffer (no shared
+    // mutable state), then we reduce into `grads`. Allocated once, only
+    // for the CPU backend (the GPU path accumulates on-device). The viz
+    // build keeps the serial path and doesn't use these.
+    #[cfg(all(feature = "gpu", not(feature = "viz")))]
+    let backend_is_cpu = ctx.gpu_backend.is_none();
+    #[cfg(all(not(feature = "gpu"), not(feature = "viz")))]
+    let backend_is_cpu = true;
+    #[cfg(not(feature = "viz"))]
+    let mut batch_grads: Vec<ModelGrads> = if backend_is_cpu {
+        (0..ctx.cli.batch_size)
+            .map(|_| ModelGrads::zeros(&ctx.model.config))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let total_start = Instant::now();
     let mut best_val = f32::INFINITY;
     let mut rng = StdRng::seed_from_u64(ctx.cli.seed.wrapping_add(0xBADC0FFEE0DDF00D));
+
+    // Muon LR cosine targets the same min/max ratio as AdamW (default
+    // 0.1×): muon_min_lr = muon_lr * (min_lr / lr).
+    let muon_min_lr = if ctx.cli.lr > 0.0 {
+        ctx.cli.muon_lr * (ctx.cli.min_lr / ctx.cli.lr)
+    } else {
+        ctx.cli.muon_lr * 0.1
+    };
 
     for epoch in ctx.start_epoch..ctx.cli.epochs as u32 {
         let epoch_start = Instant::now();
@@ -521,7 +610,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
         let report_every = (n_chunks_per_stream / 50).max(1);
 
         for chunk_idx in 0..n_chunks_per_stream {
-            // Compute LR.
+            // Compute LR (cosine warmup) for both possible steppers.
             let lr_t = cosine_warmup(
                 ctx.step as usize,
                 ctx.cli.warmup_steps,
@@ -529,11 +618,29 @@ fn run_training_loop(mut ctx: TrainCtx) {
                 ctx.cli.lr,
                 ctx.cli.min_lr,
             );
+            let muon_lr_t = cosine_warmup(
+                ctx.step as usize,
+                ctx.cli.warmup_steps,
+                total_steps_for_lr,
+                ctx.cli.muon_lr,
+                muon_min_lr,
+            );
             let adam = AdamWConfig {
                 lr: lr_t,
                 weight_decay: ctx.cli.weight_decay,
                 ..AdamWConfig::default()
             };
+            let muon_cfg = MuonConfig {
+                lr: muon_lr_t,
+                momentum: ctx.cli.muon_momentum,
+                weight_decay: 0.0,
+                ..MuonConfig::default()
+            };
+
+            // The pre-clip grad norm is only displayed on report steps
+            // (and every step under viz). On other steps we skip the
+            // GPU→host readback that fetching it would force.
+            let want_grad_norm = (chunk_idx + 1).is_multiple_of(report_every) || ctx.cli.viz;
 
             // Build the batch: one window per stream.
             let mut batch_loss = 0.0_f32;
@@ -550,72 +657,117 @@ fn run_training_loop(mut ctx: TrainCtx) {
             #[cfg(feature = "gpu")]
             if let Some(gpu) = ctx.gpu_backend.as_mut() {
                 gpu.zero_grad();
+                let mut inputs: Vec<&[u32]> = Vec::with_capacity(ctx.cli.batch_size);
+                let mut tgts: Vec<&[u32]> = Vec::with_capacity(ctx.cli.batch_size);
                 for b in 0..ctx.cli.batch_size {
-                    let stream_start = b * stream_len;
-                    let p = stream_start + chunk_idx * ctx.cli.seq_len;
-                    let input = &train_toks[p..p + ctx.cli.seq_len];
-                    let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
-                    let loss = gpu.train_step(input, target);
-                    batch_loss += loss;
-                    #[cfg(feature = "viz")]
-                    if b + 1 == ctx.cli.batch_size {
-                        last_input = input.to_vec();
-                        last_target = target.to_vec();
-                    }
+                    let p = b * stream_len + chunk_idx * ctx.cli.seq_len;
+                    inputs.push(&train_toks[p..p + ctx.cli.seq_len]);
+                    tgts.push(&train_toks[p + 1..p + ctx.cli.seq_len + 1]);
                 }
-                // train_step accumulates batch_size separate calls. Average grads.
-                grad_norm = gpu.clip_grads(ctx.cli.grad_clip * ctx.cli.batch_size as f32);
-                gpu.step_adamw(&adam);
+                // Whole batch in one encoder / one submit / one loss readback.
+                batch_loss += gpu.train_step_batch(&inputs, &tgts);
+                #[cfg(feature = "viz")]
+                {
+                    last_input = inputs[ctx.cli.batch_size - 1].to_vec();
+                    last_target = tgts[ctx.cli.batch_size - 1].to_vec();
+                }
+                // Grads are summed (not averaged) across the batch, so the
+                // clip threshold scales with batch size. Clip touches only
+                // the AdamW slice (embed + LN); matrix-grad magnitudes are
+                // bounded by Newton–Schulz inside the Muon step.
+                let clip_max = ctx.cli.grad_clip * ctx.cli.batch_size as f32;
+                grad_norm = gpu.clip_grads_adamw_subset(clip_max, want_grad_norm);
+                gpu.step_muon_hybrid(&muon_cfg, &adam);
                 ctx.step += 1;
             } else {
-                grads.zero();
-                for b in 0..ctx.cli.batch_size {
-                    let stream_start = b * stream_len;
-                    let p = stream_start + chunk_idx * ctx.cli.seq_len;
-                    let input = &train_toks[p..p + ctx.cli.seq_len];
-                    let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
-                    let (logits, cache) = ctx.model.forward(input);
-                    let loss = ctx.model.backward(&cache, target, &mut grads);
-                    batch_loss += loss;
-                    #[cfg(feature = "viz")]
-                    if b + 1 == ctx.cli.batch_size {
-                        last_cache = Some(cache);
-                        last_input = input.to_vec();
-                        last_target = target.to_vec();
-                        last_logits = logits;
-                    }
-                    #[cfg(not(feature = "viz"))]
-                    let _ = logits;
+                #[cfg(not(feature = "viz"))]
+                {
+                    let (bl, gn) = cpu_optimizer_step(
+                        &mut ctx.model,
+                        train_toks,
+                        stream_len,
+                        chunk_idx,
+                        ctx.cli.seq_len,
+                        ctx.cli.grad_clip,
+                        &mut grads,
+                        &mut batch_grads,
+                        &muon_cfg,
+                        &adam,
+                    );
+                    batch_loss += bl;
+                    grad_norm = gn;
                 }
-                grads.scale(1.0 / ctx.cli.batch_size as f32);
-                grad_norm = DecoderTransformer::clip_grads(&mut grads, ctx.cli.grad_clip);
-                ctx.model.step_adamw(&grads, &adam);
+                #[cfg(feature = "viz")]
+                {
+                    grads.zero();
+                    for b in 0..ctx.cli.batch_size {
+                        let stream_start = b * stream_len;
+                        let p = stream_start + chunk_idx * ctx.cli.seq_len;
+                        let input = &train_toks[p..p + ctx.cli.seq_len];
+                        let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
+                        let (logits, cache) = ctx.model.forward(input);
+                        let loss = ctx.model.backward(&cache, &logits, target, &mut grads);
+                        batch_loss += loss;
+                        if b + 1 == ctx.cli.batch_size {
+                            last_cache = Some(cache);
+                            last_input = input.to_vec();
+                            last_target = target.to_vec();
+                            last_logits = logits;
+                        }
+                    }
+                    grads.scale(1.0 / ctx.cli.batch_size as f32);
+                    grad_norm = DecoderTransformer::clip_grads_adamw_subset(
+                        &mut grads,
+                        ctx.cli.grad_clip,
+                    );
+                    ctx.model.step_muon_hybrid(&grads, &muon_cfg, &adam);
+                }
                 ctx.step += 1;
             }
             #[cfg(not(feature = "gpu"))]
             {
-                grads.zero();
-                for b in 0..ctx.cli.batch_size {
-                    let stream_start = b * stream_len;
-                    let p = stream_start + chunk_idx * ctx.cli.seq_len;
-                    let input = &train_toks[p..p + ctx.cli.seq_len];
-                    let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
-                    let (logits, cache) = ctx.model.forward(input);
-                    let loss = ctx.model.backward(&cache, target, &mut grads);
-                    batch_loss += loss;
-                    #[cfg(feature = "viz")]
-                    if b + 1 == ctx.cli.batch_size {
-                        last_cache = Some(cache);
-                        last_input = input.to_vec();
-                        last_target = target.to_vec();
-                        last_logits = logits;
-                    }
-                    #[cfg(not(feature = "viz"))]
-                    let _ = logits;
+                #[cfg(not(feature = "viz"))]
+                {
+                    let (bl, gn) = cpu_optimizer_step(
+                        &mut ctx.model,
+                        train_toks,
+                        stream_len,
+                        chunk_idx,
+                        ctx.cli.seq_len,
+                        ctx.cli.grad_clip,
+                        &mut grads,
+                        &mut batch_grads,
+                        &muon_cfg,
+                        &adam,
+                    );
+                    batch_loss += bl;
+                    grad_norm = gn;
                 }
-                grads.scale(1.0 / ctx.cli.batch_size as f32);
-                grad_norm = DecoderTransformer::clip_grads(&mut grads, ctx.cli.grad_clip);
-                ctx.model.step_adamw(&grads, &adam);
+                #[cfg(feature = "viz")]
+                {
+                    grads.zero();
+                    for b in 0..ctx.cli.batch_size {
+                        let stream_start = b * stream_len;
+                        let p = stream_start + chunk_idx * ctx.cli.seq_len;
+                        let input = &train_toks[p..p + ctx.cli.seq_len];
+                        let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
+                        let (logits, cache) = ctx.model.forward(input);
+                        let loss = ctx.model.backward(&cache, &logits, target, &mut grads);
+                        batch_loss += loss;
+                        if b + 1 == ctx.cli.batch_size {
+                            last_cache = Some(cache);
+                            last_input = input.to_vec();
+                            last_target = target.to_vec();
+                            last_logits = logits;
+                        }
+                    }
+                    grads.scale(1.0 / ctx.cli.batch_size as f32);
+                    grad_norm = DecoderTransformer::clip_grads_adamw_subset(
+                        &mut grads,
+                        ctx.cli.grad_clip,
+                    );
+                    ctx.model.step_muon_hybrid(&grads, &muon_cfg, &adam);
+                }
                 ctx.step += 1;
             }
 
@@ -993,8 +1145,15 @@ fn print_header(
         cli.d_model, cli.n_layer, cli.n_head, cli.d_ff, cli.seq_len
     );
     println!(
-        " optim        : lr {:.2e} → {:.2e}, warmup {} step, wd {}, clip {}",
-        cli.lr, cli.min_lr, cli.warmup_steps, cli.weight_decay, cli.grad_clip
+        " optim        : muon hybrid | matrix lr {:.2e}, momentum {} | embed/LN adamw lr {:.2e} → {:.2e}",
+        cli.muon_lr,
+        cli.muon_momentum,
+        cli.lr,
+        cli.min_lr,
+    );
+    println!(
+        "              : warmup {} step, wd {}, clip {}",
+        cli.warmup_steps, cli.weight_decay, cli.grad_clip
     );
     println!(" epochs       : {} (from {start_epoch}) batch {}", cli.epochs, cli.batch_size);
     println!(" checkpoint   : {}", cli.checkpoint.display());
@@ -1046,11 +1205,12 @@ impl MetricsWriter {
         params: usize,
     ) {
         let line = format!(
-            "{{\"event\":\"run\",\"corpus\":\"{}\",\"corpus_bytes\":{corpus_bytes},\"tokens\":{n_tokens},\"vocab\":{actual_vocab},\"d_model\":{},\"n_layer\":{},\"n_head\":{},\"d_ff\":{},\"seq_len\":{},\"batch_size\":{},\"epochs\":{},\"start_epoch\":{start_epoch},\"lr\":{:.6e},\"min_lr\":{:.6e},\"warmup_steps\":{},\"weight_decay\":{},\"grad_clip\":{},\"seed\":{},\"backend\":\"{backend}\",\"params\":{params}}}\n",
+            "{{\"event\":\"run\",\"corpus\":\"{}\",\"corpus_bytes\":{corpus_bytes},\"tokens\":{n_tokens},\"vocab\":{actual_vocab},\"d_model\":{},\"n_layer\":{},\"n_head\":{},\"d_ff\":{},\"seq_len\":{},\"batch_size\":{},\"epochs\":{},\"start_epoch\":{start_epoch},\"lr\":{:.6e},\"min_lr\":{:.6e},\"warmup_steps\":{},\"weight_decay\":{},\"grad_clip\":{},\"seed\":{},\"backend\":\"{backend}\",\"params\":{params},\"optimizer\":\"muon\",\"muon_lr\":{:.6e},\"muon_momentum\":{}}}\n",
             cli.corpus.display(),
             cli.d_model, cli.n_layer, cli.n_head, cli.d_ff, cli.seq_len,
             cli.batch_size, cli.epochs, cli.lr, cli.min_lr, cli.warmup_steps,
             cli.weight_decay, cli.grad_clip, cli.seed,
+            cli.muon_lr, cli.muon_momentum,
         );
         let _ = self.inner.write_all(line.as_bytes());
         self.flush();

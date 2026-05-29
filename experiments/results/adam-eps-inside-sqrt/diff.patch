@@ -1,0 +1,29 @@
+data                 | 1 +
+ src/gpu/optimizer.rs | 2 +-
+ src/optimizer.rs     | 2 +-
+ 3 files changed, 3 insertions(+), 2 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/gpu/optimizer.rs
+  @@ -41,7 +41,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  -    var step = p.lr * m1_hat / (sqrt(m2_hat) + p.eps);
+  +    var step = p.lr * m1_hat / sqrt(m2_hat + p.eps * p.eps);
+       if (p.apply_wd != 0u) {
+           step = step + p.lr * p.weight_decay * params[i];
+       }
+  +1 -1
+
+src/optimizer.rs
+  @@ -67,7 +67,7 @@ pub fn adamw_apply(
+  -        let mut step = config.lr * m1_hat / (m2_hat.sqrt() + config.eps);
+  +        let mut step = config.lr * m1_hat / (m2_hat + config.eps * config.eps).sqrt();
+           if apply_wd {
+               step += config.lr * config.weight_decay * params[i];
+           }
+  +1 -1

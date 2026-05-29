@@ -1,0 +1,12 @@
+NEW BANK-BEST WIN: delta_bpb = -0.375609 (2.718824 → 2.343215). +0.067 BPB better than the prior best (combo-fixup-wsd at -0.308).
+
+Composability map updated:
+- fixup-mha-only + WSD: -0.376 (this), mildly SUB-additive +0.005
+- full fixup + WSD (iter 10): -0.308, SUPER-additive +0.008
+- The init change with FFN preserved leaves less marginal headroom for WSD vs the more aggressive full-fixup init. Suggests a soft "ceiling" effect — the optimization landscape has finite room for improvement at this scale/budget.
+
+Project target: <1.5 BPB. Current: 2.343. Still ~0.84 BPB away. From baseline 2.719 we've recovered 0.376 — about 31% of the gap closed in single-epoch screening territory.
+
+Multi-seed validation strongly recommended. Promising future composites:
+- combo-fixup-mha-only-wsd + embed-both-half (predicted ~-0.43 if mildly sub-additive holds, but composability with embedding is uncertain — it sub-stacked with WSD).
+- fixup-mha-only at deeper layers only (depth-cond variant).

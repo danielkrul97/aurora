@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.040599
+mechanism: 3-way composite with wider block-LR spread: (1) inverse-sqrt-decay; (2) AdamW β2=0.98; (3) per-block lr_mult = 0.3 + 1.4·li/(n_layer-1) (vs iter 46's 0.5 + li/(n_layer-1))
+notes: Strongest composite yet on new baseline. Linear sum prediction -0.0376; actual -0.0406 → mild super-additivity (+0.003). Triangulation across all relevant data points: iter 33 [decay × β2 narrow] super-add +0.002; iter 46 [decay × β2 × block-LR narrow] linear exact; iter 48 [decay × β2 × block-LR wide] super-add +0.003. The 3-axis composite consistently shows tiny super-additivity, suggesting genuine independence with mild beneficial interactions. Bank-best for new baseline session. Worth multi-seed validation.

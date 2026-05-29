@@ -1,0 +1,16 @@
+{"event":"run","corpus":"data/tiny_200k.txt","corpus_bytes":200000,"tokens":96805,"vocab":512,"d_model":64,"n_layer":2,"n_head":2,"d_ff":128,"seq_len":32,"batch_size":8,"epochs":1,"start_epoch":0,"lr":6.000000e-4,"min_lr":6.000000e-5,"warmup_steps":10,"weight_decay":0.1,"grad_clip":1,"seed":42,"backend":"CPU","params":100992,"optimizer":"muon","muon_lr":2.000000e-2,"muon_momentum":0.95}
+{"event":"step","epoch":0,"step":6,"loss":6.209486,"bpb":4.363764,"lr":3.600000e-4,"grad_norm":0.819464,"elapsed_s":0.271}
+{"event":"step","epoch":0,"step":12,"loss":6.089277,"bpb":4.324839,"lr":5.999878e-4,"grad_norm":0.811494,"elapsed_s":0.539}
+{"event":"step","epoch":0,"step":18,"loss":5.992239,"bpb":4.283749,"lr":5.994007e-4,"grad_norm":0.684573,"elapsed_s":0.810}
+{"event":"step","epoch":0,"step":24,"loss":5.865910,"bpb":4.246368,"lr":5.979349e-4,"grad_norm":0.678850,"elapsed_s":1.082}
+{"event":"step","epoch":0,"step":30,"loss":5.784387,"bpb":4.205482,"lr":5.955952e-4,"grad_norm":0.618073,"elapsed_s":1.348}
+{"event":"step","epoch":0,"step":36,"loss":5.698571,"bpb":4.167486,"lr":5.923891e-4,"grad_norm":0.601743,"elapsed_s":1.615}
+{"event":"step","epoch":0,"step":42,"loss":5.606389,"bpb":4.132581,"lr":5.883272e-4,"grad_norm":0.616807,"elapsed_s":1.924}
+{"event":"step","epoch":0,"step":48,"loss":5.541014,"bpb":4.101011,"lr":5.834227e-4,"grad_norm":0.658313,"elapsed_s":2.306}
+{"event":"step","epoch":0,"step":54,"loss":5.569592,"bpb":4.072315,"lr":5.776915e-4,"grad_norm":0.555369,"elapsed_s":2.593}
+{"event":"step","epoch":0,"step":60,"loss":5.525186,"bpb":4.046268,"lr":5.711525e-4,"grad_norm":0.508987,"elapsed_s":2.863}
+{"event":"step","epoch":0,"step":66,"loss":5.383633,"bpb":4.022235,"lr":5.638269e-4,"grad_norm":0.561479,"elapsed_s":3.133}
+{"event":"step","epoch":0,"step":72,"loss":5.332358,"bpb":3.998466,"lr":5.557386e-4,"grad_norm":0.580648,"elapsed_s":3.400}
+{"event":"step","epoch":0,"step":78,"loss":5.609899,"bpb":3.983423,"lr":5.469139e-4,"grad_norm":0.629609,"elapsed_s":3.683}
+{"event":"step","epoch":0,"step":84,"loss":5.335746,"bpb":3.969286,"lr":5.373817e-4,"grad_norm":0.576578,"elapsed_s":3.967}
+{"event":"step","epoch":0,"step":90,"loss":5.346059,"bpb":3.953967,"lr":5.271731e-4,"grad_norm":0.633372,"elapsed_s":4.247}

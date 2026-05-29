@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: -0.013536
+mechanism: Per-block LR multiplier: block 0 = 0.5x, linearly up to block 5 = 1.5x. Mean preserved at 1.0x.
+notes: -0.013 improvement, below the -0.02 win threshold. Confirms asymmetry: linear-down was +0.018 (hurt), linear-up is -0.014 (helps). Net asymmetry ~0.032 BPB — direction of per-block LR matters. Deep blocks benefit from larger LR for from-scratch byte-LM, consistent with conventional intuition that they do high-level abstractions requiring more update magnitude. Joins smoother-dynamics family (β2=0.98, inverse-sqrt-decay, this) at ~-0.01 individual magnitude. NEW third axis for compounding — possible 3-way composite candidate (β2 × decay × per-block-up) might push past -0.02 threshold.

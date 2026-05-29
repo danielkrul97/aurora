@@ -1,0 +1,15 @@
+src/transformer/embedding.rs | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+--- Changes ---
+
+src/transformer/embedding.rs
+  @@ -34,9 +34,7 @@ impl EmbedWeights {
+  -        let w_pos: Vec<f32> = (0..seq_len_max * d_model)
+  -            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * scale)
+  -            .collect();
+  +        let w_pos: Vec<f32> = vec![0.0; seq_len_max * d_model];
+           Self {
+               w_tok,
+               w_pos,
+  +1 -3

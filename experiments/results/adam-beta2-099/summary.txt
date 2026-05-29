@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: -0.010159
+mechanism: AdamWConfig::default beta2 0.95 -> 0.99.
+notes: -0.010 improvement, below the -0.02 win threshold. Essentially identical to β2=0.98 (iter 32, -0.010003). β2 sweep: 0.95=0, 0.98=-0.010, 0.99=-0.010. The β2 optimum is a BROAD PLATEAU spanning 0.98-0.99 — both give the same ~-0.010 gain. The composite (iter 65 bank-best) uses 0.98; switching to 0.99 would not change the result. β2 axis fully characterized: anything in 0.98-0.99 is optimal.

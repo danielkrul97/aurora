@@ -17,10 +17,12 @@ use super::{
     AdamWKernel, CausalMhaBackwardKernel, CausalMhaForwardKernel, EmbedScatterAddKernel,
     EmbedScatterReduceKernel, GeluBackwardKernel, GeluKernel, GemmKernel, GemmTransposeBKernel,
     GpuContext, GradNormFinalizeKernel, GradNormSqReduceKernel, LayerNormBackwardKernel,
-    LayerNormForwardKernel, OuterProductAccumKernel, RowReduceAddKernel, ScaleByBufferKernel,
-    SoftmaxCrossEntropyKernel, TokenPosEmbedKernel, VectorAddKernel, ZeroBufferKernel,
+    LayerNormForwardKernel, MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel,
+    MuonLoadStoreKernel, MuonMomentumKernel, MuonStepXKernel, OuterProductAccumKernel,
+    RowReduceAddKernel, ScaleByBufferKernel, SoftmaxCrossEntropyKernel, TokenPosEmbedKernel,
+    VectorAddKernel, ZeroBufferKernel,
 };
-use crate::optimizer::{bias_correction, AdamWConfig};
+use crate::optimizer::{bias_correction, AdamWConfig, MuonConfig};
 use crate::transformer::{DecoderTransformer, TransformerConfig};
 
 const GN_GROUPS_PER_TENSOR: u32 = 8;
@@ -49,6 +51,12 @@ pub struct DecoderTransformerGpu {
     pub gn_sq: GradNormSqReduceKernel,
     pub gn_finalize: GradNormFinalizeKernel,
     pub scaleb_buf: ScaleByBufferKernel,
+    pub muon_momentum: MuonMomentumKernel,
+    pub muon_frob_inv: MuonFrobInvKernel,
+    pub muon_load_store: MuonLoadStoreKernel,
+    pub muon_combine_b: MuonCombineBKernel,
+    pub muon_step_x: MuonStepXKernel,
+    pub muon_apply: MuonApplyKernel,
     pub embed_scatter_reduce: EmbedScatterReduceKernel,
     pub single_embed: SingleTokenEmbedKernel,
     pub mha_kv: MhaKvCacheKernel,
@@ -70,6 +78,20 @@ pub struct DecoderTransformerGpu {
     // each of zero_grad / clip_grads / step_adamw.
     pub(crate) grad_ops: Vec<GradOps>,
     pub(crate) gn_finalize_bind: wgpu::BindGroup,
+    // Zeroes `gn_partials_flat` on-GPU at the start of the subset clip so
+    // finalize (which sums the whole buffer) never picks up stale
+    // matrix-slot partials — replaces a per-step host zero-fill + upload.
+    pub(crate) gn_partials_zero_bind: wgpu::BindGroup,
+
+    // Muon hybrid step: scratch buffers (sized for the largest matrix),
+    // per-matrix cached bind groups, and one shared set of bind groups
+    // for the scratch-only stages. `muon_scratch` owns the buffers that
+    // `muon_shared` bind groups reference — the compiler can't see the
+    // indirect ownership, hence the allow.
+    #[allow(dead_code)]
+    pub(crate) muon_scratch: MuonScratchGpu,
+    pub(crate) muon_ops: Vec<MuonOps>,
+    pub(crate) muon_shared: MuonSharedOps,
 
     // Persistent activation arena. All buffers sized to `seq_len_max`;
     // train_step reuses them every step (no per-step allocation).
@@ -146,6 +168,11 @@ pub(crate) struct LayerBackwardOps {
 pub(crate) struct GradOps {
     pub n: u32,
     pub apply_wd: bool,
+    /// `true` for the 6 matrix params per block that Muon owns in
+    /// hybrid mode (Q/K/V/O, FC, Proj). Used by `step_muon_hybrid` to
+    /// skip the AdamW dispatch for matrix params and by
+    /// `clip_grads_adamw_subset` to exclude them from the clip norm.
+    pub is_matrix: bool,
     pub gn_offset: u32,
     pub zerob_bind: wgpu::BindGroup,
     pub adamw_bind: wgpu::BindGroup,
@@ -223,7 +250,7 @@ pub(crate) struct Activations {
 }
 
 impl Activations {
-    fn new(ctx: &GpuContext, cfg: &TransformerConfig) -> Self {
+    fn new(ctx: &GpuContext, cfg: &TransformerConfig, max_batch: usize) -> Self {
         let t = cfg.seq_len_max;
         let d = cfg.d_model;
         let d_ff = cfg.d_ff;
@@ -232,6 +259,10 @@ impl Activations {
         let td = t * d;
         let td_ff = t * d_ff;
         let probs_cap = n_head * t * t;
+        // Token / target / per-token-loss buffers hold the whole batch
+        // (B sequences laid out contiguously) so `train_step_batch` can
+        // run all sequences in one submission with a single readback.
+        let bt = max_batch.max(1) * t;
 
         let layers: Vec<LayerCache> = (0..cfg.n_layer)
             .map(|_| LayerCache {
@@ -257,7 +288,7 @@ impl Activations {
         Self {
             layers,
             z_chain,
-            tok_buf: GpuBuffer::empty(ctx, "tok", t),
+            tok_buf: GpuBuffer::empty(ctx, "tok", bt),
             h0: GpuBuffer::empty(ctx, "h0", td),
             ln1_mean: GpuBuffer::empty(ctx, "ln1_mean", t),
             ln2_mean: GpuBuffer::empty(ctx, "ln2_mean", t),
@@ -270,8 +301,8 @@ impl Activations {
             h_final: GpuBuffer::empty(ctx, "h_final", td),
             logits_buf: GpuBuffer::empty(ctx, "logits", t * v),
             d_logits_buf: GpuBuffer::empty(ctx, "d_logits", t * v),
-            loss_seq_buf: GpuBuffer::empty(ctx, "loss_seq", t),
-            targets_buf: GpuBuffer::empty(ctx, "targets", t),
+            loss_seq_buf: GpuBuffer::empty(ctx, "loss_seq", bt),
+            targets_buf: GpuBuffer::empty(ctx, "targets", bt),
             d_h_final: GpuBuffer::empty(ctx, "d_h_final", td),
             d_pre_final: GpuBuffer::empty(ctx, "d_pre_final", td),
             d_h_post: GpuBuffer::empty(ctx, "d_h_post", td_ff),
@@ -343,6 +374,7 @@ pub struct GpuBlock {
 
     pub m1: BlockAdamMoments,
     pub m2: BlockAdamMoments,
+    pub mu: BlockMuonMoments,
 }
 
 pub struct BlockAdamMoments {
@@ -356,6 +388,60 @@ pub struct BlockAdamMoments {
     pub ln2_beta: GpuBuffer,
     pub w_fc: GpuBuffer,
     pub w_proj: GpuBuffer,
+}
+
+/// Muon momentum buffers per block — only for the 6 matrix params.
+/// LN γ/β + biases stay on AdamW even in hybrid mode.
+pub struct BlockMuonMoments {
+    pub w_q: GpuBuffer,
+    pub w_k: GpuBuffer,
+    pub w_v: GpuBuffer,
+    pub w_o: GpuBuffer,
+    pub w_fc: GpuBuffer,
+    pub w_proj: GpuBuffer,
+}
+
+/// GPU scratch shared across all matrix params for one Muon step.
+/// Buffers are sized for the largest matrix in the model so a single
+/// allocation covers every parameter.
+pub(crate) struct MuonScratchGpu {
+    pub update: GpuBuffer,
+    pub x_cur: GpuBuffer,
+    pub bx_buf: GpuBuffer,
+    pub a_buf: GpuBuffer,
+    pub a_sq: GpuBuffer,
+    pub b_buf: GpuBuffer,
+    pub frob_partials: GpuBuffer,
+    pub frob_result: GpuBuffer,
+}
+
+/// One `MuonOps` per matrix parameter holds cached bind groups that
+/// reference per-matrix buffers (param, grad, momentum). All bind
+/// groups that touch only scratch buffers live in `MuonSharedOps` and
+/// are reused across matrices.
+pub(crate) struct MuonOps {
+    pub rows: u32,
+    pub cols: u32,
+    pub n: u32,
+    pub apply_wd: bool,
+    pub momentum_bind: wgpu::BindGroup,
+    pub apply_bind: wgpu::BindGroup,
+}
+
+/// Bind groups for the scratch-only stages of the Muon step (Frobenius
+/// reduce + inv, NS5 matmul/combine, transpose load/store). One set
+/// reused across every matrix in `step_muon_hybrid`.
+pub(crate) struct MuonSharedOps {
+    pub frob_reduce_bind: wgpu::BindGroup,   // update → frob_partials
+    pub frob_inv_bind: wgpu::BindGroup,      // frob_partials → frob_result
+    pub scale_update_bind: wgpu::BindGroup,  // update *= frob_result[1]
+    pub load_bind: wgpu::BindGroup,          // update → x_cur (transpose-aware)
+    pub store_bind: wgpu::BindGroup,         // x_cur → update (transpose-aware)
+    pub xxt_bind: wgpu::BindGroup,           // X @ X^T → a_buf (gemm_t)
+    pub aa_bind: wgpu::BindGroup,            // A @ A → a_sq (gemm)
+    pub combine_b_bind: wgpu::BindGroup,     // B = b·A + c·A_sq
+    pub bx_bind: wgpu::BindGroup,            // B @ X → bx_buf (gemm)
+    pub step_x_bind: wgpu::BindGroup,        // X = a·X + BX
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -517,11 +603,13 @@ fn build_grad_ops(
                     m1: &GpuBuffer,
                     m2: &GpuBuffer,
                     n: u32,
-                    apply_wd: bool| {
+                    apply_wd: bool,
+                    is_matrix: bool| {
         let gn_offset = ops.len() as u32 * GN_GROUPS_PER_TENSOR;
         ops.push(GradOps {
             n,
             apply_wd,
+            is_matrix,
             gn_offset,
             zerob_bind: zerob.build_bind(ctx, grad),
             adamw_bind: adamw.build_bind(ctx, params, grad, m1, m2),
@@ -530,21 +618,102 @@ fn build_grad_ops(
         });
     };
 
-    push(&p.w_tok, &p.g_w_tok, &p.m1_w_tok, &p.m2_w_tok, (v * d) as u32, true);
-    push(&p.w_pos, &p.g_w_pos, &p.m1_w_pos, &p.m2_w_pos, (seq_max * d) as u32, false);
-    push(&p.final_gamma, &p.g_final_gamma, &p.m1_final_gamma, &p.m2_final_gamma, d as u32, false);
-    push(&p.final_beta, &p.g_final_beta, &p.m1_final_beta, &p.m2_final_beta, d as u32, false);
+    push(&p.w_tok, &p.g_w_tok, &p.m1_w_tok, &p.m2_w_tok, (v * d) as u32, true, false);
+    push(&p.w_pos, &p.g_w_pos, &p.m1_w_pos, &p.m2_w_pos, (seq_max * d) as u32, false, false);
+    push(&p.final_gamma, &p.g_final_gamma, &p.m1_final_gamma, &p.m2_final_gamma, d as u32, false, false);
+    push(&p.final_beta, &p.g_final_beta, &p.m1_final_beta, &p.m2_final_beta, d as u32, false, false);
     for blk in &p.blocks {
-        push(&blk.ln1_gamma, &blk.g_ln1_gamma, &blk.m1.ln1_gamma, &blk.m2.ln1_gamma, d as u32, false);
-        push(&blk.ln1_beta, &blk.g_ln1_beta, &blk.m1.ln1_beta, &blk.m2.ln1_beta, d as u32, false);
-        push(&blk.w_q, &blk.g_w_q, &blk.m1.w_q, &blk.m2.w_q, (d * d) as u32, true);
-        push(&blk.w_k, &blk.g_w_k, &blk.m1.w_k, &blk.m2.w_k, (d * d) as u32, true);
-        push(&blk.w_v, &blk.g_w_v, &blk.m1.w_v, &blk.m2.w_v, (d * d) as u32, true);
-        push(&blk.w_o, &blk.g_w_o, &blk.m1.w_o, &blk.m2.w_o, (d * d) as u32, true);
-        push(&blk.ln2_gamma, &blk.g_ln2_gamma, &blk.m1.ln2_gamma, &blk.m2.ln2_gamma, d as u32, false);
-        push(&blk.ln2_beta, &blk.g_ln2_beta, &blk.m1.ln2_beta, &blk.m2.ln2_beta, d as u32, false);
-        push(&blk.w_fc, &blk.g_w_fc, &blk.m1.w_fc, &blk.m2.w_fc, (d * d_ff) as u32, true);
-        push(&blk.w_proj, &blk.g_w_proj, &blk.m1.w_proj, &blk.m2.w_proj, (d * d_ff) as u32, true);
+        push(&blk.ln1_gamma, &blk.g_ln1_gamma, &blk.m1.ln1_gamma, &blk.m2.ln1_gamma, d as u32, false, false);
+        push(&blk.ln1_beta, &blk.g_ln1_beta, &blk.m1.ln1_beta, &blk.m2.ln1_beta, d as u32, false, false);
+        push(&blk.w_q, &blk.g_w_q, &blk.m1.w_q, &blk.m2.w_q, (d * d) as u32, true, true);
+        push(&blk.w_k, &blk.g_w_k, &blk.m1.w_k, &blk.m2.w_k, (d * d) as u32, true, true);
+        push(&blk.w_v, &blk.g_w_v, &blk.m1.w_v, &blk.m2.w_v, (d * d) as u32, true, true);
+        push(&blk.w_o, &blk.g_w_o, &blk.m1.w_o, &blk.m2.w_o, (d * d) as u32, true, true);
+        push(&blk.ln2_gamma, &blk.g_ln2_gamma, &blk.m1.ln2_gamma, &blk.m2.ln2_gamma, d as u32, false, false);
+        push(&blk.ln2_beta, &blk.g_ln2_beta, &blk.m1.ln2_beta, &blk.m2.ln2_beta, d as u32, false, false);
+        push(&blk.w_fc, &blk.g_w_fc, &blk.m1.w_fc, &blk.m2.w_fc, (d * d_ff) as u32, true, true);
+        push(&blk.w_proj, &blk.g_w_proj, &blk.m1.w_proj, &blk.m2.w_proj, (d * d_ff) as u32, true, true);
+    }
+    ops
+}
+
+/// Sized for the largest matrix in the model. All Muon params reuse
+/// this scratch in sequence — fine because the orchestrator runs them
+/// sequentially anyway.
+fn alloc_muon_scratch(ctx: &GpuContext, cfg: &TransformerConfig) -> MuonScratchGpu {
+    let d = cfg.d_model;
+    let d_ff = cfg.d_ff;
+    let max_mn = d * d_ff;
+    // For Aurora's nano layout, min(rows, cols) == d for every matrix
+    // (Q/K/V/O is d×d, W_fc is d×d_ff, W_proj is d_ff×d), so the m×m
+    // NS work buffers are always d² floats.
+    let max_mm = d * d;
+    MuonScratchGpu {
+        update: GpuBuffer::empty(ctx, "muon_update", max_mn),
+        x_cur: GpuBuffer::empty(ctx, "muon_x_cur", max_mn),
+        bx_buf: GpuBuffer::empty(ctx, "muon_bx", max_mn),
+        a_buf: GpuBuffer::empty(ctx, "muon_a", max_mm),
+        a_sq: GpuBuffer::empty(ctx, "muon_a_sq", max_mm),
+        b_buf: GpuBuffer::empty(ctx, "muon_b", max_mm),
+        frob_partials: GpuBuffer::zeros(ctx, "muon_frob_partials", 8),
+        frob_result: GpuBuffer::zeros(ctx, "muon_frob_result", 2),
+    }
+}
+
+fn build_muon_shared_ops(
+    ctx: &GpuContext,
+    scratch: &MuonScratchGpu,
+    gn_sq: &GradNormSqReduceKernel,
+    frob_inv: &MuonFrobInvKernel,
+    scaleb_buf: &ScaleByBufferKernel,
+    load_store: &MuonLoadStoreKernel,
+    gemm: &GemmKernel,
+    gemm_t: &GemmTransposeBKernel,
+    combine_b: &MuonCombineBKernel,
+    step_x: &MuonStepXKernel,
+) -> MuonSharedOps {
+    MuonSharedOps {
+        frob_reduce_bind: gn_sq.build_bind(ctx, &scratch.update, &scratch.frob_partials),
+        frob_inv_bind: frob_inv.build_bind(ctx, &scratch.frob_partials, &scratch.frob_result),
+        scale_update_bind: scaleb_buf.build_bind(ctx, &scratch.update, &scratch.frob_result),
+        load_bind: load_store.build_bind(ctx, &scratch.update, &scratch.x_cur),
+        store_bind: load_store.build_bind(ctx, &scratch.x_cur, &scratch.update),
+        xxt_bind: gemm_t.build_bind(ctx, &scratch.x_cur, &scratch.x_cur, &scratch.a_buf),
+        aa_bind: gemm.build_bind(ctx, &scratch.a_buf, &scratch.a_buf, &scratch.a_sq),
+        combine_b_bind: combine_b.build_bind(ctx, &scratch.a_buf, &scratch.a_sq, &scratch.b_buf),
+        bx_bind: gemm.build_bind(ctx, &scratch.b_buf, &scratch.x_cur, &scratch.bx_buf),
+        step_x_bind: step_x.build_bind(ctx, &scratch.x_cur, &scratch.bx_buf),
+    }
+}
+
+fn build_muon_ops(
+    ctx: &GpuContext,
+    p: &GpuParams,
+    cfg: &TransformerConfig,
+    momentum: &MuonMomentumKernel,
+    apply: &MuonApplyKernel,
+    scratch: &MuonScratchGpu,
+) -> Vec<MuonOps> {
+    let d = cfg.d_model as u32;
+    let d_ff = cfg.d_ff as u32;
+    let mut ops = Vec::with_capacity(cfg.n_layer * 6);
+    let mut push = |param: &GpuBuffer, grad: &GpuBuffer, m: &GpuBuffer, rows: u32, cols: u32| {
+        ops.push(MuonOps {
+            rows,
+            cols,
+            n: rows * cols,
+            apply_wd: false,
+            momentum_bind: momentum.build_bind(ctx, grad, m, &scratch.update),
+            apply_bind: apply.build_bind(ctx, param, &scratch.update),
+        });
+    };
+    for blk in &p.blocks {
+        push(&blk.w_q, &blk.g_w_q, &blk.mu.w_q, d, d);
+        push(&blk.w_k, &blk.g_w_k, &blk.mu.w_k, d, d);
+        push(&blk.w_v, &blk.g_w_v, &blk.mu.w_v, d, d);
+        push(&blk.w_o, &blk.g_w_o, &blk.mu.w_o, d, d);
+        push(&blk.w_fc, &blk.g_w_fc, &blk.mu.w_fc, d, d_ff);
+        push(&blk.w_proj, &blk.g_w_proj, &blk.mu.w_proj, d_ff, d);
     }
     ops
 }
@@ -579,6 +748,14 @@ fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) ->
         w_fc: zeros_dff(),
         w_proj: zeros_dff(),
     };
+    let mu = BlockMuonMoments {
+        w_q: zeros_dd(),
+        w_k: zeros_dd(),
+        w_v: zeros_dd(),
+        w_o: zeros_dd(),
+        w_fc: zeros_dff(),
+        w_proj: zeros_dff(),
+    };
     GpuBlock {
         ln1_gamma: GpuBuffer::from_slice(ctx, "ln1_g", &cpu.ln1.gamma),
         ln1_beta: GpuBuffer::from_slice(ctx, "ln1_b", &cpu.ln1.beta),
@@ -602,13 +779,14 @@ fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) ->
         g_w_proj: zeros_dff(),
         m1,
         m2,
+        mu,
     }
 }
 
 impl DecoderTransformerGpu {
     /// Upload a CPU `DecoderTransformer` to the GPU. The two then run
     /// in parallel; `to_cpu()` snapshots the GPU back.
-    pub fn from_cpu(cpu: &DecoderTransformer, ctx: GpuContext) -> Self {
+    pub fn from_cpu(cpu: &DecoderTransformer, ctx: GpuContext, max_batch: usize) -> Self {
         let cfg = cpu.config.clone();
         let v = cfg.vocab;
         let d = cfg.d_model;
@@ -646,6 +824,12 @@ impl DecoderTransformerGpu {
         let gn_sq = GradNormSqReduceKernel::new(&ctx);
         let gn_finalize = GradNormFinalizeKernel::new(&ctx);
         let scaleb_buf = ScaleByBufferKernel::new(&ctx);
+        let muon_momentum = MuonMomentumKernel::new(&ctx);
+        let muon_frob_inv = MuonFrobInvKernel::new(&ctx);
+        let muon_load_store = MuonLoadStoreKernel::new(&ctx);
+        let muon_combine_b = MuonCombineBKernel::new(&ctx);
+        let muon_step_x = MuonStepXKernel::new(&ctx);
+        let muon_apply = MuonApplyKernel::new(&ctx);
         let gemm = GemmKernel::new(&ctx);
         let gemm_t = GemmTransposeBKernel::new(&ctx);
         let gelu_fwd = GeluKernel::new(&ctx);
@@ -668,7 +852,14 @@ impl DecoderTransformerGpu {
             build_grad_ops(&ctx, &p, &cfg, &zerob, &adamw, &gn_sq, &scaleb_buf,
                            &gn_partials_flat, &gn_result);
         let gn_finalize_bind = gn_finalize.build_bind(&ctx, &gn_partials_flat, &gn_result);
-        let acts = Activations::new(&ctx, &cfg);
+        let gn_partials_zero_bind = zerob.build_bind(&ctx, &gn_partials_flat);
+        let muon_scratch = alloc_muon_scratch(&ctx, &cfg);
+        let muon_shared = build_muon_shared_ops(
+            &ctx, &muon_scratch, &gn_sq, &muon_frob_inv, &scaleb_buf, &muon_load_store,
+            &gemm, &gemm_t, &muon_combine_b, &muon_step_x,
+        );
+        let muon_ops = build_muon_ops(&ctx, &p, &cfg, &muon_momentum, &muon_apply, &muon_scratch);
+        let acts = Activations::new(&ctx, &cfg, max_batch);
         let fwd_ops = build_forward_ops(
             &ctx, &p, &acts, &cfg,
             &embed_fwd, &ln_fwd, &gemm_t, &mha_fwd, &gelu_fwd, &vadd,
@@ -698,6 +889,12 @@ impl DecoderTransformerGpu {
             gn_sq,
             gn_finalize,
             scaleb_buf,
+            muon_momentum,
+            muon_frob_inv,
+            muon_load_store,
+            muon_combine_b,
+            muon_step_x,
+            muon_apply,
             embed_scatter_reduce,
             single_embed,
             mha_kv,
@@ -710,6 +907,10 @@ impl DecoderTransformerGpu {
             p,
             grad_ops,
             gn_finalize_bind,
+            gn_partials_zero_bind,
+            muon_scratch,
+            muon_ops,
+            muon_shared,
             acts,
             fwd_ops,
             bwd_ops,
@@ -850,7 +1051,7 @@ impl DecoderTransformerGpu {
     /// offset 0, length `t * vocab`. Caller must have uploaded tokens
     /// to `self.acts.tok_buf` first. Used by both `train_step` and
     /// `eval_step` so the two paths share the exact same dispatch chain.
-    fn encode_forward(&self, enc: &mut wgpu::CommandEncoder, t: usize) {
+    fn encode_forward(&self, enc: &mut wgpu::CommandEncoder, t: usize, tok_offset: u32) {
         let cfg = &self.config;
         let d = cfg.d_model;
         let v = cfg.vocab;
@@ -870,7 +1071,7 @@ impl DecoderTransformerGpu {
             pass.set_pipeline(&self.embed_fwd.pipeline);
             self.embed_fwd.dispatch_with_bind(
                 &mut pass, &self.fwd_ops.embed,
-                t_u, d_u, v as u32, cfg.seq_len_max as u32,
+                t_u, d_u, v as u32, cfg.seq_len_max as u32, tok_offset,
             );
         }
 
@@ -989,8 +1190,95 @@ impl DecoderTransformerGpu {
     /// same encoder as fwd/bwd; only T floats (per-token NLL) come back
     /// to the host. Returns the per-token mean cross-entropy loss.
     pub fn train_step(&mut self, tokens: &[u32], targets: &[u32]) -> f32 {
-        let cfg = self.config.clone();
         let t = tokens.len();
+        debug_assert_eq!(targets.len(), t);
+
+        self.acts.tok_buf.upload_u32_prefix(&self.ctx, tokens);
+        self.acts.targets_buf.upload_u32_prefix(&self.ctx, targets);
+
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fwd") });
+        self.encode_train_element(&mut enc, t, 0, 0);
+        self.ctx.queue.submit(Some(enc.finish()));
+
+        // Per-token NLL was written by softmax_ce; reduce on host.
+        // Download is T floats (small) instead of the legacy T·V logits.
+        let loss_per_t = self.acts.loss_seq_buf.download_prefix(&self.ctx, t);
+        loss_per_t.iter().sum::<f32>() / t as f32
+    }
+
+    /// Batched train step: runs all `inputs.len()` sequences through
+    /// forward + backward in a SINGLE command encoder, SINGLE submit, and
+    /// SINGLE loss readback, accumulating gradients across the batch.
+    /// (Muon expects summed — not averaged — grads; the caller scales the
+    /// clip threshold by the batch size to compensate, exactly as the old
+    /// per-element loop did.)
+    ///
+    /// Each sequence reuses the shared activation arena; wgpu's automatic
+    /// hazard tracking inserts the barriers that serialize one element's
+    /// fwd/bwd before the next overwrites the arena, so the gradients are
+    /// identical to `inputs.len()` separate `train_step` calls — but the
+    /// GPU↔host round-trip (a full device stall) is paid once for the whole
+    /// batch instead of once per element.
+    ///
+    /// Returns the sum of per-sequence mean cross-entropies (divide by
+    /// `inputs.len()` for the batch-mean loss).
+    pub fn train_step_batch(&mut self, inputs: &[&[u32]], targets: &[&[u32]]) -> f32 {
+        let b = inputs.len();
+        debug_assert_eq!(targets.len(), b);
+        if b == 0 {
+            return 0.0;
+        }
+        let t = inputs[0].len();
+
+        // Flatten into the B·T token/target buffers. Both uploads happen
+        // before any dispatch, so there is no write-after-write hazard on
+        // the shared token/target buffers within the single submission.
+        let mut tok_flat: Vec<u32> = Vec::with_capacity(b * t);
+        let mut tgt_flat: Vec<u32> = Vec::with_capacity(b * t);
+        for i in 0..b {
+            debug_assert_eq!(inputs[i].len(), t);
+            debug_assert_eq!(targets[i].len(), t);
+            tok_flat.extend_from_slice(inputs[i]);
+            tgt_flat.extend_from_slice(targets[i]);
+        }
+        self.acts.tok_buf.upload_u32_prefix(&self.ctx, &tok_flat);
+        self.acts.targets_buf.upload_u32_prefix(&self.ctx, &tgt_flat);
+
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fwd batch"),
+            });
+        for bi in 0..b {
+            let off = (bi * t) as u32;
+            self.encode_train_element(&mut enc, t, off, off);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+
+        // Σ over all B·T NLLs / T = Σ_b mean_t(NLL_b): the sum of
+        // per-sequence means (caller divides by B for the batch mean).
+        let loss_per = self.acts.loss_seq_buf.download_prefix(&self.ctx, b * t);
+        loss_per.iter().sum::<f32>() / t as f32
+    }
+
+    /// Encode one sequence's forward + softmax-CE + backward into `enc`,
+    /// reading its tokens at `tok_offset` and reading targets / writing its
+    /// per-token NLL at `bt_offset` within the shared `B·T` buffers.
+    /// Gradients accumulate (+=) into the shared grad tensors, so the
+    /// caller must `zero_grad()` once before the batch. No submit, no
+    /// readback — the caller batches those.
+    fn encode_train_element(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        t: usize,
+        tok_offset: u32,
+        bt_offset: u32,
+    ) {
+        let cfg = &self.config;
         let d = cfg.d_model;
         let v = cfg.vocab;
         let n_head = cfg.n_head;
@@ -998,27 +1286,15 @@ impl DecoderTransformerGpu {
         let d_ff = cfg.d_ff;
         let t_u = t as u32;
         let d_u = d as u32;
-        debug_assert_eq!(targets.len(), t);
 
-        self.acts.tok_buf.upload_u32_prefix(&self.ctx, tokens);
+        self.encode_forward(enc, t, tok_offset);
 
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fwd") });
-
-        self.encode_forward(&mut enc, t);
-
-        // GPU softmax + cross-entropy: writes per-token NLL into
-        // `loss_seq_buf` (length T) and pre-scaled gradient (probs −
-        // one_hot)/T into `d_logits_buf`. Eliminates the T·V logits
-        // download + per-token CPU loss + T·V d_logits upload that the
-        // earlier path paid every step.
-        self.acts.targets_buf.upload_u32_prefix(&self.ctx, targets);
+        // GPU softmax + cross-entropy: per-token NLL → loss_seq[bt_offset..],
+        // pre-scaled gradient (probs − one_hot)/T → d_logits (offset 0).
         let loss_scale = 1.0_f32 / t as f32;
         self.softmax_ce.dispatch_into(
             &self.ctx,
-            &mut enc,
+            enc,
             &self.acts.logits_buf,
             &self.acts.d_logits_buf,
             &self.acts.loss_seq_buf,
@@ -1027,11 +1303,10 @@ impl DecoderTransformerGpu {
             t_u,
             1,
             loss_scale,
+            bt_offset,
         );
 
         // d_h_final = d_logits × w_tok  AND  outer_accum into g_w_tok.
-        // The two reads of d_logits are concurrent (read-only) so we
-        // can put them in one pass.
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("lm head bwd"), timestamp_writes: None,
@@ -1058,7 +1333,7 @@ impl DecoderTransformerGpu {
 
         // Block backward chain.
         for li in (0..cfg.n_layer).rev() {
-            self.block_backward(&mut enc, li, t, d, n_head, d_head, d_ff);
+            self.block_backward(enc, li, t, d, n_head, d_head, d_ff);
         }
 
         // Embed bwd: per-pos grad + scatter-reduce to g_w_tok / g_w_pos.
@@ -1069,7 +1344,7 @@ impl DecoderTransformerGpu {
             pass.set_pipeline(&self.embed_bwd.pipeline);
             self.embed_bwd.dispatch_with_bind(
                 &mut pass, &self.bwd_ops.embed_bwd,
-                t_u, d_u, v as u32, cfg.seq_len_max as u32,
+                t_u, d_u, v as u32, cfg.seq_len_max as u32, tok_offset,
             );
         }
         {
@@ -1078,15 +1353,9 @@ impl DecoderTransformerGpu {
             });
             pass.set_pipeline(&self.embed_scatter_reduce.pipeline);
             self.embed_scatter_reduce.dispatch_with_bind(
-                &mut pass, &self.bwd_ops.embed_scatter_reduce, t_u, d_u,
+                &mut pass, &self.bwd_ops.embed_scatter_reduce, t_u, d_u, tok_offset,
             );
         }
-        self.ctx.queue.submit(Some(enc.finish()));
-
-        // Per-token NLL was written by softmax_ce; reduce on host.
-        // Download is T floats (small) instead of the legacy T·V logits.
-        let loss_per_t = self.acts.loss_seq_buf.download_prefix(&self.ctx, t);
-        loss_per_t.iter().sum::<f32>() / t as f32
     }
 
     /// Forward-only path for validation. Encodes the same forward
@@ -1114,7 +1383,7 @@ impl DecoderTransformerGpu {
                 label: Some("eval fwd"),
             });
 
-        self.encode_forward(&mut enc, t);
+        self.encode_forward(&mut enc, t, 0);
 
         // loss_scale is irrelevant for eval (d_logits not used), but
         // softmax_ce still writes it; pass 1.0 to keep raw probabilities.
@@ -1129,6 +1398,7 @@ impl DecoderTransformerGpu {
             t_u,
             1,
             1.0,
+            0,
         );
         self.ctx.queue.submit(Some(enc.finish()));
 
@@ -1310,6 +1580,325 @@ impl DecoderTransformerGpu {
             }
         }
         self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Hybrid Muon + AdamW step. Matrix params (Q/K/V/O, FC, Proj) go
+    /// through per-matrix Newton–Schulz5 orthogonalization on
+    /// momentum-modified gradients; everything else (embed lookups +
+    /// LayerNorm γ/β) uses AdamW. Per-matrix pipeline = ~32 compute
+    /// passes; full-step dispatch overhead is ~1.1k passes for nano.
+    pub fn step_muon_hybrid(&mut self, muon_cfg: &MuonConfig, adam_cfg: &AdamWConfig) {
+        self.step += 1;
+        let (bc1, bc2) = bias_correction(self.step as usize, adam_cfg.beta1, adam_cfg.beta2);
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("aurora muon hybrid step"),
+            });
+
+        // AdamW pass for all non-matrix grad tensors (one compute pass,
+        // many dispatches — independent reads/writes).
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("muon-hybrid adamw subset"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.adamw.pipeline);
+            for op in &self.grad_ops {
+                if op.is_matrix {
+                    continue;
+                }
+                self.adamw.dispatch_with_bind(
+                    &mut pass,
+                    &op.adamw_bind,
+                    op.n,
+                    op.apply_wd,
+                    adam_cfg.lr,
+                    adam_cfg.beta1,
+                    adam_cfg.beta2,
+                    adam_cfg.eps,
+                    bc1,
+                    bc2,
+                    adam_cfg.weight_decay,
+                );
+            }
+        }
+
+        // Per matrix: momentum → Frobenius bound → load → 5×NS5 → store → apply.
+        for op in &self.muon_ops {
+            let transposed = op.rows > op.cols;
+            let (m, n_dim) = if transposed { (op.cols, op.rows) } else { (op.rows, op.cols) };
+            let mn = m * n_dim;
+            let mm = m * m;
+
+            // momentum + nesterov → update
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("muon momentum"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.muon_momentum.pipeline);
+                self.muon_momentum.dispatch_with_bind(
+                    &mut pass,
+                    &op.momentum_bind,
+                    op.n,
+                    muon_cfg.nesterov,
+                    muon_cfg.momentum,
+                );
+            }
+            // Frobenius squared partials over update
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("muon frob reduce"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.gn_sq.pipeline);
+                self.gn_sq.dispatch_with_bind(
+                    &mut pass,
+                    &self.muon_shared.frob_reduce_bind,
+                    op.n,
+                    0,
+                    8,
+                );
+            }
+            // finalize: frob_result[0] = sqrt(sum), [1] = 1/(sqrt+eps)
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("muon frob inv"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.muon_frob_inv.pipeline);
+                self.muon_frob_inv.dispatch_with_bind(
+                    &mut pass,
+                    &self.muon_shared.frob_inv_bind,
+                    8,
+                );
+            }
+            // update *= inv_scale (factor_idx=1)
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("muon scale"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.scaleb_buf.pipeline);
+                self.scaleb_buf.dispatch_with_bind(
+                    &mut pass,
+                    &self.muon_shared.scale_update_bind,
+                    op.n,
+                    1,
+                );
+            }
+            // load update → x_cur (transpose if rows > cols)
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("muon load"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.muon_load_store.pipeline);
+                self.muon_load_store.dispatch_with_bind(
+                    &mut pass,
+                    &self.muon_shared.load_bind,
+                    op.rows,
+                    op.cols,
+                    transposed,
+                    false,
+                );
+            }
+            // NS5 iterations
+            for _ in 0..muon_cfg.ns_steps {
+                // A = X X^T  ([m × n] · [n × m] → [m × m])
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ns xxt"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(self.gemm_t.pipeline());
+                    self.gemm_t.dispatch_with_bind(
+                        &mut pass,
+                        &self.muon_shared.xxt_bind,
+                        m,
+                        m,
+                        n_dim,
+                    );
+                }
+                // A_sq = A @ A  ([m × m] · [m × m] → [m × m])
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ns aa"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.gemm.pipeline);
+                    self.gemm.dispatch_with_bind(
+                        &mut pass,
+                        &self.muon_shared.aa_bind,
+                        m,
+                        m,
+                        m,
+                    );
+                }
+                // B = b·A + c·A_sq
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ns combine_b"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.muon_combine_b.pipeline);
+                    self.muon_combine_b.dispatch_with_bind(
+                        &mut pass,
+                        &self.muon_shared.combine_b_bind,
+                        mm,
+                    );
+                }
+                // BX = B @ X  ([m × m] · [m × n] → [m × n])
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ns bx"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.gemm.pipeline);
+                    self.gemm.dispatch_with_bind(
+                        &mut pass,
+                        &self.muon_shared.bx_bind,
+                        m,
+                        n_dim,
+                        m,
+                    );
+                }
+                // X = a·X + BX (in-place on x_cur)
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ns step_x"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.muon_step_x.pipeline);
+                    self.muon_step_x.dispatch_with_bind(
+                        &mut pass,
+                        &self.muon_shared.step_x_bind,
+                        mn,
+                    );
+                }
+            }
+            // store x_cur → update (transpose back if needed)
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("muon store"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.muon_load_store.pipeline);
+                self.muon_load_store.dispatch_with_bind(
+                    &mut pass,
+                    &self.muon_shared.store_bind,
+                    op.rows,
+                    op.cols,
+                    transposed,
+                    true,
+                );
+            }
+            // params -= lr · sqrt(n/m) · update  (+ optional decoupled wd)
+            let scale = (n_dim as f32 / m as f32).sqrt();
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("muon apply"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.muon_apply.pipeline);
+                self.muon_apply.dispatch_with_bind(
+                    &mut pass,
+                    &op.apply_bind,
+                    op.n,
+                    op.apply_wd,
+                    muon_cfg.lr,
+                    scale,
+                    muon_cfg.weight_decay,
+                );
+            }
+        }
+
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Clip only the AdamW-managed subset (embed lookups + LayerNorm
+    /// γ/β). Matrix grads pass through untouched — Newton–Schulz inside
+    /// `step_muon_hybrid` already bounds their update magnitude. The clip
+    /// scale is applied entirely on-GPU; `want_norm` controls whether the
+    /// pre-clip norm is read back to the host (a full device stall) — pass
+    /// `false` on steps that won't log it and the return value is `NaN`.
+    pub fn clip_grads_adamw_subset(&self, max_norm: f32, want_norm: bool) -> f32 {
+        let n_partials = self.grad_ops.len() as u32 * GN_GROUPS_PER_TENSOR;
+
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("clip_subset"),
+            });
+        // Zero the partial-sum buffer on-GPU. The subset gn_sq below
+        // writes only the non-matrix slots; finalize sums the whole
+        // buffer, so the matrix slots must read as 0. (Replaces a per-step
+        // host zero-fill + PCIe upload.)
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("clip_subset zero"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.zerob.pipeline);
+            self.zerob
+                .dispatch_with_bind(&mut pass, &self.gn_partials_zero_bind, n_partials);
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("clip_subset gn_sq"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.gn_sq.pipeline);
+            for op in &self.grad_ops {
+                if op.is_matrix {
+                    continue;
+                }
+                self.gn_sq.dispatch_with_bind(
+                    &mut pass,
+                    &op.gn_sq_bind,
+                    op.n,
+                    op.gn_offset,
+                    GN_GROUPS_PER_TENSOR,
+                );
+            }
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("clip_subset finalize"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.gn_finalize.pipeline);
+            self.gn_finalize.dispatch_with_bind(
+                &mut pass,
+                &self.gn_finalize_bind,
+                n_partials,
+                max_norm,
+            );
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("clip_subset scale"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.scaleb_buf.pipeline);
+            for op in &self.grad_ops {
+                if op.is_matrix {
+                    continue;
+                }
+                self.scaleb_buf
+                    .dispatch_with_bind(&mut pass, &op.scale_bind, op.n, 1);
+            }
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+
+        if want_norm {
+            self.gn_result.download(&self.ctx)[0]
+        } else {
+            f32::NAN
+        }
     }
 
     /// Populate a fresh KV cache from a seed sequence. Runs full GPU

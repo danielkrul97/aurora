@@ -1,0 +1,26 @@
+WIN: Δ_BPB = -0.089389 vs post-merge baseline (2.386948 → 2.297559).
+
+NEW BANK-BEST of the post-merge-baseline session. Twelfth win.
+
+4-way composite — the consolidated best recipe:
+1. WSD-tail30 schedule (warmup → flat base_lr 70% → linear decay 30%)
+2. AdamW β2 = 0.98
+3. per-block lr_mult linear [0.2x (block 0) .. 1.8x (block 5)]
+4. embed-lr 1.1x (w_tok, w_pos)
+
+Beats iter 65 (identical recipe, WSD-tail20) by ~0.0026 — the tail30
+solo edge (-0.045 vs tail20's -0.044) transferred into the composite.
+
+Diff: 36 LoC across src/transformer/schedule.rs, src/optimizer.rs,
+src/transformer/model.rs, src/gpu/transformer.rs. No GPU shader changes;
+no new params; no checkpoint format bump. All gates pass.
+
+Cumulative: old baseline 2.718824 → 2.297559 = -0.421 BPB total
+(from the SNN-era → transformer rebuild → fixup-mha-only merge → this).
+
+Bank-best for the new baseline. Strong merge candidate after multi-seed
+validation. Component provenance:
+- WSD-tail: iters 58/60/61 (tail sweep, 20-30% optimal)
+- β2=0.98: iter 32
+- per-block-lr [0.2,1.8]: iters 45/47/49 (spread sweep)
+- embed-lr 1.1x: iters 62/63 (1.5x broke smoke, 1.1x safe)

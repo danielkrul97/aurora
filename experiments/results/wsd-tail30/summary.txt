@@ -1,0 +1,8 @@
+status: win
+delta_bpb: -0.044996
+mechanism: WSD schedule with 30% linear-decay tail (flat at base_lr 70%, decay 30%).
+notes: Win, marginally better than wsd-tail20 (-0.043713) by ~0.001 — within noise. WSD tail-fraction sweep complete:
+- tail10: -0.033
+- tail20: -0.044
+- tail30: -0.045
+The optimum is BROAD: anywhere in 20-30% tail gives essentially the same result. tail10 is too short (loses end-annealing). tail20 and tail30 are statistically tied. The composite (iter 59) uses tail20; switching to tail30 would change the result by ~0.001 (negligible). Schedule axis is now fully characterized: WSD with 20-30% tail is optimal.

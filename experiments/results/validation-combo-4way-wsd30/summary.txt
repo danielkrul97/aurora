@@ -1,0 +1,15 @@
+status: validation
+parent: combo-4way-wsd30
+verdict: NOT REPRODUCIBLE — screening -0.089 does not hold across seeds
+seeds (unpaired, vs seed-42 baseline 2.386948):
+  seed 42    val_bpb 2.297559   delta -0.089389  [screening iter70]
+  seed 1337  val_bpb 2.380447   delta -0.006501  [validation — within noise floor]
+  seed 2024  val_bpb 2.321915   delta -0.065033  [validation]
+mean_delta_bpb: -0.053641   pop_std: 0.034784   effect/std: 1.5x  (fixup-mha-only: ~56x)
+experiment val_bpb spread across seeds: 0.083
+gpu_parity: 16/16 pass. GPU per-block-LR indexing statically verified vs CPU path.
+note: real cross-seed noise on a 1-epoch screening delta is ~0.035 — 4-7x the
+README's assumed 0.005-0.01 and well above the -0.02 win threshold. combo-4way-wsd30
+is at best a soft win (~-0.05 expected), not seed-robust. The -0.089 screening number
+was an upward-biased best-of-~70 single-seed draws (winner's curse). Do not merge as
+-0.089. The post-merge bank's sub--0.05 "wins" need the same multi-seed scrutiny.

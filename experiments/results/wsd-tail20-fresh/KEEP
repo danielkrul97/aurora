@@ -1,0 +1,15 @@
+WIN: Δ_BPB = -0.043713 vs post-merge baseline (2.386948 → 2.343235).
+
+Sixth win of post-merge-baseline session. Major SOLO finding.
+
+Mechanism: WSD-tail20 schedule (warmup → flat at base_lr 80% → linear decay 20%). Diff: 11 LoC in src/transformer/schedule.rs only. No GPU, no optimizer, no new params.
+
+Key insight: at the SCHEDULE axis position, this is 6x larger than inverse-sqrt-decay (-0.007). The winning composite (iter 50) used the WEAKER inverse-sqrt-decay; substituting WSD-tail20 should give the strongest composite yet.
+
+Predicted combo with β2=0.98 + per-block-lr [0.2, 1.8]:
+- Linear sum: -0.043 + -0.010 + -0.025 = -0.078
+- With super-add: ~-0.085
+
+That would push from old baseline 2.7188 → predicted 2.302, getting closer to project goal of <1.5.
+
+Worth multi-seed validation. Strong merge candidate.

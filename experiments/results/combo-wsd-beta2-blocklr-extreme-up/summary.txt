@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.082544
+mechanism: 3-way composite: WSD-tail20 schedule + AdamW β2=0.98 + per-block lr [0.2, 1.8]
+notes: STRONGEST result of the post-merge-baseline session. Linear sum -0.079 (-0.044 WSD + -0.010 β2 + -0.025 block-LR); actual -0.0825 → super-add +0.004. Substituting WSD-tail20 for inverse-sqrt-decay (iter 50's schedule component) lifted the composite from -0.0489 to -0.0825 — a 69% improvement, driven entirely by the better schedule curve. val_bpb 2.304404. Cumulative from old baseline (2.7188): -0.414 BPB. The schedule axis was the bottleneck in earlier composites. Worth multi-seed validation; strong merge candidate.

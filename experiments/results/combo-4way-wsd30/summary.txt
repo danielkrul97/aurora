@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.089389
+mechanism: 4-way composite: WSD-tail30 + β2=0.98 + per-block-lr [0.2,1.8] + embed-lr 1.1x
+notes: NEW BANK-BEST. Beats iter 65 (same 4-way with WSD-tail20) by ~0.0026. The tail30 solo edge over tail20 (-0.045 vs -0.044) transferred into the composite and slightly amplified. val_bpb 2.297559. Cumulative from old baseline 2.7188 → 2.298 = -0.421 BPB total. This is the consolidated best recipe: WSD schedule with 30% decay tail + AdamW β2=0.98 + per-block linear LR ramp [0.2x..1.8x] + embedding-group LR 1.1x. Diff 36 LoC across 4 files, no GPU shader changes, no new params, no checkpoint bump. Strong merge candidate — worth multi-seed validation.

@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.026737
+mechanism: w_tok + w_pos AdamW step uses 1.2x base LR; transformer blocks + final_ln unchanged.
+notes: WIN. Embedding-group LR boost is a real, distinct mechanism — 1.2x faster learning for the critical token+positional embeddings. This is a NEW independent axis: it scales w_tok/w_pos, orthogonal to per-block-lr (which scales the 6 transformer blocks). Should compose additively with the iter 59 bank-best (WSD + β2 + per-block-lr). Predicted 4-way composite: linear sum -0.044 + -0.010 + -0.025 + -0.027 = -0.106. The 1.5x variant (iter 62) broke smoke; 1.2x is the safe operating point. Worth multi-seed validation; high-priority 4-way composite follow-up.

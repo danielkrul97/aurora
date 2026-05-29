@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.001304
+mechanism: Skip AdamW updates for ALL LayerNorm β parameters (13 groups: 6 blocks × 2 + 1 final). β values stay at zero throughout training.
+notes: Neutral within noise (+0.001). Useful negative result: LayerNorm β is genuinely redundant under tied LM head — other params (γ, w_tok, etc.) fully compensate for the missing per-channel bias. Bonus: 585s runtime vs ~617s typical (skipping 13 AdamW dispatches saves measurable GPU time). Confirms RMSNorm-style architectures would be valid; β doesn't add expressivity for byte-LM. For future implementations: dropping β entirely (not just freezing it) would save ~5K params and slightly speed up training without quality cost. Doesn't move BPB needle in 1-epoch screening.

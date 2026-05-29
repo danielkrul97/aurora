@@ -1,0 +1,4 @@
+status: broken_impl
+delta_bpb: n/a (smoke convergence failed)
+mechanism: 4-way composite: WSD-tail20 + β2=0.98 + per-block-lr [0.2,1.8] + embed-lr 1.2x
+notes: cpu_transformer_converges_on_copy_task failed — 24.4% loss drop in 600 steps (first=2.055, last=1.554; needs <1.439 for 30%). Each of the 4 components passed smoke individually (iter 58 WSD, iter 32 β2, iter 49 per-block-lr, iter 63 embed-lr-1.2x), and the 3-way subset (iter 59) passed. But the 4-way stacks one too many LR modulations: per-block-lr puts block 0 at 0.2× while embed-lr boosts embeddings to 1.2×, and the resulting per-group LR imbalance leaves the copy-task convergence just short of the smoke threshold. Same composite-interference pattern as iter 53 (combo-extreme-freeze-betas). The 3-way iter 59 (-0.0825) remains the bank-best mergeable composite. A milder embed-lr (1.1×) might let the 4-way pass smoke — follow-up candidate.

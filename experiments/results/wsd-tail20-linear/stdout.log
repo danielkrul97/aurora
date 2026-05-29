@@ -1,0 +1,126 @@
+   Compiling cfg_aliases v0.1.1
+   Compiling bitflags v2.11.1
+   Compiling parking_lot_core v0.9.12
+   Compiling thiserror v1.0.69
+   Compiling libloading v0.8.9
+   Compiling smallvec v1.15.1
+   Compiling equivalent v1.0.2
+   Compiling scopeguard v1.2.0
+   Compiling khronos-egl v6.0.0
+   Compiling unicode-width v0.1.14
+   Compiling hashbrown v0.17.0
+   Compiling bytemuck_derive v1.10.2
+   Compiling naga v23.1.0
+   Compiling thiserror-impl v1.0.69
+   Compiling ash v0.38.0+1.3.281
+   Compiling foldhash v0.1.5
+   Compiling termcolor v1.4.1
+   Compiling bit-vec v0.8.0
+   Compiling gpu-alloc-types v0.3.0
+   Compiling hashbrown v0.15.5
+   Compiling gpu-descriptor-types v0.2.0
+   Compiling spirv v0.3.0+sdk-1.3.268.0
+   Compiling lock_api v0.4.14
+   Compiling codespan-reporting v0.11.1
+   Compiling bit-set v0.8.0
+   Compiling wgpu-hal v23.0.1
+   Compiling unicode-xid v0.2.6
+   Compiling arrayvec v0.7.6
+   Compiling hexf-parse v0.2.1
+   Compiling log v0.4.29
+   Compiling rustc-hash v1.1.0
+   Compiling parking_lot v0.12.5
+   Compiling gpu-alloc v0.6.0
+   Compiling indexmap v2.14.0
+   Compiling wgpu-types v23.0.0
+   Compiling wgpu-core v23.0.1
+   Compiling gpu-descriptor v0.3.2
+   Compiling litrs v1.0.0
+   Compiling glow v0.14.2
+   Compiling bytemuck v1.25.0
+   Compiling raw-window-handle v0.6.2
+   Compiling renderdoc-sys v1.1.0
+   Compiling profiling v1.0.17
+   Compiling wgpu v23.0.1
+   Compiling static_assertions v1.1.0
+   Compiling document-features v0.2.12
+   Compiling rgb v0.8.53
+   Compiling pollster v0.4.0
+   Compiling textplots v0.8.7
+   Compiling aurora v0.1.0 (/home/dkrul/Projects/research-projects/aurora/experiments/wt/wsd-tail20-linear)
+    Finished `release` profile [optimized] target(s) in 16.64s
+     Running `target/release/examples/aurora_train --corpus data/enwik8_10m.txt --bpe data/enwik8_10m_4096.bpe --vocab 4096 --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 --seq-len 256 --batch-size 16 --epochs 1 --lr 6e-4 --min-lr 6e-5 --warmup-steps 200 --weight-decay 0.1 --grad-clip 1.0 --seed 42 --gpu --metrics ../../results/wsd-tail20-linear/metrics.jsonl --checkpoint ../../results/wsd-tail20-linear/ckpt.bin`
+no checkpoint at ../../results/wsd-tail20-linear/ckpt.bin — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  GPU (NVIDIA GeForce GTX 1650)
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921248 (BPE vocab 4096, encode 5.4s)
+ train / val  : 2629123 / 292125
+ model        : d=384 L=6 h=6 dff=1536 ctx=256
+ optim        : lr 6.00e-4 → 6.00e-5, warmup 200 step, wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : ../../results/wsd-tail20-linear/ckpt.bin
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.201  bpb 3.506  lr 3.60e-5  gn 20.39    11.4s
+  step      24  chunk    24/641    loss 8.079  bpb 3.467  lr 7.20e-5  gn 13.10    22.6s
+  step      36  chunk    36/641    loss 7.847  bpb 3.430  lr 1.08e-4  gn 11.16    33.8s
+  step      48  chunk    48/641    loss 7.657  bpb 3.389  lr 1.44e-4  gn 11.11    45.1s
+  step      60  chunk    60/641    loss 7.543  bpb 3.353  lr 1.80e-4  gn 10.52    56.3s
+  step      72  chunk    72/641    loss 7.477  bpb 3.322  lr 2.16e-4  gn 7.59    67.8s
+  step      84  chunk    84/641    loss 7.441  bpb 3.299  lr 2.52e-4  gn 7.89    79.4s
+  step      96  chunk    96/641    loss 7.494  bpb 3.282  lr 2.88e-4  gn 8.21    90.7s
+  step     108  chunk   108/641    loss 7.453  bpb 3.267  lr 3.24e-4  gn 7.95   101.9s
+  step     120  chunk   120/641    loss 7.469  bpb 3.255  lr 3.60e-4  gn 7.88   113.2s
+  step     132  chunk   132/641    loss 7.448  bpb 3.246  lr 3.96e-4  gn 8.32   124.5s
+  step     144  chunk   144/641    loss 7.473  bpb 3.237  lr 4.32e-4  gn 9.48   135.8s
+  step     156  chunk   156/641    loss 7.354  bpb 3.227  lr 4.68e-4  gn 8.91   147.2s
+  step     168  chunk   168/641    loss 7.338  bpb 3.217  lr 5.04e-4  gn 8.54   158.5s
+  step     180  chunk   180/641    loss 7.286  bpb 3.208  lr 5.40e-4  gn 8.11   169.8s
+  step     192  chunk   192/641    loss 7.183  bpb 3.198  lr 5.76e-4  gn 9.18   181.1s
+  step     204  chunk   204/641    loss 7.198  bpb 3.189  lr 6.00e-4  gn 10.61   192.4s
+  step     216  chunk   216/641    loss 7.132  bpb 3.179  lr 6.00e-4  gn 9.51   203.7s
+  step     228  chunk   228/641    loss 7.059  bpb 3.168  lr 6.00e-4  gn 9.78   215.1s
+  step     240  chunk   240/641    loss 6.906  bpb 3.157  lr 6.00e-4  gn 9.82   226.4s
+  step     252  chunk   252/641    loss 6.981  bpb 3.146  lr 6.00e-4  gn 14.36   237.7s
+  step     264  chunk   264/641    loss 6.858  bpb 3.135  lr 6.00e-4  gn 10.78   249.0s
+  step     276  chunk   276/641    loss 6.881  bpb 3.124  lr 6.00e-4  gn 11.82   260.3s
+  step     288  chunk   288/641    loss 6.827  bpb 3.113  lr 6.00e-4  gn 11.13   271.6s
+  step     300  chunk   300/641    loss 6.713  bpb 3.103  lr 6.00e-4  gn 9.93   283.0s
+  step     312  chunk   312/641    loss 6.748  bpb 3.092  lr 6.00e-4  gn 10.67   294.7s
+  step     324  chunk   324/641    loss 6.727  bpb 3.082  lr 6.00e-4  gn 10.52   306.0s
+  step     336  chunk   336/641    loss 6.816  bpb 3.073  lr 6.00e-4  gn 11.40   317.3s
+  step     348  chunk   348/641    loss 6.676  bpb 3.065  lr 6.00e-4  gn 9.52   328.7s
+  step     360  chunk   360/641    loss 6.543  bpb 3.056  lr 6.00e-4  gn 12.17   340.0s
+  step     372  chunk   372/641    loss 6.528  bpb 3.047  lr 6.00e-4  gn 12.25   351.3s
+  step     384  chunk   384/641    loss 6.564  bpb 3.038  lr 6.00e-4  gn 10.87   362.6s
+  step     396  chunk   396/641    loss 6.518  bpb 3.028  lr 6.00e-4  gn 9.83   373.9s
+  step     408  chunk   408/641    loss 6.531  bpb 3.020  lr 6.00e-4  gn 10.70   385.2s
+  step     420  chunk   420/641    loss 6.586  bpb 3.014  lr 6.00e-4  gn 9.49   396.6s
+  step     432  chunk   432/641    loss 6.505  bpb 3.007  lr 6.00e-4  gn 9.99   407.9s
+  step     444  chunk   444/641    loss 6.452  bpb 2.999  lr 6.00e-4  gn 10.41   419.2s
+  step     456  chunk   456/641    loss 6.530  bpb 2.992  lr 6.00e-4  gn 9.45   430.5s
+  step     468  chunk   468/641    loss 6.384  bpb 2.985  lr 6.00e-4  gn 10.11   441.8s
+  step     480  chunk   480/641    loss 6.399  bpb 2.978  lr 6.00e-4  gn 11.89   453.1s
+  step     492  chunk   492/641    loss 6.399  bpb 2.971  lr 6.00e-4  gn 10.99   464.4s
+  step     504  chunk   504/641    loss 6.450  bpb 2.965  lr 6.00e-4  gn 9.85   475.7s
+  step     516  chunk   516/641    loss 6.437  bpb 2.959  lr 6.00e-4  gn 10.42   487.1s
+  step     528  chunk   528/641    loss 6.358  bpb 2.953  lr 6.00e-4  gn 12.86   498.4s
+  step     540  chunk   540/641    loss 6.353  bpb 2.946  lr 6.00e-4  gn 12.08   509.7s
+  step     552  chunk   552/641    loss 6.316  bpb 2.940  lr 6.00e-4  gn 10.49   521.1s
+  step     564  chunk   564/641    loss 6.262  bpb 2.934  lr 5.33e-4  gn 10.63   532.5s
+  step     576  chunk   576/641    loss 6.145  bpb 2.928  lr 4.60e-4  gn 11.15   543.8s
+  step     588  chunk   588/641    loss 6.356  bpb 2.922  lr 3.88e-4  gn 10.15   555.1s
+  step     600  chunk   600/641    loss 6.151  bpb 2.916  lr 3.15e-4  gn 10.83   566.4s
+  step     612  chunk   612/641    loss 6.277  bpb 2.910  lr 2.42e-4  gn 10.73   577.7s
+  step     624  chunk   624/641    loss 6.302  bpb 2.905  lr 1.69e-4  gn 10.46   589.0s
+  step     636  chunk   636/641    loss 6.176  bpb 2.901  lr 9.64e-5  gn 10.13   600.3s
+  done   train bpb 2.898  val bpb 2.670  2317.3s
+  checkpoint → ../../results/wsd-tail20-linear/ckpt.bin
+  sample:
+    seed: "ates such as the archons. To the "
+    cont: "Paul morceates the preOn ignual beguse on the thems. ===\n\nThe nable, to be amstrephack becomed perte's closs, but on [[Francelchinousy and ascary]] and the seyear. It ==\n{{Ovophit. A ideure, around of the [[Siley its boniited by common of the cel went cavation.\n*[[191.\n1., and in which [[151. Alonment the books or Hin]].\n (16&lt;/sub&gt;The [[[[Plocends of the [[Eevres''' (The species  the apumon]] and [[Gastland]] [[section&quot; and it "
+
+Total time 2369.6s   best val bpb 2.670   steps planned 641

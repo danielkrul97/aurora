@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.005372
+mechanism: MhaWeights::new w_k = LinearProj::new_scaled(d,d,0.0,rng); zero-init produces uniform attention at init, combined with baked-in w_o=0
+notes: Neutral (+0.005, within noise). Staged-specialization hypothesis didn't pay off — adding a 2nd MHA zero-init (w_k) on top of baked-in w_o=0 produces no compounding gain. w_o=0 alone is the active ingredient of fixup-mha-only's -0.335 win. Useful negative result: future iters should avoid layering additional zero-inits inside MHA; explore OTHER mechanisms instead (FFN-side, embedding, schedule).

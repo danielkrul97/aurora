@@ -1,0 +1,3 @@
+status: win
+delta_bpb: -0.048763
+mechanism: WSD schedule — warmup→stable(base_lr)→linear-decay over last 20% of post-warmup steps; replaces cosine

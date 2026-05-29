@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.093604
+mechanism: WSD schedule (warmup → stable base_lr → linear tail 20% decay) + both w_tok and w_pos init at 0.5x baseline magnitude
+notes: Mildly sub-additive (predicted -0.102, observed -0.094; +0.008 interaction loss). Different from prior super-additive composites (combo-fixup-wsd +0.008, combo-embed-both-half +0.009). This is the first composite where observed < predicted additive — suggests WSD and embedding-half mechanisms partially overlap (both effectively reduce the "size" of late-training gradient updates, one via lower late LR, the other via smaller initial parameters).

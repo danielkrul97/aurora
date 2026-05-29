@@ -1,0 +1,4 @@
+status: win
+delta_bpb: -0.093202
+mechanism: Zero-init w_o (fixup-mha-only) + both w_tok and w_pos at 0.5x baseline magnitude. FFN w_proj keeps baseline.
+notes: Anti-stacks vs parent fixup-mha-only (-0.332). Adding embedding halving destroyed ~0.24 BPB of the init gain — same destructive pattern as iter 19. Confirms a rule: residual-init zero + embedding magnitude reduction is consistently destructive composability.

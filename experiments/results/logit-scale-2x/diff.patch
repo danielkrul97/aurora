@@ -1,0 +1,29 @@
+src/transformer/loss.rs | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+--- Changes ---
+
+src/transformer/loss.rs
+  @@ -11,13 +11,23 @@ pub fn softmax(logits: &[f32]) -> Vec<f32> {
+  +/// Pre-softmax temperature for the LM-head pathway. T=2 sharpens the
+  +/// softmax operating point and doubles the chain-rule factor for
+  +/// d_logits, amplifying the dominant gradient signal in byte-LM
+  +/// 1-epoch screening.
+  +const LOGIT_TEMP: f32 = 2.0;
+  +
+   #[must_use]
+   pub fn cross_entropy_with_grad(logits: &[f32], target: usize) -> (f32, Vec<f32>) {
+  -    let probs = softmax(logits);
+  +    let scaled: Vec<f32> = logits.iter().map(|&v| v * LOGIT_TEMP).collect();
+  +    let probs = softmax(&scaled);
+       let p_target = probs[target].max(1e-12);
+       let loss = -p_target.ln();
+       let mut grad = probs;
+       grad[target] -= 1.0;
+  +    for g in grad.iter_mut() {
+  +        *g *= LOGIT_TEMP;
+  +    }
+       (loss, grad)
+   }
+   
+  +11 -1

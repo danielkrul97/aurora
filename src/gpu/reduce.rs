@@ -825,7 +825,7 @@ impl ScaleByBufferKernel {
 // read/write it as `array<f32>`; the bytes are identical.
 
 const EMBED_SCATTER_REDUCE_WGSL: &str = "
-struct P { t: u32, d: u32, _p0: u32, _p1: u32 };
+struct P { t: u32, d: u32, tok_offset: u32, _p1: u32 };
 @group(0) @binding(0) var<storage, read>       tokens: array<u32>;
 @group(0) @binding(1) var<storage, read>       per_pos: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dest: array<atomic<u32>>;
@@ -848,7 +848,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (lane >= total) { return; }
     let ti = lane / p.d;
     let c = lane % p.d;
-    let tok = tokens[ti];
+    let tok = tokens[p.tok_offset + ti];
     let val = per_pos[ti * p.d + c];
     atomic_add_f32(tok * p.d + c, val);
 }
@@ -959,8 +959,9 @@ impl EmbedScatterReduceKernel {
         bind: &wgpu::BindGroup,
         t: u32,
         d: u32,
+        tok_offset: u32,
     ) {
-        let p = RowReduceParams { t, d, _p0: 0, _p1: 0 };
+        let p = RowReduceParams { t, d, _p0: tok_offset, _p1: 0 };
         pass.set_bind_group(0, bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups((t * d).div_ceil(256), 1, 1);

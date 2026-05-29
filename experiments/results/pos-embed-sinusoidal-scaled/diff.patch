@@ -1,0 +1,30 @@
+data                         |  1 +
+ src/transformer/embedding.rs | 13 ++++++++++---
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/transformer/embedding.rs
+  @@ -34,9 +34,16 @@ impl EmbedWeights {
+  -        let w_pos: Vec<f32> = (0..seq_len_max * d_model)
+  -            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * scale)
+  -            .collect();
+  +        let pe_scale: f32 = 0.03;
+  +        let mut w_pos = vec![0.0_f32; seq_len_max * d_model];
+  +        for pos in 0..seq_len_max {
+  +            for i in 0..(d_model / 2) {
+  +                let denom = 10000.0_f32.powf(2.0 * i as f32 / d_model as f32);
+  +                let angle = pos as f32 / denom;
+  +                w_pos[pos * d_model + 2 * i] = pe_scale * angle.sin();
+  +                w_pos[pos * d_model + 2 * i + 1] = pe_scale * angle.cos();
+  +            }
+  +        }
+           Self {
+               w_tok,
+               w_pos,
+  +10 -3

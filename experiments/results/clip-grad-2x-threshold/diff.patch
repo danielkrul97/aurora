@@ -1,0 +1,32 @@
+data                     | 1 +
+ src/gpu/transformer.rs   | 1 +
+ src/transformer/model.rs | 5 +++--
+ 3 files changed, 5 insertions(+), 2 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/gpu/transformer.rs
+  @@ -803,6 +803,7 @@ impl DecoderTransformerGpu {
+  +        let max_norm = max_norm * 2.0;
+           let mut enc = self
+               .ctx
+               .device
+  +1 -0
+
+src/transformer/model.rs
+  @@ -438,9 +438,10 @@ impl DecoderTransformer {
+  +        let cap = max_norm * 2.0;
+           let n = grads.l2_norm();
+  -        if n > max_norm && n > 0.0 {
+  -            grads.scale(max_norm / n);
+  +        if n > cap && n > 0.0 {
+  +            grads.scale(cap / n);
+           }
+           n
+       }
+  +3 -2

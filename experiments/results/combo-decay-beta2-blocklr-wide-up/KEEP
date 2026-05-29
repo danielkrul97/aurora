@@ -1,0 +1,19 @@
+WIN: Δ_BPB = -0.040599 vs post-merge baseline (2.386948 → 2.346349).
+
+Strongest composite of the post-merge-baseline session. 3-way:
+1. inverse-sqrt-decay (-0.007 solo)
+2. AdamW β2 = 0.98 (-0.010 solo)
+3. per-block lr_mult 0.3× → 1.7× wide (-0.0206 solo)
+
+Linear sum -0.0376. Actual -0.0406 → mild super-additivity (+0.003).
+
+Diff: 22 LoC across src/transformer/schedule.rs, src/optimizer.rs, src/transformer/model.rs, src/gpu/transformer.rs. No GPU shader changes; no new params; no checkpoint bump.
+
+Bank-best for the new baseline so far. Worth multi-seed validation before merge.
+
+Triangulation history:
+- iter 33: decay × β2 narrow → -0.019 (super-add +0.002)
+- iter 46: decay × β2 × block-LR narrow → -0.0316 (linear exact)
+- iter 48: decay × β2 × block-LR wide  → -0.0406 (super-add +0.003)
+
+Pattern: 3-axis composites show small but consistent super-additivity (~+0.002-0.003), indicating the schedule × optimizer × depth-cond axes are genuinely independent with mild beneficial interactions.

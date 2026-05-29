@@ -1,0 +1,45 @@
+failing test: cpu_transformer_argmax_sanity
+
+Last output:
+running 3 tests
+test cpu_transformer_step_does_not_nan ... ok
+test cpu_transformer_argmax_sanity ... FAILED
+test cpu_transformer_converges_on_copy_task ... (skipped — abort on first failure)
+
+failures:
+---- cpu_transformer_argmax_sanity stdout ----
+thread 'cpu_transformer_argmax_sanity' panicked at tests/transformer_smoke.rs:166:5:
+assertion `left == right` failed: model should learn identity prediction, got 0
+  left: 0
+ right: 2
+
+failures:
+    cpu_transformer_argmax_sanity
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+
+Interpretation: The argmax sanity test uses cfg vocab=4, d_model=16,
+n_layer=1, n_head=1, d_ff=32, lr=3e-2, weight_decay=0, 100 training
+steps on a "predict same token" task. After training, the model is
+asked to predict token 2 from input [2,2,2,2]. It predicted 0 instead.
+
+With this combo (fixup w_o=0 + w_proj=0 + pos at 0.5x scale):
+- At init, every sublayer output is zero (fixup).
+- Residual stream is essentially w_tok[input] + 0.5 * w_pos[pos].
+- LM head logits = LN(stream) @ w_tok^T, so model learns w_tok rows
+  to be discriminable enough that input token wins.
+
+100 steps at lr=3e-2 with WD=0 may not be enough to push token 2's
+embedding above the other rows when sublayers haven't yet kicked in.
+With baseline init or fixup alone the sublayers contribute random
+features early which let argmax separate tokens; with halved pos
+embeddings the residual stream has less per-position variation, so
+the LM head has less to distinguish.
+
+This is a DIFFERENT failure mode than iter 13 (quarter-magnitude),
+which passed argmax but failed convergence (28% drop). The boundary
+is non-monotonic across init magnitudes — the smoke harness has
+multiple binding constraints and each gate is sensitive to a different
+balance of warm-up speed vs initial signal strength.
+
+Per RESEARCHER.md spec, any smoke failure ⇒ broken_impl.

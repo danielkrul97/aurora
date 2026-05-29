@@ -1,0 +1,4 @@
+status: broken_impl
+delta_bpb: n/a (sanity gate failed - no screening run)
+mechanism: w_pos init replaced with Vaswani PE: sin/cos at varying frequencies, magnitudes in [-1, 1]
+notes: cpu_transformer_argmax_sanity failed. Sinusoidal init has magnitudes ~1 vs original random U(-0.035, 0.035) ≈ 28x larger. In the small-dim argmax sanity test, pos info dominates the residual stream and the model can't learn to predict from tokens (got argmax=3 expected 2 after 100 steps). Math is correct; gpu_parity would have passed. Next iter should try scaled sinusoidal (* 0.05 to match old magnitude variance) to preserve the structural prior while keeping signal balance.

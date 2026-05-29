@@ -1,0 +1,7 @@
+WIN: delta_bpb = -0.052525 (2.718824 → 2.666299). Both halved-embedding wins compose slightly super-additively. Predicted additive sum was -0.044 (pos -0.022 + tok -0.022); observed -0.053. The +0.009 interaction is small but consistent with prior orthogonal-composability win pattern (combo-fixup-wsd was +0.008 super-additive vs its components).
+
+Mechanism contrast: pos-half reduces per-position noise in the residual stream entering attention; tok-half reduces initial LM head logit magnitude. Distinct pathways, distinct gains.
+
+Notable: this win is WITHOUT fixup or WSD, just embedding init halving. Still worse than the best (combo-fixup-wsd -0.308) but useful as an ingredient for principled multi-area composites. The earlier failed attempt (combo-fixup-wsd-tok-half iter 19, anti-stacked) suggests embedding-half does NOT compose with fixup, only with WSD-or-similar non-init changes. Worth testing combo-wsd-embed-both-half next.
+
+Multi-seed validation recommended.

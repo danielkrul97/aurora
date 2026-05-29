@@ -1,0 +1,21 @@
+data                         | 1 +
+ src/transformer/embedding.rs | 4 +---
+ 2 files changed, 2 insertions(+), 3 deletions(-)
+
+--- Changes ---
+
+data
+  @@ -0,0 +1 @@
+  +/home/dkrul/Projects/research-projects/aurora/data
+  +1 -0
+
+src/transformer/embedding.rs
+  @@ -31,9 +31,7 @@ impl EmbedWeights {
+  -        let w_tok: Vec<f32> = (0..vocab * d_model)
+  -            .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * scale)
+  -            .collect();
+  +        let w_tok: Vec<f32> = vec![0.0_f32; vocab * d_model];
+           let w_pos: Vec<f32> = (0..seq_len_max * d_model)
+               .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * scale)
+               .collect();
+  +1 -3

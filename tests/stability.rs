@@ -40,7 +40,7 @@ fn grad_norm_stays_finite_under_large_inputs() {
     for v in &logits {
         assert!(v.is_finite(), "logits non-finite on fresh init");
     }
-    let _ = model.backward(&cache, target, &mut grads);
+    let _ = model.backward(&cache, &logits, target, &mut grads);
     let pre = DecoderTransformer::clip_grads(&mut grads, 1.0);
     assert!(pre.is_finite() && pre >= 0.0, "grad norm non-finite: {pre}");
 
@@ -175,18 +175,18 @@ fn grad_accumulation_across_batch() {
     let target_b = &tokens_b[1..];
 
     let mut grads_a = ModelGrads::zeros(&cfg);
-    let (_, c_a) = model.forward(input_a);
-    let _ = model.backward(&c_a, target_a, &mut grads_a);
+    let (la, c_a) = model.forward(input_a);
+    let _ = model.backward(&c_a, &la, target_a, &mut grads_a);
 
     let mut grads_b = ModelGrads::zeros(&cfg);
-    let (_, c_b) = model.forward(input_b);
-    let _ = model.backward(&c_b, target_b, &mut grads_b);
+    let (lb, c_b) = model.forward(input_b);
+    let _ = model.backward(&c_b, &lb, target_b, &mut grads_b);
 
     let mut grads_combined = ModelGrads::zeros(&cfg);
-    let (_, c_a2) = model.forward(input_a);
-    let _ = model.backward(&c_a2, target_a, &mut grads_combined);
-    let (_, c_b2) = model.forward(input_b);
-    let _ = model.backward(&c_b2, target_b, &mut grads_combined);
+    let (la2, c_a2) = model.forward(input_a);
+    let _ = model.backward(&c_a2, &la2, target_a, &mut grads_combined);
+    let (lb2, c_b2) = model.forward(input_b);
+    let _ = model.backward(&c_b2, &lb2, target_b, &mut grads_combined);
 
     // The accumulated grad should equal sum of individual grads.
     for i in 0..grads_a.embed.d_w_tok.len() {
@@ -218,9 +218,9 @@ fn very_small_lr_does_not_diverge() {
         let tokens: Vec<u32> = (0..16).map(|_| rng.random_range(0..cfg.vocab as u32)).collect();
         let input = &tokens[..15];
         let target = &tokens[1..];
-        let (_, cache) = model.forward(input);
+        let (logits, cache) = model.forward(input);
         grads.zero();
-        let loss = model.backward(&cache, target, &mut grads);
+        let loss = model.backward(&cache, &logits, target, &mut grads);
         DecoderTransformer::clip_grads(&mut grads, 1.0);
         model.step_adamw(&grads, &adam);
         if s == 0 {

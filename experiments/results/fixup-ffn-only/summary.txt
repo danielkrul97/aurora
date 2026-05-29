@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.024560
+mechanism: Zero-init w_proj (FFN output projection) only; w_o (MHA output) keeps baseline GPT-3 1/sqrt(2N) residual scaling. At init: MHA sublayer non-zero, FFN sublayer = 0.
+notes: Confirms iter 22's reinterpretation — FFN zero-init alone is genuinely harmful (+0.025), independent of MHA. fixup-mha-only is the correct recommendation; the iter-4 fixup-full was strictly worse than fixup-mha-only because including FFN zero-init both hurts standalone and interferes with the MHA-side gain. Decomposition closes the fixup mechanism question.

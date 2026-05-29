@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: -0.018728
+mechanism: cosine_warmup post-warmup branch -> base*sqrt(warmup/step); AdamWConfig::default beta2 0.95 -> 0.98.
+notes: Closest miss in the new-baseline era. Sum of components: -0.007 (inverse-sqrt) + -0.010 (beta2-098) = -0.017. Composite: -0.019 → super-additive by ~0.002, but the cross-mechanism super-addition is too small to bring it above the -0.020 win threshold. The "smoother dynamics" family stacks weakly but doesn't compound aggressively — most of each effect IS independent (4 LoC composite is real but just below threshold). Worth noting as a near-miss data point: shows that even compounding the two best non-init mechanisms is just short of a win on the new baseline. The headroom from current baseline really is small without architectural changes.

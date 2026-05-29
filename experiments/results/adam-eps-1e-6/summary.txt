@@ -1,0 +1,4 @@
+status: loss
+delta_bpb: +0.001851
+mechanism: AdamWConfig::default().eps changed from 1e-8 to 1e-6 (BERT-style). Affects denominator floor in θ ← θ − lr · m̂₁ / (√m̂₂ + ε).
+notes: Within noise. The "quiet param dampening" hypothesis didn't materialize at this scale — LN γ/β gradients aren't small enough for 1e-8 vs 1e-6 to differ meaningfully.

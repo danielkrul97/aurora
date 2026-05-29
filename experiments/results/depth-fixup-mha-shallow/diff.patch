@@ -1,0 +1,25 @@
+src/transformer/model.rs | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+--- Changes ---
+
+src/transformer/model.rs
+  @@ -90,7 +90,7 @@ pub struct BlockAdam {
+  -        let blocks: Vec<TransformerBlock> = (0..config.n_layer)
+  +        let mut blocks: Vec<TransformerBlock> = (0..config.n_layer)
+               .map(|_| {
+                   TransformerBlock::new(
+                       config.d_model,
+  @@ -101,6 +101,14 @@ impl DecoderTransformer {
+  +        let shallow_cutoff = config.n_layer / 2;
+  +        for (li, blk) in blocks.iter_mut().enumerate() {
+  +            if li < shallow_cutoff {
+  +                for v in blk.mha.w_o.w.iter_mut() {
+  +                    *v = 0.0;
+  +                }
+  +            }
+  +        }
+           let final_ln = LayerNorm::new(config.d_model);
+   
+           let d = config.d_model;
+  +9 -1

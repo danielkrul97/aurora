@@ -1,0 +1,65 @@
+src/attention.rs       |  2 +-
+ src/gpu/transformer.rs | 16 ++++++++--------
+ 2 files changed, 9 insertions(+), 9 deletions(-)
+
+--- Changes ---
+
+src/attention.rs
+  @@ -41,7 +41,7 @@ impl LayerNorm {
+  -            eps: 1e-5,
+  +            eps: 1e-3,
+               d,
+           }
+       }
+  +1 -1
+
+src/gpu/transformer.rs
+  @@ -886,7 +886,7 @@ impl DecoderTransformerGpu {
+  -                self.ln_fwd.dispatch_with_bind(&mut pass, &fop.ln1, t_u, d_u, 1e-5);
+  +                self.ln_fwd.dispatch_with_bind(&mut pass, &fop.ln1, t_u, d_u, 1e-3);
+               }
+               // QKV — independent gemm_t writes; batch into one pass (1.2).
+               {
+  @@ -930,7 +930,7 @@ impl DecoderTransformerGpu {
+  -                self.ln_fwd.dispatch_with_bind(&mut pass, &fop.ln2, t_u, d_u, 1e-5);
+  +                self.ln_fwd.dispatch_with_bind(&mut pass, &fop.ln2, t_u, d_u, 1e-3);
+               }
+               // fc + gelu + proj (each in its own pass — sequential deps).
+               {
+  @@ -970,7 +970,7 @@ impl DecoderTransformerGpu {
+  -            self.ln_fwd.dispatch_with_bind(&mut pass, &self.fwd_ops.final_ln, t_u, d_u, 1e-5);
+  +            self.ln_fwd.dispatch_with_bind(&mut pass, &self.fwd_ops.final_ln, t_u, d_u, 1e-3);
+           }
+           // Tied LM head (logits = h_final × w_tokᵀ)
+           {
+  @@ -1311,7 +1311,7 @@ impl DecoderTransformerGpu {
+  -                &ln1_inv, &ln1_xhat, 1, d as u32, 1e-5,
+  +                &ln1_inv, &ln1_xhat, 1, d as u32, 1e-3,
+               );
+   
+               let q_new = GpuBuffer::empty(&self.ctx, "step_q", d);
+  @@ -1346,7 +1346,7 @@ impl DecoderTransformerGpu {
+  -                &ln2_mean, &ln2_inv, &ln2_xhat, 1, d as u32, 1e-5,
+  +                &ln2_mean, &ln2_inv, &ln2_xhat, 1, d as u32, 1e-3,
+               );
+               self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln2_out, &blk.w_fc, &h_pre, 1, d_ff as u32, d as u32);
+               self.gelu_fwd.dispatch_into(&self.ctx, &mut enc, &h_pre, &h_post, d_ff as u32);
+  @@ -1363,7 +1363,7 @@ impl DecoderTransformerGpu {
+  -            &f_mean, &f_inv, &f_xhat, 1, d as u32, 1e-5,
+  +            &f_mean, &f_inv, &f_xhat, 1, d as u32, 1e-3,
+           );
+           self.gemm_t.dispatch_into(
+               &self.ctx, &mut enc, &h_final, &self.p.w_tok, &logits, 1, v_dim as u32, d as u32,
+  @@ -1424,7 +1424,7 @@ impl DecoderTransformerGpu {
+  -                &ln1_inv, &ln1_xhat, t as u32, d as u32, 1e-5,
+  +                &ln1_inv, &ln1_xhat, t as u32, d as u32, 1e-3,
+               );
+               self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_q, &q, t as u32, d as u32, d as u32);
+               self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_k, &k, t as u32, d as u32, d as u32);
+  @@ -1453,7 +1453,7 @@ impl DecoderTransformerGpu {
+  -                &ln2_mean, &ln2_inv, &ln2_xhat, t as u32, d as u32, 1e-5,
+  +                &ln2_mean, &ln2_inv, &ln2_xhat, t as u32, d as u32, 1e-3,
+               );
+               self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln2_out, &blk.w_fc, &h_pre, t as u32, d_ff as u32, d as u32);
+               self.gelu_fwd.dispatch_into(&self.ctx, &mut enc, &h_pre, &h_post, (t * d_ff) as u32);
+  +8 -8
