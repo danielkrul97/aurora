@@ -7,11 +7,15 @@ pub mod components;
 pub mod scene;
 pub mod snapshot;
 pub mod systems;
+pub mod thermo;
 pub mod ui;
 
 pub use snapshot::{
     health_from_norm, l2_norm, max_abs, new_snapshot, LayerKind, LayerStats, SnapshotArc,
     TrainingSnapshot,
+};
+pub use thermo::{
+    new_thermo_snapshot, run_thermo_window, ThermoChannel, ThermoSnapshot, ThermoSnapshotArc,
 };
 
 use bevy::log::LogPlugin;

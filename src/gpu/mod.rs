@@ -30,6 +30,10 @@ pub mod muon;
 pub mod optimizer;
 pub mod reduce;
 pub mod softmax_ce;
+pub mod thermo_conv;
+pub mod thermo_model;
+pub mod thermo_step;
+pub mod thermo_stencil;
 pub mod transformer;
 
 pub use attention::{CausalMhaBackwardKernel, CausalMhaForwardKernel};
@@ -50,4 +54,19 @@ pub use reduce::{
     OuterProductAccumKernel, RowReduceAddKernel, ScaleByBufferKernel,
 };
 pub use softmax_ce::SoftmaxCrossEntropyKernel;
+pub use thermo_model::ThermoGpu;
+pub use thermo_conv::{
+    ThermoConv1x1Kernel, ThermoConv3x3Dw1Kernel, ThermoConv3x3DsKernel, ThermoConv3x3GeluKernel,
+    ThermoConv3x3Kernel,
+};
+pub use thermo_stencil::{
+    ThermoDiffusionBwdDsKernel, ThermoDiffusionBwdParamKernel, ThermoDiffusionBwdPreKernel,
+    ThermoDiffusionForwardKernel, ThermoFluxDivBackwardKernel, ThermoFluxDivKernel,
+    ThermoAvgPoolBackwardKernel, ThermoAvgPoolKernel, ThermoInjectBackwardKernel,
+    ThermoInjectKernel,
+};
+pub use thermo_step::{
+    ExtractFluxKernel, StepAssembleKernel, ThermoDisassembleKernel, ThermoFluxScatterKernel,
+    ThermoGpuForward, ThermoScaleKernel,
+};
 pub use transformer::DecoderTransformerGpu;
