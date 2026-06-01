@@ -241,24 +241,164 @@ impl OuterProductAccumKernel {
     }
 }
 
+// OuterProductSplitKKernel — split-K partials for a tall-skinny outer product
+// `dest[r,cc] = Σ_k d_y[k,r]·x[k,cc]` where d_out·d_in is tiny but t (=K) is
+// huge. The tiled `OuterProductAccum` parallelizes over the M×N output, so a
+// tiny output collapses to ONE workgroup that reduces all of K serially (13/14
+// SMs idle — the thermo `d_w2` bottleneck). Here we split K across `n_groups`,
+// giving `n_groups·d_out·d_in` threads (full occupancy); a `RowReduceAdd` over
+// the `[n_groups, d_out·d_in]` partials then sums them into the grad buffer.
+
+const OUTER_SPLITK_WGSL: &str = "
+struct P { d_out:u32, d_in:u32, t:u32, n_groups:u32 };
+@group(0) @binding(0) var<storage, read>       x:        array<f32>;  // [t, d_in]
+@group(0) @binding(1) var<storage, read>       d_y:      array<f32>;  // [t, d_out]
+@group(0) @binding(2) var<storage, read_write> partials: array<f32>;  // [n_groups, d_out*d_in]
+var<push_constant> p: P;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dd = p.d_out * p.d_in;
+    let idx = gid.x;
+    if (idx >= p.n_groups * dd) { return; }
+    let g = idx / dd;
+    let rem = idx % dd;
+    let r = rem / p.d_in;
+    let cc = rem % p.d_in;
+    let k_lo = g * p.t / p.n_groups;
+    let k_hi = (g + 1u) * p.t / p.n_groups;
+    var acc = 0.0;
+    for (var k: u32 = k_lo; k < k_hi; k = k + 1u) {
+        acc = acc + d_y[k * p.d_out + r] * x[k * p.d_in + cc];
+    }
+    partials[idx] = acc;
+}
+";
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct OuterSplitKParams {
+    d_out: u32,
+    d_in: u32,
+    t: u32,
+    n_groups: u32,
+}
+
+pub struct OuterProductSplitKKernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bgl: Arc<wgpu::BindGroupLayout>,
+}
+
+impl OuterProductSplitKKernel {
+    /// Number of K-slices. Sized so `n_groups·d_out·d_in` saturates the device
+    /// while keeping each thread's reduction long enough to amortize launch.
+    pub const GROUPS: u32 = 64;
+
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("aurora outer_splitk"),
+            source: wgpu::ShaderSource::Wgsl(OUTER_SPLITK_WGSL.into()),
+        });
+        let bgl = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("aurora outer_splitk bgl"),
+            entries: &[storage_entry(0, true), storage_entry(1, true), storage_entry(2, false)],
+        });
+        let pl = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("aurora outer_splitk pl"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[wgpu::PushConstantRange { stages: wgpu::ShaderStages::COMPUTE, range: 0..16 }],
+        });
+        let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("aurora outer_splitk"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        Self { pipeline: Arc::new(pipeline), bgl: Arc::new(bgl) }
+    }
+
+    /// Writes `[n_groups, d_out*d_in]` partial sums into `partials` (which
+    /// must hold `GROUPS·d_out·d_in` floats). Follow with a `RowReduceAdd`
+    /// (`t = n_groups`, `d = d_out*d_in`) to accumulate into the grad buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_into(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        x: &GpuBuffer,
+        d_y: &GpuBuffer,
+        partials: &GpuBuffer,
+        d_out: u32,
+        d_in: u32,
+        t: u32,
+    ) {
+        let n_groups = Self::GROUPS.min(t.max(1));
+        let p = OuterSplitKParams { d_out, d_in, t, n_groups };
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora outer_splitk bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: x.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: d_y.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: partials.inner.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("aurora outer_splitk pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups((n_groups * d_out * d_in).div_ceil(64), 1, 1);
+    }
+
+    /// K-slices actually used for a given `t` (matches `dispatch_into`).
+    #[must_use]
+    pub fn groups_for(t: u32) -> u32 {
+        Self::GROUPS.min(t.max(1))
+    }
+}
+
 // RowReduceAddKernel — dest[c] += sum_t src[t, c].
-// One workgroup per output column; sums over t with stride loop.
+// One workgroup per output column; the 256 threads cooperatively reduce the
+// t dimension (shared-memory tree). The naive version ran one thread per
+// column over all t (≈d active threads, 13/14 SMs idle) — the dominant cost
+// in thermo backward param-grads where d is tiny (10-24) and t≈25k.
 
 const ROW_REDUCE_ADD_WGSL: &str = "
 struct P { t: u32, d: u32, _p0: u32, _p1: u32 };
 @group(0) @binding(0) var<storage, read>       src: array<f32>;
 @group(0) @binding(1) var<storage, read_write> dest: array<f32>;
 var<push_constant> p: P;
+var<workgroup> sh: array<f32, 256>;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let c = gid.x;
-    if (c >= p.d) { return; }
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let c = wid.x;            // one workgroup per output column
+    let tid = lid.x;
     var acc: f32 = 0.0;
-    for (var ti: u32 = 0u; ti < p.t; ti = ti + 1u) {
-        acc = acc + src[ti * p.d + c];
+    if (c < p.d) {
+        var ti = tid;
+        loop {
+            if (ti >= p.t) { break; }
+            acc = acc + src[ti * p.d + c];
+            ti = ti + 256u;
+        }
     }
-    dest[c] = dest[c] + acc;
+    sh[tid] = acc;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) { sh[tid] = sh[tid] + sh[tid + stride]; }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (tid == 0u && c < p.d) { dest[c] = dest[c] + sh[0]; }
 }
 ";
 
@@ -342,8 +482,7 @@ impl RowReduceAddKernel {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
-        let groups = d.div_ceil(256);
-        pass.dispatch_workgroups(groups, 1, 1);
+        pass.dispatch_workgroups(d, 1, 1); // one workgroup per output column
     }
 }
 

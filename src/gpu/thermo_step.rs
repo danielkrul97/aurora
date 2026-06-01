@@ -13,7 +13,8 @@ use std::sync::Arc;
 use super::buffers::GpuBuffer;
 use super::thermo_conv::{build, dispatch_n, ThermoConv1x1Kernel, ThermoConv3x3GeluKernel};
 use super::thermo_stencil::{
-    ThermoAvgPoolKernel, ThermoDiffusionForwardKernel, ThermoFluxDivKernel, ThermoInjectKernel,
+    ThermoAvgPoolKernel, ThermoDiffusionForwardKernel, ThermoFeatureAssembleKernel,
+    ThermoFluxDivKernel, ThermoInjectKernel, ThermoSpectralKernel,
 };
 use super::{GemmTransposeBKernel, GpuContext, VectorAddKernel};
 use crate::thermo::field::{init_field, ThermoConfig};
@@ -208,6 +209,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
+/// `out[r*n + j] = a[r*n + j] + bias[j]` — bias broadcast over `rows`
+/// (batched readout: B logit rows share one bias vector).
+const BIAS_ROW_ADD_WGSL: &str = "
+struct P { rows:u32, n:u32, _0:u32, _1:u32, _2:u32, _3:u32, _4:u32, _5:u32 };
+@group(0) @binding(0) var<storage, read>       a:    array<f32>;
+@group(0) @binding(1) var<storage, read>       bias: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out:  array<f32>;
+var<push_constant> p: P;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= p.rows * p.n) { return; }
+    out[idx] = a[idx] + bias[idx % p.n];
+}
+";
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct BiasRowAddParams {
+    rows: u32,
+    n: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+    _p3: u32,
+    _p4: u32,
+    _p5: u32,
+}
+
+pub struct ThermoBiasRowAddKernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bgl: Arc<wgpu::BindGroupLayout>,
+}
+
+impl ThermoBiasRowAddKernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let (pipeline, bgl) = build(ctx, "thermo_bias_row_add", BIAS_ROW_ADD_WGSL, &[true, true, false]);
+        Self { pipeline, bgl }
+    }
+    pub fn dispatch_into(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, a: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer, rows: u32, n: u32) {
+        let p = BiasRowAddParams { rows, n, _p0: 0, _p1: 0, _p2: 0, _p3: 0, _p4: 0, _p5: 0 };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[a, bias, out], bytemuck::bytes_of(&p), (rows * n).div_ceil(WG));
+    }
+}
+
 pub struct ThermoScaleKernel {
     pipeline: Arc<wgpu::ComputePipeline>,
     bgl: Arc<wgpu::BindGroupLayout>,
@@ -259,6 +306,169 @@ impl ThermoFluxScatterKernel {
     }
 }
 
+// ───── fused transport forward: extract + flux-div + assemble ───────────
+//
+// One thread per field element. Conserved channels compute the flux
+// divergence directly from `raw`'s flux slots at this cell + the left/down
+// neighbours (no fx/fy/div buffers); free channels read their delta slot;
+// every channel adds the residual and the (anneal-scaled) diffusion delta.
+// `diff` must be zero when diffusion is off (anneal·0 = 0).
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TransportFwdParams {
+    h: u32,
+    w: u32,
+    c: u32,
+    nc: u32,
+    cout: u32,
+    nb: u32,
+    dt: f32,
+    anneal: f32,
+}
+
+const TRANSPORT_FWD_WGSL: &str = "
+struct P { h:u32, w:u32, c:u32, nc:u32, cout:u32, nb:u32, dt:f32, anneal:f32 };
+@group(0) @binding(0) var<storage, read>       s:    array<f32>;  // [nb*cells*c]
+@group(0) @binding(1) var<storage, read>       raw:  array<f32>;  // [nb*cells*cout]
+@group(0) @binding(2) var<storage, read>       diff: array<f32>;  // [nb*cells*c]
+@group(0) @binding(3) var<storage, read>       kind: array<u32>;  // [c]
+@group(0) @binding(4) var<storage, read>       slot: array<u32>;  // [c]
+@group(0) @binding(5) var<storage, read_write> out:  array<f32>;  // [nb*cells*c]
+var<push_constant> p: P;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= p.nb * p.h * p.w * p.c) { return; }
+    let ch = idx % p.c;
+    let cell = idx / p.c;
+    let row = cell / p.w;
+    let g = row / p.h;
+    let i = row % p.h;
+    let j = cell % p.w;
+    let nfree = p.c - p.nc;
+    let cbase = cell * p.cout;
+    let gbase = g * p.h * p.w;
+    var v = s[idx] + p.dt * p.anneal * diff[idx];
+    if (kind[ch] == 1u) {
+        let m = slot[ch];
+        var in_left = 0.0;
+        if (j > 0u) { in_left = raw[(gbase + i * p.w + (j - 1u)) * p.cout + nfree + m]; }
+        var fx_self = 0.0;
+        if (j + 1u < p.w) { fx_self = raw[cbase + nfree + m]; }
+        var in_down = 0.0;
+        if (i > 0u) { in_down = raw[(gbase + (i - 1u) * p.w + j) * p.cout + nfree + p.nc + m]; }
+        var fy_self = 0.0;
+        if (i + 1u < p.h) { fy_self = raw[cbase + nfree + p.nc + m]; }
+        v = v + p.dt * ((in_left - fx_self) + (in_down - fy_self));
+    } else {
+        v = v + p.dt * raw[cbase + slot[ch]];
+    }
+    out[idx] = v;
+}
+";
+
+// ───── fused transport backward: disassemble + flux-div adjoint + scatter ─
+//
+// Adjoint of `TransportFwd`. One thread per `d_raw` slot. Writes every
+// `cout` slot (free deltas, then fx/fy flux components), so `d_raw` needs
+// no pre-zero. Reads only `d_out` (cell + right/bottom neighbours).
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TransportBwdParams {
+    h: u32,
+    w: u32,
+    c: u32,
+    nc: u32,
+    cout: u32,
+    nb: u32,
+    dt: f32,
+    _pad: u32,
+}
+
+const TRANSPORT_BWD_WGSL: &str = "
+struct P { h:u32, w:u32, c:u32, nc:u32, cout:u32, nb:u32, dt:f32, _pad:u32 };
+@group(0) @binding(0) var<storage, read>       d_out:   array<f32>;  // [nb*cells*c]
+@group(0) @binding(1) var<storage, read>       cons_ch: array<u32>;  // [nc]
+@group(0) @binding(2) var<storage, read>       free_ch: array<u32>;  // [nfree]
+@group(0) @binding(3) var<storage, read_write> draw:    array<f32>;  // [nb*cells*cout]
+var<push_constant> p: P;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= p.nb * p.h * p.w * p.cout) { return; }
+    let co = idx % p.cout;
+    let cell = idx / p.cout;
+    let row = cell / p.w;
+    let g = row / p.h;
+    let i = row % p.h;
+    let j = cell % p.w;
+    let nfree = p.c - p.nc;
+    let cbase = cell * p.c;
+    let gbase = g * p.h * p.w;
+    var val = 0.0;
+    if (co < nfree) {
+        let ch = free_ch[co];
+        val = p.dt * d_out[cbase + ch];
+    } else if (co < nfree + p.nc) {
+        let m = co - nfree;
+        let ch = cons_ch[m];
+        if (j + 1u < p.w) {
+            let self_v = p.dt * d_out[cbase + ch];
+            let right = p.dt * d_out[(gbase + i * p.w + (j + 1u)) * p.c + ch];
+            val = right - self_v;
+        }
+    } else {
+        let m = co - nfree - p.nc;
+        let ch = cons_ch[m];
+        if (i + 1u < p.h) {
+            let self_v = p.dt * d_out[cbase + ch];
+            let bottom = p.dt * d_out[(gbase + (i + 1u) * p.w + j) * p.c + ch];
+            val = bottom - self_v;
+        }
+    }
+    draw[idx] = val;
+}
+";
+
+pub struct StepTransportFwdKernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bgl: Arc<wgpu::BindGroupLayout>,
+}
+pub struct StepTransportBwdKernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bgl: Arc<wgpu::BindGroupLayout>,
+}
+
+impl StepTransportFwdKernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let (pipeline, bgl) = build(ctx, "thermo_transport_fwd", TRANSPORT_FWD_WGSL, &[true, true, true, true, true, false]);
+        Self { pipeline, bgl }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_b(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, s: &GpuBuffer, raw: &GpuBuffer, diff: &GpuBuffer, kind: &GpuBuffer, slot: &GpuBuffer, out: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, nb: u32, dt: f32, anneal: f32) {
+        let p = TransportFwdParams { h, w, c, nc, cout, nb, dt, anneal };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[s, raw, diff, kind, slot, out], bytemuck::bytes_of(&p), (nb * h * w * c).div_ceil(WG));
+    }
+}
+
+impl StepTransportBwdKernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let (pipeline, bgl) = build(ctx, "thermo_transport_bwd", TRANSPORT_BWD_WGSL, &[true, true, true, false]);
+        Self { pipeline, bgl }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_b(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, d_out: &GpuBuffer, cons_ch: &GpuBuffer, free_ch: &GpuBuffer, draw: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, nb: u32, dt: f32) {
+        let p = TransportBwdParams { h, w, c, nc, cout, nb, dt, _pad: 0 };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[d_out, cons_ch, free_ch, draw], bytemuck::bytes_of(&p), (nb * h * w * cout).div_ceil(WG));
+    }
+}
+
 // ───── orchestrator (forward only) ──────────────────────────────────────
 
 pub struct ThermoGpuForward {
@@ -272,6 +482,8 @@ pub struct ThermoGpuForward {
     diff: ThermoDiffusionForwardKernel,
     assemble: StepAssembleKernel,
     pool: ThermoAvgPoolKernel,
+    spectral: ThermoSpectralKernel,
+    feat_assemble: ThermoFeatureAssembleKernel,
     gtb: GemmTransposeBKernel,
     vadd: VectorAddKernel,
     inject: ThermoInjectKernel,
@@ -300,21 +512,26 @@ pub struct ThermoGpuForward {
     diff_delta: GpuBuffer,
     lap: GpuBuffer,
     pooled: GpuBuffer,
+    basis: GpuBuffer,
+    spec: GpuBuffer,
+    feat: GpuBuffer,
     lraw: GpuBuffer,
     logits_t: GpuBuffer,
 }
 
 impl ThermoGpuForward {
-    /// Moment-readout only (spectral GPU path is a later addition).
+    /// Moment and/or spectral-DCT readout (mirrors `ThermoLM::forward`).
     #[must_use]
     pub fn new(ctx: &GpuContext, model: &ThermoLM) -> Self {
         let cfg = model.config.clone();
-        assert!(cfg.readout_moments && !cfg.readout_spectral, "GPU forward = moments-only readout");
+        assert!(cfg.readout_moments || cfg.readout_spectral, "readout must use moments and/or spectral");
         let cells = cfg.cells();
         let c = cfg.c;
         let ch = cfg.conv_hidden;
         let cout = cfg.c_out();
         let nc = cfg.n_conserved();
+        let sdim = cfg.spectral_dim();
+        let rdim = cfg.readout_dim();
 
         let (kind, slot) = cfg.channel_decode();
 
@@ -328,6 +545,8 @@ impl ThermoGpuForward {
             diff: ThermoDiffusionForwardKernel::new(ctx),
             assemble: StepAssembleKernel::new(ctx),
             pool: ThermoAvgPoolKernel::new(ctx),
+            spectral: ThermoSpectralKernel::new(ctx),
+            feat_assemble: ThermoFeatureAssembleKernel::new(ctx),
             gtb: GemmTransposeBKernel::new(ctx),
             vadd: VectorAddKernel::new(ctx),
             inject: ThermoInjectKernel::new(ctx),
@@ -354,6 +573,13 @@ impl ThermoGpuForward {
             diff_delta: GpuBuffer::zeros(ctx, "diff_delta", cells * c),
             lap: GpuBuffer::zeros(ctx, "lap", cells * c),
             pooled: GpuBuffer::zeros(ctx, "pooled", cfg.pooled_dim()),
+            basis: GpuBuffer::from_slice(
+                ctx,
+                "basis",
+                if model.readout.basis.is_empty() { &[0.0_f32] } else { &model.readout.basis },
+            ),
+            spec: GpuBuffer::zeros(ctx, "spec", sdim.max(1)),
+            feat: GpuBuffer::zeros(ctx, "feat", rdim),
             lraw: GpuBuffer::zeros(ctx, "lraw", cfg.vocab),
             logits_t: GpuBuffer::zeros(ctx, "logits_t", cfg.vocab),
         }
@@ -402,9 +628,21 @@ impl ThermoGpuForward {
                 cur = 1 - cur;
             }
 
-            // readout (moments): avgpool → gemmᵀ → +bias → logits[ti]
-            self.pool.dispatch_into(&self.ctx, &mut enc, fields[cur], &self.pooled, h as u32, w as u32, c as u32, cfg.pool as u32);
-            self.gtb.dispatch_into(&self.ctx, &mut enc, &self.pooled, &self.projw, &self.lraw, 1, vocab as u32, cfg.pooled_dim() as u32);
+            // readout: moments (avgpool) and/or spectral (DCT) → feat → gemmᵀ → +bias
+            let rdim = cfg.readout_dim();
+            if cfg.readout_spectral {
+                if cfg.readout_moments {
+                    self.pool.dispatch_into(&self.ctx, &mut enc, fields[cur], &self.pooled, h as u32, w as u32, c as u32, cfg.pool as u32);
+                }
+                let msq = (cfg.readout_modes * cfg.readout_modes) as u32;
+                self.spectral.dispatch_b(&self.ctx, &mut enc, fields[cur], &self.basis, &self.spec, cells as u32, c as u32, msq, 1);
+                let mdim = if cfg.readout_moments { cfg.pooled_dim() } else { 0 };
+                self.feat_assemble.dispatch_b(&self.ctx, &mut enc, &self.pooled, &self.spec, &self.feat, mdim as u32, cfg.spectral_dim() as u32, 1);
+                self.gtb.dispatch_into(&self.ctx, &mut enc, &self.feat, &self.projw, &self.lraw, 1, vocab as u32, rdim as u32);
+            } else {
+                self.pool.dispatch_into(&self.ctx, &mut enc, fields[cur], &self.pooled, h as u32, w as u32, c as u32, cfg.pool as u32);
+                self.gtb.dispatch_into(&self.ctx, &mut enc, &self.pooled, &self.projw, &self.lraw, 1, vocab as u32, rdim as u32);
+            }
             self.vadd.dispatch_into(&self.ctx, &mut enc, &self.lraw, &self.bias, &self.logits_t, vocab as u32);
             enc.copy_buffer_to_buffer(&self.logits_t.inner, 0, &logits.inner, (ti * vocab * 4) as u64, (vocab * 4) as u64);
         }

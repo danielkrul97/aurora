@@ -1,4 +1,11 @@
-#![allow(clippy::cast_precision_loss, clippy::needless_range_loop, clippy::must_use_candidate)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::needless_range_loop,
+    clippy::must_use_candidate,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::suboptimal_flops
+)]
 
 //! Readout head: field → vocab logits.
 //!
@@ -17,7 +24,7 @@
 
 use rand::Rng;
 
-use crate::attention::{linear_backward, linear_forward, LinearGrads, LinearProj};
+use crate::attention::{linear_backward, LinearGrads, LinearProj};
 use crate::thermo::field::ThermoConfig;
 
 #[derive(Clone, Debug)]
@@ -146,6 +153,28 @@ fn spectral_coeffs(s: &[f32], w: &ReadoutWeights, cfg: &ThermoConfig) -> Vec<f32
     out
 }
 
+/// Dot product with 8 independent accumulator lanes. The fixed-width inner
+/// step lets LLVM emit packed multiply-add; the lanes break the serial
+/// dependency that pins a naive `acc += a*b` reduction at scalar latency.
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = [0.0_f32; 8];
+    let chunks = a.len() / 8;
+    for ch in 0..chunks {
+        let ar = &a[ch * 8..ch * 8 + 8];
+        let br = &b[ch * 8..ch * 8 + 8];
+        for l in 0..8 {
+            acc[l] += ar[l] * br[l];
+        }
+    }
+    let mut s = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    for k in chunks * 8..a.len() {
+        s += a[k] * b[k];
+    }
+    s
+}
+
 pub fn readout_forward(s: &[f32], w: &ReadoutWeights, cfg: &ThermoConfig) -> (Vec<f32>, ReadoutCache) {
     let mut features = Vec::with_capacity(cfg.readout_dim());
     if w.use_moments {
@@ -154,9 +183,11 @@ pub fn readout_forward(s: &[f32], w: &ReadoutWeights, cfg: &ThermoConfig) -> (Ve
     if w.use_spectral {
         features.extend_from_slice(&spectral_coeffs(s, w, cfg));
     }
-    let mut logits = linear_forward(&w.proj, &features);
-    for v in 0..cfg.vocab {
-        logits[v] += w.bias[v];
+    let d_in = w.proj.d_in;
+    let mut logits = vec![0.0_f32; cfg.vocab];
+    for o in 0..cfg.vocab {
+        let row = &w.proj.w[o * d_in..(o + 1) * d_in];
+        logits[o] = dot(row, &features) + w.bias[o];
     }
     (logits, ReadoutCache { features })
 }

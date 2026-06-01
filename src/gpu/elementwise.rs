@@ -153,6 +153,97 @@ impl VectorAddKernel {
     }
 }
 
+const VECTOR_ADD3_WGSL: &str = "
+struct P { n: u32, _p0: u32, _p1: u32, _p2: u32 };
+@group(0) @binding(0) var<storage, read>       a: array<f32>;
+@group(0) @binding(1) var<storage, read>       b: array<f32>;
+@group(0) @binding(2) var<storage, read>       c: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+var<push_constant> p: P;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= p.n) { return; }
+    y[i] = a[i] + b[i] + c[i];
+}
+";
+
+/// Fused 3-input elementwise add `y = a + b + c`. Replaces a two-`VectorAdd`
+/// chain (saves one dispatch + one full-field round-trip per call).
+pub struct VectorAdd3Kernel {
+    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
+}
+
+impl VectorAdd3Kernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let module = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("aurora vector_add3"),
+            source: wgpu::ShaderSource::Wgsl(VECTOR_ADD3_WGSL.into()),
+        });
+        let bgl = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("aurora vector_add3 bgl"),
+            entries: &[
+                storage_entry(0, true),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, false),
+            ],
+        });
+        let pl = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("aurora vector_add3 pl"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..16,
+            }],
+        });
+        let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("aurora vector_add3"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        Self { pipeline: Arc::new(pipeline), bgl: Arc::new(bgl) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_into(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        a: &GpuBuffer,
+        b: &GpuBuffer,
+        c: &GpuBuffer,
+        y: &GpuBuffer,
+        n: u32,
+    ) {
+        let p = EltParams { n, _p0: 0, _p1: 0, _p2: 0 };
+        let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora vector_add3 bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: a.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: c.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: y.inner.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("aurora vector_add3 pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+    }
+}
+
 pub struct ZeroBufferKernel {
     pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
     pub(crate) bgl: Arc<wgpu::BindGroupLayout>,

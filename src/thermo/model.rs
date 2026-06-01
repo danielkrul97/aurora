@@ -17,7 +17,10 @@
 
 use rand::Rng;
 
-use crate::optimizer::{adamw_apply, bias_correction, AdamGroup, AdamWConfig};
+use crate::optimizer::{
+    adamw_apply, bias_correction, muon_apply, AdamGroup, AdamWConfig, MuonConfig, MuonGroup,
+    MuonScratch,
+};
 use crate::thermo::field::{init_field, ThermoConfig};
 use crate::transformer::loss::cross_entropy_with_grad;
 use crate::thermo::inject::{inject_backward, inject_forward, InjectCache, InjectGrads, InjectWeights};
@@ -40,7 +43,20 @@ pub struct ThermoLM {
     pub inject: InjectWeights,
     pub readout: ReadoutWeights,
     pub adam: ThermoAdam,
+    pub muon: ThermoMuon,
     pub step_count: u64,
+    /// Re-inject the token (anneal-scaled) before every sub-step instead of
+    /// once per token (H31). Set by the trainer; default false.
+    pub inject_every: bool,
+}
+
+/// Muon momentum buffers for the matrix params (conv kernels + readout
+/// projection). The 1-D gates/biases and the injection table stay on AdamW.
+#[derive(Clone, Debug)]
+pub struct ThermoMuon {
+    pub conv_w1: MuonGroup,
+    pub conv_w2: MuonGroup,
+    pub ro_w: MuonGroup,
 }
 
 #[derive(Clone, Debug)]
@@ -74,13 +90,20 @@ impl ThermoLM {
             ro_w: AdamGroup::zeros(readout.proj.w.len()),
             ro_bias: AdamGroup::zeros(readout.bias.len()),
         };
+        let muon = ThermoMuon {
+            conv_w1: MuonGroup::zeros(step.conv.w1.len()),
+            conv_w2: MuonGroup::zeros(step.conv.w2.len()),
+            ro_w: MuonGroup::zeros(readout.proj.w.len()),
+        };
         Self {
             config,
             step,
             inject,
             readout,
             adam,
+            muon,
             step_count: 0,
+            inject_every: false,
         }
     }
 
@@ -98,7 +121,9 @@ impl ThermoLM {
 
 #[derive(Clone, Debug, Default)]
 pub struct RolloutCache {
-    pub inj: Vec<InjectCache>,
+    /// `[T][n_inj]` inject caches: `n_inj = 1` (once per token) or `K` (every
+    /// sub-step, when `inject_every`).
+    pub inj: Vec<Vec<InjectCache>>,
     /// `[T][K]` sub-step caches.
     pub steps: Vec<Vec<StepCache>>,
     pub readout: Vec<ReadoutCache>,
@@ -206,16 +231,24 @@ impl ThermoLM {
         };
 
         for ti in 0..t {
-            let (f_inj, ic) = inject_forward(&field, tokens[ti], 1.0, &self.inject, cfg);
-            field = f_inj;
-            cache.inj.push(ic);
-
+            let mut ics = Vec::with_capacity(k);
             let mut sc = Vec::with_capacity(k);
+            if !self.inject_every {
+                let (f_inj, ic) = inject_forward(&field, tokens[ti], 1.0, &self.inject, cfg);
+                field = f_inj;
+                ics.push(ic);
+            }
             for kk in 0..k {
+                if self.inject_every {
+                    let (f_inj, ic) = inject_forward(&field, tokens[ti], anneal_at(kk, cfg), &self.inject, cfg);
+                    field = f_inj;
+                    ics.push(ic);
+                }
                 let (f_next, c) = step_forward(&field, &self.step, anneal_at(kk, cfg), cfg);
                 field = f_next;
                 sc.push(c);
             }
+            cache.inj.push(ics);
             cache.steps.push(sc);
 
             let (lg, rc) = readout_forward(&field, &self.readout, cfg);
@@ -236,9 +269,15 @@ impl ThermoLM {
         let mut field = init_field(cfg);
         let mut logits = vec![0.0_f32; t * vocab];
         for ti in 0..t {
-            let (f_inj, _) = inject_forward(&field, tokens[ti], 1.0, &self.inject, cfg);
-            field = f_inj;
+            if !self.inject_every {
+                let (f_inj, _) = inject_forward(&field, tokens[ti], 1.0, &self.inject, cfg);
+                field = f_inj;
+            }
             for kk in 0..k {
+                if self.inject_every {
+                    let (f_inj, _) = inject_forward(&field, tokens[ti], anneal_at(kk, cfg), &self.inject, cfg);
+                    field = f_inj;
+                }
                 let (f_next, _) = step_forward(&field, &self.step, anneal_at(kk, cfg), cfg);
                 field = f_next;
             }
@@ -279,8 +318,13 @@ impl ThermoLM {
 
             for kk in (0..k).rev() {
                 d_field = step_backward(&self.step, &cache.steps[ti][kk], &d_field, &mut grads.step, cfg);
+                if self.inject_every {
+                    d_field = inject_backward(&cache.inj[ti][kk], &d_field, &self.inject, &mut grads.inject, cfg);
+                }
             }
-            d_field = inject_backward(&cache.inj[ti], &d_field, &self.inject, &mut grads.inject, cfg);
+            if !self.inject_every {
+                d_field = inject_backward(&cache.inj[ti][0], &d_field, &self.inject, &mut grads.inject, cfg);
+            }
         }
 
         total_loss / t as f32
@@ -313,6 +357,41 @@ impl ThermoLM {
         apply(&mut self.step.diffusion.b, &grads.step.diffusion.d_b, &mut self.adam.diff_b, false);
         apply(&mut self.inject.inj, &grads.inject.d_inj, &mut self.adam.inj, true);
         apply(&mut self.readout.proj.w, &grads.readout.d_proj.d_w, &mut self.adam.ro_w, true);
+        apply(&mut self.readout.bias, &grads.readout.d_bias, &mut self.adam.ro_bias, false);
+    }
+
+    /// Hybrid step: Muon (orthogonalized update) for the matrix params —
+    /// conv `W1` (`c_h × c·9`), conv `W2` (`c_out × c_h`), readout proj
+    /// (`vocab × readout_dim`) — and AdamW for the 1-D gates/biases and the
+    /// injection table (à la the transformer's `step_muon_hybrid`).
+    pub fn step_muon_hybrid(
+        &mut self,
+        grads: &ThermoGrads,
+        adam_cfg: &AdamWConfig,
+        muon_cfg: &MuonConfig,
+        scratch: &mut MuonScratch,
+    ) {
+        self.step_count += 1;
+        let (bc1, bc2) = bias_correction(self.step_count as usize, adam_cfg.beta1, adam_cfg.beta2);
+        let (c, ch, cout, vocab, rdim) = (
+            self.config.c,
+            self.config.conv_hidden,
+            self.config.c_out(),
+            self.config.vocab,
+            self.config.readout_dim(),
+        );
+        muon_apply(&mut self.step.conv.w1, &grads.step.conv.d_w1, &mut self.muon.conv_w1, ch, c * 9, muon_cfg, scratch);
+        muon_apply(&mut self.step.conv.w2, &grads.step.conv.d_w2, &mut self.muon.conv_w2, cout, ch, muon_cfg, scratch);
+        muon_apply(&mut self.readout.proj.w, &grads.readout.d_proj.d_w, &mut self.muon.ro_w, vocab, rdim, muon_cfg, scratch);
+        let apply = |p: &mut [f32], g: &[f32], grp: &mut AdamGroup, wd: bool| {
+            adamw_apply(p, g, grp, adam_cfg, bc1, bc2, wd);
+        };
+        apply(&mut self.step.conv.b1, &grads.step.conv.d_b1, &mut self.adam.conv_b1, false);
+        apply(&mut self.step.conv.b2, &grads.step.conv.d_b2, &mut self.adam.conv_b2, false);
+        apply(&mut self.step.diffusion.k0, &grads.step.diffusion.d_k0, &mut self.adam.diff_k0, false);
+        apply(&mut self.step.diffusion.a, &grads.step.diffusion.d_a, &mut self.adam.diff_a, false);
+        apply(&mut self.step.diffusion.b, &grads.step.diffusion.d_b, &mut self.adam.diff_b, false);
+        apply(&mut self.inject.inj, &grads.inject.d_inj, &mut self.adam.inj, true);
         apply(&mut self.readout.bias, &grads.readout.d_bias, &mut self.adam.ro_bias, false);
     }
 }

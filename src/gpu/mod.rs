@@ -38,7 +38,7 @@ pub mod transformer;
 
 pub use attention::{CausalMhaBackwardKernel, CausalMhaForwardKernel};
 pub use context::GpuContext;
-pub use elementwise::{VectorAddKernel, ZeroBufferKernel};
+pub use elementwise::{VectorAdd3Kernel, VectorAddKernel, ZeroBufferKernel};
 pub use embedding::{EmbedScatterAddKernel, TokenPosEmbedKernel};
 pub use gelu::{GeluBackwardKernel, GeluKernel};
 pub use kv_cache::{KvBlockGpu, KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
@@ -51,22 +51,26 @@ pub use muon::{
 pub use optimizer::AdamWKernel;
 pub use reduce::{
     EmbedScatterReduceKernel, GradNormFinalizeKernel, GradNormSqReduceKernel,
-    OuterProductAccumKernel, RowReduceAddKernel, ScaleByBufferKernel,
+    OuterProductAccumKernel, OuterProductSplitKKernel, RowReduceAddKernel, ScaleByBufferKernel,
 };
 pub use softmax_ce::SoftmaxCrossEntropyKernel;
 pub use thermo_model::ThermoGpu;
 pub use thermo_conv::{
-    ThermoConv1x1Kernel, ThermoConv3x3Dw1Kernel, ThermoConv3x3DsKernel, ThermoConv3x3GeluKernel,
-    ThermoConv3x3Kernel,
+    ThermoConv1x1Kernel, ThermoConv3x3Dw1Kernel, ThermoConv3x3Dw1SplitKKernel,
+    ThermoConv3x3DsKernel, ThermoConv3x3GeluCacheKernel, ThermoConv3x3GeluKernel,
+    ThermoConv3x3Kernel, ThermoConvBwdHiddenKernel,
 };
 pub use thermo_stencil::{
-    ThermoDiffusionBwdDsKernel, ThermoDiffusionBwdParamKernel, ThermoDiffusionBwdPreKernel,
-    ThermoDiffusionForwardKernel, ThermoFluxDivBackwardKernel, ThermoFluxDivKernel,
-    ThermoAvgPoolBackwardKernel, ThermoAvgPoolKernel, ThermoInjectBackwardKernel,
-    ThermoInjectKernel,
+    ThermoAvgPoolBackwardKernel, ThermoAvgPoolKernel, ThermoDiffusionBwdDsKernel,
+    ThermoDiffusionBwdParamKernel, ThermoDiffusionBwdPreKernel, ThermoDiffusionForwardKernel,
+    ThermoFeatureAssembleKernel, ThermoFeatureDisassembleKernel, ThermoFluxDivBackwardKernel,
+    ThermoFluxDivKernel, ThermoInjectBackwardBatchedKernel, ThermoInjectBackwardKernel,
+    ThermoInjectBatchedKernel, ThermoInjectKernel, ThermoSpectralBackwardKernel,
+    ThermoSpectralKernel,
 };
 pub use thermo_step::{
-    ExtractFluxKernel, StepAssembleKernel, ThermoDisassembleKernel, ThermoFluxScatterKernel,
-    ThermoGpuForward, ThermoScaleKernel,
+    ExtractFluxKernel, StepAssembleKernel, StepTransportBwdKernel, StepTransportFwdKernel,
+    ThermoBiasRowAddKernel, ThermoDisassembleKernel, ThermoFluxScatterKernel, ThermoGpuForward,
+    ThermoScaleKernel,
 };
 pub use transformer::DecoderTransformerGpu;

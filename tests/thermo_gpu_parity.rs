@@ -24,6 +24,8 @@ use aurora::thermo::inject::{inject_backward, inject_forward, InjectGrads, Injec
 use aurora::thermo::model::{ThermoGrads, ThermoLM};
 use aurora::thermo::readout::{readout_backward, readout_forward, ReadoutGrads, ReadoutWeights};
 use aurora::thermo::step::{step_backward, step_forward, StepGrads, StepWeights};
+use aurora::optimizer::{AdamWConfig, MuonConfig, MuonScratch};
+use aurora::transformer::loss::softmax;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -604,8 +606,8 @@ fn rollout_backward_param_grads_match_cpu() {
     let mut g_cpu = ThermoGrads::zeros(&cfg);
     let loss_cpu = model.backward(&cache, &targets, &mut g_cpu);
 
-    // GPU forward+backward.
-    let gpu = ThermoGpu::new(&ctx, &model, seq_len);
+    // GPU forward+backward (batch = 1).
+    let gpu = ThermoGpu::new(&ctx, &model, seq_len, 1);
     gpu.zero_grad();
     gpu.forward(&tokens);
     let loss_gpu = gpu.backward(&tokens, &targets);
@@ -627,4 +629,355 @@ fn rollout_backward_param_grads_match_cpu() {
     chk("d_inj", &g_cpu.inject.d_inj, &g_gpu.inject.d_inj);
     chk("d_proj", &g_cpu.readout.d_proj.d_w, &g_gpu.readout.d_proj.d_w);
     chk("d_bias", &g_cpu.readout.d_bias, &g_gpu.readout.d_bias);
+}
+
+/// On-device batch (B>1) must equal the CPU mean over B independent windows:
+/// each grid carries its own tokens, grads sum across the batch, loss is the
+/// B×T mean. Guards the stacked-grid indexing in every batched kernel.
+#[test]
+fn rollout_backward_batched_matches_cpu() {
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0xBA7C);
+    let cfg = ThermoConfig {
+        vocab: 16,
+        h: 8,
+        w: 8,
+        c: 6,
+        conv_hidden: 8,
+        conserved: vec![CH_RHO, CH_E],
+        k_steps: 2,
+        pool: 2,
+        dt: 0.1,
+        t_init: 1.0,
+        anneal_tmax: 1.0,
+        anneal_alpha: 1.0,
+        readout_moments: true,
+        readout_spectral: false,
+        readout_modes: 4,
+        use_diffusion: true,
+    };
+    let model = ThermoLM::new(cfg.clone(), &mut rng);
+    let seq_len = 4;
+    let batch = 3;
+
+    // B independent windows; distinct tokens per grid exercise the per-grid
+    // token / profile paths.
+    let toks: Vec<Vec<u32>> = (0..batch)
+        .map(|_| (0..seq_len).map(|_| rng.random_range(0..cfg.vocab as u32)).collect())
+        .collect();
+    let tgts: Vec<Vec<u32>> = (0..batch)
+        .map(|_| (0..seq_len).map(|_| rng.random_range(0..cfg.vocab as u32)).collect())
+        .collect();
+
+    // CPU reference: per-window backward (each scales 1/T), summed then /B.
+    let mut g_cpu = ThermoGrads::zeros(&cfg);
+    let mut loss_cpu = 0.0_f32;
+    for b in 0..batch {
+        let cache = model.forward(&toks[b]);
+        let mut g = ThermoGrads::zeros(&cfg);
+        loss_cpu += model.backward(&cache, &tgts[b], &mut g);
+        g_cpu.add_assign(&g);
+    }
+    g_cpu.scale(1.0 / batch as f32);
+    loss_cpu /= batch as f32;
+
+    // GPU: flattened [T, B] (row = ti*B + b).
+    let mut tok_flat = vec![0u32; seq_len * batch];
+    let mut tgt_flat = vec![0u32; seq_len * batch];
+    for b in 0..batch {
+        for ti in 0..seq_len {
+            tok_flat[ti * batch + b] = toks[b][ti];
+            tgt_flat[ti * batch + b] = tgts[b][ti];
+        }
+    }
+
+    let gpu = ThermoGpu::new(&ctx, &model, seq_len, batch);
+    gpu.zero_grad();
+    gpu.forward(&tok_flat);
+    let loss_gpu = gpu.backward(&tok_flat, &tgt_flat);
+    let g_gpu = gpu.download_grads();
+
+    assert!((loss_cpu - loss_gpu).abs() < 1e-2, "batched loss {loss_cpu} vs {loss_gpu}");
+    let chk = |name: &str, cpu: &[f32], gpu: &[f32]| {
+        let e = max_rel_err(cpu, gpu);
+        assert!(e < 2e-2, "batched param-grad {name}: max_rel_err {e}");
+    };
+    chk("d_w1", &g_cpu.step.conv.d_w1, &g_gpu.step.conv.d_w1);
+    chk("d_b1", &g_cpu.step.conv.d_b1, &g_gpu.step.conv.d_b1);
+    chk("d_w2", &g_cpu.step.conv.d_w2, &g_gpu.step.conv.d_w2);
+    chk("d_b2", &g_cpu.step.conv.d_b2, &g_gpu.step.conv.d_b2);
+    chk("d_k0", &g_cpu.step.diffusion.d_k0, &g_gpu.step.diffusion.d_k0);
+    chk("d_a", &g_cpu.step.diffusion.d_a, &g_gpu.step.diffusion.d_a);
+    chk("d_b", &g_cpu.step.diffusion.d_b, &g_gpu.step.diffusion.d_b);
+    chk("d_inj", &g_cpu.inject.d_inj, &g_gpu.inject.d_inj);
+    chk("d_proj", &g_cpu.readout.d_proj.d_w, &g_gpu.readout.d_proj.d_w);
+    chk("d_bias", &g_cpu.readout.d_bias, &g_gpu.readout.d_bias);
+}
+
+/// On-device eval (`ThermoGpu::eval_nats`) must equal the CPU softmax-NLL
+/// over the same non-overlapping windows (the H1 replacement for the
+/// `to_cpu` + CPU `evaluate` path). Window count is not a multiple of the
+/// batch, so the tail-padding/masking is exercised.
+#[test]
+fn gpu_eval_matches_cpu() {
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0xE7A1);
+    let cfg = ThermoConfig {
+        vocab: 16,
+        h: 8,
+        w: 8,
+        c: 6,
+        conv_hidden: 8,
+        conserved: vec![CH_RHO, CH_E],
+        k_steps: 2,
+        pool: 2,
+        dt: 0.1,
+        t_init: 1.0,
+        anneal_tmax: 1.0,
+        anneal_alpha: 1.0,
+        readout_moments: true,
+        readout_spectral: false,
+        readout_modes: 4,
+        use_diffusion: true,
+    };
+    let model = ThermoLM::new(cfg.clone(), &mut rng);
+    let seq = 4;
+    let batch = 3;
+    let val: Vec<u32> = (0..seq * 11).map(|_| rng.random_range(0..cfg.vocab as u32)).collect();
+
+    // CPU reference over all non-overlapping windows (eval_nats max_windows=0).
+    let all: Vec<usize> = (0..).map(|i| i * seq).take_while(|&p| p + seq + 1 < val.len()).collect();
+    let mut nats_cpu = 0.0_f64;
+    for &p in &all {
+        let logits = model.forward(&val[p..p + seq]).logits;
+        for ti in 0..seq {
+            let probs = softmax(&logits[ti * cfg.vocab..(ti + 1) * cfg.vocab]);
+            nats_cpu += f64::from(-probs[val[p + ti + 1] as usize].max(1e-12).ln());
+        }
+    }
+
+    let gpu = ThermoGpu::new(&ctx, &model, seq, batch);
+    let (nats_gpu, ntok) = gpu.eval_nats(&val, 0);
+    assert_eq!(ntok, all.len() * seq, "scored-token count");
+    let rel = ((nats_cpu - nats_gpu).abs() / nats_cpu.max(1e-6)) as f32;
+    assert!(rel < 2e-2, "gpu eval nats {nats_gpu} vs cpu {nats_cpu} rel {rel}");
+}
+
+/// Inject-every-sub-step (H31): GPU rollout fwd+bwd with `inject_every` must
+/// match the CPU model. K=3 with the default anneal gives three differently
+/// scaled injections per token, so `d_inj` (and the field trajectory feeding
+/// every other grad) exercises the per-sub-step inject + its adjoint.
+#[test]
+fn rollout_backward_inject_every_matches_cpu() {
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x13EE);
+    let cfg = ThermoConfig {
+        vocab: 16,
+        h: 8,
+        w: 8,
+        c: 6,
+        conv_hidden: 8,
+        conserved: vec![CH_RHO, CH_E],
+        k_steps: 3,
+        pool: 2,
+        dt: 0.1,
+        t_init: 1.0,
+        anneal_tmax: 1.0,
+        anneal_alpha: 1.0,
+        readout_moments: true,
+        readout_spectral: false,
+        readout_modes: 4,
+        use_diffusion: true,
+    };
+    let mut model = ThermoLM::new(cfg.clone(), &mut rng);
+    model.inject_every = true;
+    let seq_len = 4;
+    let tokens: Vec<u32> = (0..seq_len).map(|_| rng.random_range(0..cfg.vocab as u32)).collect();
+    let targets: Vec<u32> = (0..seq_len).map(|_| rng.random_range(0..cfg.vocab as u32)).collect();
+
+    let cache = model.forward(&tokens);
+    let mut g_cpu = ThermoGrads::zeros(&cfg);
+    let loss_cpu = model.backward(&cache, &targets, &mut g_cpu);
+
+    let mut gpu = ThermoGpu::new(&ctx, &model, seq_len, 1);
+    gpu.inject_every = true;
+    gpu.zero_grad();
+    gpu.forward(&tokens);
+    let loss_gpu = gpu.backward(&tokens, &targets);
+    let g_gpu = gpu.download_grads();
+
+    assert!((loss_cpu - loss_gpu).abs() < 1e-2, "inject_every loss {loss_cpu} vs {loss_gpu}");
+    let chk = |name: &str, cpu: &[f32], gpu: &[f32]| {
+        let e = max_rel_err(cpu, gpu);
+        assert!(e < 2e-2, "inject_every param-grad {name}: max_rel_err {e}");
+    };
+    chk("d_w1", &g_cpu.step.conv.d_w1, &g_gpu.step.conv.d_w1);
+    chk("d_w2", &g_cpu.step.conv.d_w2, &g_gpu.step.conv.d_w2);
+    chk("d_inj", &g_cpu.inject.d_inj, &g_gpu.inject.d_inj);
+    chk("d_proj", &g_cpu.readout.d_proj.d_w, &g_gpu.readout.d_proj.d_w);
+    chk("d_k0", &g_cpu.step.diffusion.d_k0, &g_gpu.step.diffusion.d_k0);
+}
+
+/// GPU `step_muon_hybrid` must match the CPU `ThermoLM::step_muon_hybrid`
+/// given identical grads: Muon (orthogonalized) for W1/W2/proj, AdamW for the
+/// gates/biases/inject. Compares the param *deltas* (the actual updates), so a
+/// near-stationary param can't mask a wrong update.
+#[test]
+fn gpu_muon_matches_cpu() {
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x4D0E);
+    let cfg = ThermoConfig {
+        vocab: 16,
+        h: 8,
+        w: 8,
+        c: 6,
+        conv_hidden: 8,
+        conserved: vec![CH_RHO, CH_E],
+        k_steps: 2,
+        pool: 2,
+        dt: 0.1,
+        t_init: 1.0,
+        anneal_tmax: 1.0,
+        anneal_alpha: 1.0,
+        readout_moments: true,
+        readout_spectral: false,
+        readout_modes: 4,
+        use_diffusion: true,
+    };
+    let model = ThermoLM::new(cfg.clone(), &mut rng);
+    let seq = 4;
+    let tokens: Vec<u32> = (0..seq).map(|_| rng.random_range(0..cfg.vocab as u32)).collect();
+    let targets: Vec<u32> = (0..seq).map(|_| rng.random_range(0..cfg.vocab as u32)).collect();
+
+    // One set of grads, fed to BOTH optimizers.
+    let cache = model.forward(&tokens);
+    let mut g = ThermoGrads::zeros(&cfg);
+    model.backward(&cache, &targets, &mut g);
+
+    let adam = AdamWConfig::default();
+    let muon = MuonConfig { lr: 0.02, weight_decay: 0.01, ..MuonConfig::default() };
+
+    // CPU step.
+    let mut cpu = model.clone();
+    let mut scratch = MuonScratch::new();
+    cpu.step_muon_hybrid(&g, &adam, &muon, &mut scratch);
+
+    // GPU step from the identical grads.
+    let mut gpu = ThermoGpu::new(&ctx, &model, seq, 2);
+    gpu.upload_grads(&g);
+    gpu.step_muon_hybrid(&adam, &muon);
+    let out = gpu.to_cpu();
+
+    let chk = |name: &str, base: &[f32], cpu: &[f32], gpu: &[f32]| {
+        let dc: Vec<f32> = cpu.iter().zip(base).map(|(a, b)| a - b).collect();
+        let dg: Vec<f32> = gpu.iter().zip(base).map(|(a, b)| a - b).collect();
+        let e = max_rel_err(&dc, &dg);
+        assert!(e < 5e-2, "muon {name} update rel_err {e}");
+    };
+    chk("w1", &model.step.conv.w1, &cpu.step.conv.w1, &out.step.conv.w1);
+    chk("w2", &model.step.conv.w2, &cpu.step.conv.w2, &out.step.conv.w2);
+    chk("proj", &model.readout.proj.w, &cpu.readout.proj.w, &out.readout.proj.w);
+    chk("inj", &model.inject.inj, &cpu.inject.inj, &out.inject.inj);
+    chk("bias", &model.readout.bias, &cpu.readout.bias, &out.readout.bias);
+}
+
+fn spectral_cfg(moments: bool, spectral: bool) -> ThermoConfig {
+    ThermoConfig {
+        vocab: 16,
+        h: 8,
+        w: 8,
+        c: 6,
+        conv_hidden: 8,
+        conserved: vec![CH_RHO, CH_E],
+        k_steps: 2,
+        pool: 2, // lossy moments → spectral carries real signal
+        dt: 0.1,
+        t_init: 1.0,
+        anneal_tmax: 1.0,
+        anneal_alpha: 1.0,
+        readout_moments: moments,
+        readout_spectral: spectral,
+        readout_modes: 3,
+        use_diffusion: true,
+    }
+}
+
+/// Spectral / combined readout forward parity (ThermoGpuForward, B=1).
+/// Covers moments+spectral, spectral-only (mdim=0), and moments-only control.
+#[test]
+fn rollout_forward_spectral_matches_cpu() {
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x5EC0);
+    for (moments, spectral) in [(true, true), (false, true), (true, false)] {
+        let cfg = spectral_cfg(moments, spectral);
+        let model = ThermoLM::new(cfg.clone(), &mut rng);
+        let tokens: Vec<u32> = (0..5).map(|_| rng.random_range(0..cfg.vocab as u32)).collect();
+
+        let logits_cpu = model.forward(&tokens).logits;
+        let gpu = ThermoGpuForward::new(&ctx, &model);
+        let logits_gpu = gpu.forward(&tokens);
+
+        let err = max_rel_err(&logits_cpu, &logits_gpu);
+        assert!(err < 2e-2, "spectral fwd (moments={moments} spectral={spectral}): max_rel_err {err}");
+    }
+}
+
+/// Full batched training fwd+bwd parity with the spectral readout in the
+/// loop (ThermoGpu). d_proj now spans the [moments | spectral] feature
+/// matrix; conv/inject grads diverge if d_field through the spectral
+/// adjoint is wrong, so they double as a check on `ThermoSpectralBackward`.
+#[test]
+fn rollout_backward_spectral_matches_cpu() {
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x5BAC);
+    let seq_len = 4;
+    let batch = 3;
+    for (moments, spectral) in [(true, true), (false, true)] {
+        let cfg = spectral_cfg(moments, spectral);
+        let model = ThermoLM::new(cfg.clone(), &mut rng);
+
+        let toks: Vec<Vec<u32>> = (0..batch)
+            .map(|_| (0..seq_len).map(|_| rng.random_range(0..cfg.vocab as u32)).collect())
+            .collect();
+        let tgts: Vec<Vec<u32>> = (0..batch)
+            .map(|_| (0..seq_len).map(|_| rng.random_range(0..cfg.vocab as u32)).collect())
+            .collect();
+
+        let mut g_cpu = ThermoGrads::zeros(&cfg);
+        let mut loss_cpu = 0.0_f32;
+        for bb in 0..batch {
+            let cache = model.forward(&toks[bb]);
+            let mut g = ThermoGrads::zeros(&cfg);
+            loss_cpu += model.backward(&cache, &tgts[bb], &mut g);
+            g_cpu.add_assign(&g);
+        }
+        g_cpu.scale(1.0 / batch as f32);
+        loss_cpu /= batch as f32;
+
+        let mut tok_flat = vec![0u32; seq_len * batch];
+        let mut tgt_flat = vec![0u32; seq_len * batch];
+        for bb in 0..batch {
+            for ti in 0..seq_len {
+                tok_flat[ti * batch + bb] = toks[bb][ti];
+                tgt_flat[ti * batch + bb] = tgts[bb][ti];
+            }
+        }
+
+        let gpu = ThermoGpu::new(&ctx, &model, seq_len, batch);
+        gpu.zero_grad();
+        gpu.forward(&tok_flat);
+        let loss_gpu = gpu.backward(&tok_flat, &tgt_flat);
+        let g_gpu = gpu.download_grads();
+
+        assert!((loss_cpu - loss_gpu).abs() < 1e-2, "spectral loss (m{moments} s{spectral}) {loss_cpu} vs {loss_gpu}");
+        let chk = |name: &str, cpu: &[f32], gpu: &[f32]| {
+            let e = max_rel_err(cpu, gpu);
+            assert!(e < 2e-2, "spectral bwd (m{moments} s{spectral}) {name}: max_rel_err {e}");
+        };
+        chk("d_w1", &g_cpu.step.conv.d_w1, &g_gpu.step.conv.d_w1);
+        chk("d_w2", &g_cpu.step.conv.d_w2, &g_gpu.step.conv.d_w2);
+        chk("d_inj", &g_cpu.inject.d_inj, &g_gpu.inject.d_inj);
+        chk("d_proj", &g_cpu.readout.d_proj.d_w, &g_gpu.readout.d_proj.d_w);
+        chk("d_bias", &g_cpu.readout.d_bias, &g_gpu.readout.d_bias);
+    }
 }

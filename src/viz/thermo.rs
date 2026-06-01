@@ -19,8 +19,11 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use bevy::asset::RenderAssetUsages;
+use bevy::image::ImageSampler;
 use bevy::log::LogPlugin;
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::sprite::Anchor;
 use bevy::sprite_render::{ColorMaterial, MeshMaterial2d};
@@ -162,11 +165,13 @@ struct PanelGeom {
     side: f32,
 }
 
+/// One heatmap panel: a single quad textured by a `w×h` image that the
+/// update system rewrites each frame. The sampler is linear, so the field's
+/// coarse `H×W` cells render as a smooth bilinear gradient.
 #[derive(Component)]
-struct HeatCell {
+struct HeatPanel {
     channel: usize,
-    index: usize,
-    material: Handle<ColorMaterial>,
+    image: Handle<Image>,
 }
 
 #[derive(Component)]
@@ -264,6 +269,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     layout: Res<ThermoLayout>,
     mut panels: ResMut<ThermoPanels>,
     windows: Query<&Window>,
@@ -295,7 +301,7 @@ fn setup(
         let pcx = heat_left + col_w * (ci as f32 + 0.5);
         let pcy = content_top - row_h * (ri as f32 + 0.5);
         panels.0.push(PanelGeom { center: Vec2::new(pcx, pcy), side });
-        spawn_heatmap(&mut commands, &mut materials, &unit, &layout, c, pcx, pcy, side);
+        spawn_heatmap(&mut commands, &mut materials, &mut images, &unit, &layout, c, pcx, pcy, side);
     }
 
     spawn_bpb_chart(&mut commands, &unit, &mut materials, win_w, content_top, content_bottom);
@@ -306,6 +312,7 @@ fn setup(
 fn spawn_heatmap(
     commands: &mut Commands,
     materials: &mut Assets<ColorMaterial>,
+    images: &mut Assets<Image>,
     unit: &Handle<Mesh>,
     layout: &ThermoLayout,
     channel: usize,
@@ -326,21 +333,27 @@ fn spawn_heatmap(
         rect_tf(pcx, pcy, side, side, -0.2),
     ));
 
-    let cell_w = side / w as f32;
-    let cell_h = side / h as f32;
-    for i in 0..h {
-        for j in 0..w {
-            let x = pcx - side * 0.5 + (j as f32 + 0.5) * cell_w;
-            let y = pcy + side * 0.5 - (i as f32 + 0.5) * cell_h;
-            let mat = materials.add(ColorMaterial::from_color(Color::srgb(0.05, 0.05, 0.1)));
-            commands.spawn((
-                Mesh2d(unit.clone()),
-                MeshMaterial2d(mat.clone()),
-                rect_tf(x, y, cell_w, cell_h, 0.0),
-                HeatCell { channel, index: i * w + j, material: mat },
-            ));
-        }
-    }
+    // A single `w×h` texture sampled with bilinear filtering across one quad.
+    // `update_heatmaps` rewrites its pixels each frame; the linear sampler
+    // interpolates between the coarse field cells so the panel looks smooth
+    // rather than a grid of hard squares. Rgba8UnormSrgb so the stored colors
+    // (the thermal colormap, already in sRGB) display unchanged, with the
+    // bilinear blend done gamma-correctly in linear space by the sampler.
+    let mut img = Image::new_fill(
+        Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        &[8, 8, 26, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    img.sampler = ImageSampler::linear();
+    let image = images.add(img);
+    commands.spawn((
+        Mesh2d(unit.clone()),
+        MeshMaterial2d(materials.add(ColorMaterial { texture: Some(image.clone()), ..default() })),
+        rect_tf(pcx, pcy, side, side, 0.0),
+        HeatPanel { channel, image },
+    ));
 
     commands.spawn((
         Text2d::new(layout.names[channel].clone()),
@@ -460,21 +473,32 @@ fn thermal(t: f32) -> Color {
 
 fn update_heatmaps(
     live: Res<ThermoLive>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    q: Query<&HeatCell>,
+    q: Query<(&HeatPanel, &MeshMaterial2d<ColorMaterial>)>,
 ) {
     let Some(snap) = live.0.as_ref() else { return };
-    for cell in &q {
-        let Some(ch) = snap.channels.get(cell.channel) else { continue };
-        let Some(&v) = ch.data.get(cell.index) else { continue };
-        let t = if ch.vmax > ch.vmin {
-            (v - ch.vmin) / (ch.vmax - ch.vmin)
-        } else {
-            0.5
-        };
-        if let Some(mat) = materials.get_mut(&cell.material) {
-            mat.color = thermal(t);
+    for (panel, mat) in &q {
+        let Some(ch) = snap.channels.get(panel.channel) else { continue };
+        let Some(img) = images.get_mut(&panel.image) else { continue };
+        let Some(data) = img.data.as_mut() else { continue };
+        let span = ch.vmax - ch.vmin;
+        for (idx, &v) in ch.data.iter().enumerate() {
+            let o = idx * 4;
+            if o + 4 > data.len() {
+                break;
+            }
+            let t = if span > 0.0 { (v - ch.vmin) / span } else { 0.5 };
+            let c = thermal(t).to_srgba();
+            data[o] = (c.red * 255.0) as u8;
+            data[o + 1] = (c.green * 255.0) as u8;
+            data[o + 2] = (c.blue * 255.0) as u8;
+            data[o + 3] = 255;
         }
+        // Mutating the Image re-uploads it as a fresh GpuImage, but the
+        // material's bind group still samples the old texture view — touch
+        // the material so its bind group rebinds against the new upload.
+        let _ = materials.get_mut(&mat.0);
     }
 }
 
