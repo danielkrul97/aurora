@@ -724,3 +724,366 @@ grad-norm reduce na optimizer krok) a `--gpu` v traineru.
 
 **Akceptace:** plný forward+backward parity vs CPU `< 5e-2`; pak rychlost
 odemkne 32×32 / delší trénink.
+
+---
+
+## 18. Fáze T2 — 3D mřížka (IMPLEMENTOVÁNO)
+
+Pole je teď `D×H×W×C` (`idx3`, channel-last); `D=1` reprodukuje původní 2D
+dynamiku, takže stávající běhy fungují beze změny. 3D se zapíná
+`--depth N` (default 1). Změny napříč stackem:
+
+- **conv** 3×3 → 3×3×3 (9 → 27 tapů, `tap=(ki·3+kj)·3+kl` ↔ depth,height,width)
+- **difuze** 5-bod → 7-bodový Laplacian (přední/zadní soused)
+- **flux** `fx,fy` → `fx,fy,fz`, takže `c_out = c + 2·n_cons` (3 toky/kanál)
+- **readout** pool `P²→P³`, spektrum `modes²→modes³`
+- **kanály** přidán `CH_UZ` (`N_PHYS` 5→6, `[ρ,u_x,u_y,u_z,e,T]`); difuzní
+  teplotní index jde do GPU jako uniform (`cht`), ne hardcode
+- **checkpoint** `THERMO02` (+`d`); **viz** řez `z=D/2` + max-Z projekce
+  na quantitu (8 panelů, reuse 2D-textura)
+
+**CPU kill-gate (PASSED):** `--depth 4 --grid 16 --channels 16 --seq 32
+--batch 24 --steps 400 --readout both` → **val bpb 3.199 vs bigram 3.674
+(−0.475)**. Gradient checks zelené (toy `d=3`, vč. `d_fz`); smoke konverguje
+v 3D i v `d=1` degeneraci.
+
+**GPU parity (PASSED):** všech 16 `thermo_gpu_parity` testů `< 5e-2` při
+`d=2/3` (conv 27-tap, fz flux, 7-bod difuze, readout, step-backward,
+rollout, Muon, spektrum). GPU 3D trénink běží end-to-end na GTX 1650 a učí
+se (loss klesá, bez NaN).
+
+**VRAM pozn.:** plná trajektorie škáluje s `d` (`b·cells·c·nsub`). Tenká
+hloubka (`D≤8`) + skromný batch se vejde do 4 GB; větší `d`/`B` chce
+redukci batche nebo gradient checkpointing (§5.2 — odložené). `48-byte`
+push-constant range v `thermo_conv::build` (fused transport-fwd má 9 slov).
+
+### Profilace 3D (GTX 1650, d=4×16×16, B24, `thermo_microbench`)
+
+Per-kernel µs/disp (cool): **dw1 splitK ~4200, conv3g fwd ~3650, conv_ds
+~1500**, vše ostatní <300. **Conv je ~97 % per-substep GPU času** — 27-tap
+3D conv je úzké hrdlo (3× MAC/buňka vs 2D + depth× buněk).
+
+**Měřicí pozn.:** GTX 1650 má ~2× thermal šum mezi běhy (`dw1 splitK`
+8718→4213 µs beze změny kódu) → **A/B MUSÍ být in-process** (obě varianty
+v jednom běhu). Viz [[thermo-gpu-dispatch-bound]].
+
+**Dvě optimalizace otestované a ZAMÍTNuté** (in-process A/B):
+- *thread-per-cell forward conv* (akumulovat `c_h` na buňku, číst sousedství
+  1× místo `c_h`×) → **~2× pomalejší**. `s` (786 KB) se vejde do L2 →
+  redundantní čtení byla levná; dynamický `acc[]` spadl do local memory.
+- *shared-mem dw1* (workgroup na `(g,co,ci)`, `dhp` sloupec do shared) →
+  **3.7× pomalejší** (4213→15694 µs). Barriers + jen 27/32 aktivních vláken
+  + sériový cell-loop přebily úsporu; `dhp` je dost L2-friendly.
+
+**Optimalizace SHIPPED — im2col + GEMM pro `d_w1`** (největší kernel).
+`d_w1[co,ci,tap] = Σ_cells dhp[cell,co]·s[neighbour(cell,tap),ci]` se
+materializuje jako patch matice `[nb·cells, c·27]` (im2col kernel) a pak
+`d_w1 = dhpᵀ ⊗ patch` přes `OuterProductSplitK` + `RowReduceAdd` — **stejná
+rychlá cesta jako `d_w2`**. Column order `ci·27+tap` dá rovnou kanonický
+`w1` layout, takže GEMM je beze změny. **In-process A/B: 4126 → 3274 µs
+(~1.26×)**; parity zelená (rollout-backward + Muon testy jedou orchestrátor).
+Conv-style split-K `d_w1` (scattered s-reads přes sériový cell-loop)
+nahrazen. ~10 % per-substep úspora (dw1 je ~⅓ conv ceny).
+
+**Závěr:** zbylé kernely (per-element conv fwd/`d_s`) jsou L2-rezidentní a
+už dobře vyladěné — další micro-opt se nevyplácí. Páky: **config** (tenká
+hloubka, menší `--batch-size`/`--conv-hidden`/`--k-steps`, `--pool>1`) a
+případně **f16** (GTX 1650 ~2× fp16, velká změna, odložené).
+
+---
+
+## 19. Vír / černá díra — advekce + horizont (EXPERIMENT, CPU-only)
+
+Nápad: upravit 3D prostor tak, aby obsahoval **vír nasávající vstupní data**,
+a v „horizontu událostí" buď číst (read hlava), nebo **zničit informaci**.
+Mapování na mechaniku modelu (analýza předcházela implementaci):
+
+- **Vír = advekce.** Předepsané rychlostní pole `v(x)` (dovnitř `−r̂` + swirl
+  `ω·θ̂` kolem osy z) biasuje hranové toky konzervovaných kanálů upwind členem
+  `F += β·s_upwind·v·n̂`. Jede po **stejných telescoping hranách** jako učený
+  flux, takže **zachování zůstává exaktní** (test `step_vortex_conserves_total`).
+  `v` je parameter-free; backward = adjoint upwind gather.
+- **Horizont jako read hlava** = Gaussova skořápka maskuje pole před readoutem.
+- **Zničení informace = sink** = atenuace jádra `field *= 1−strength` jako
+  poslední op sub-kroku. **Vědomě porušuje zachování** (to je ta „černá díra").
+  Adjoint = stejná maska → **prostorový stop-gradient** (trunkace BPTT skrz
+  jádro, tj. StableBPTT realizovaný geometricky).
+
+**Strukturální nutnost (zachování to vynucuje):** v uzavřené krabici nelze
+nasávat donekonečna — bez sinku advekce+difuze ustálí koncentrovaný profil
+(hromadění, ztráta recency), se sinkem teče skutečný proud. „Buď read hlava,
+nebo zničení" tedy není volba, ale fyzikálně vynucená dichotomie.
+
+**Implementace (čistě aditivní, vzor `inject_every`/`delta_readout`):** nové
+`src/thermo/vortex.rs` (VortexField + flux add/backward + sink mask); skaláry
+na `ThermoLM` (`vortex_beta/swirl`, `inject_ring_radius`, `readout_horizon`,
+`sink_radius/strength`), default off, `rebuild_experimental()`. `ThermoConfig`
+**netknut** (žádný churn ~20 literálů). CLI `--vortex-beta --vortex-swirl
+--inject-ring --read-horizon --sink-radius --sink-strength`. GPU rollout je
+ignoruje (CPU-only guard). 14 gradient checků zelených (vč. vortex+sink d_s a
+end-to-end rollout se všemi čtyřmi knoby).
+
+### Výsledky (tiny_200k, grid16 c8 K4 dt0.1 pool1 seq16 B24 muon inject_every, seed 12345, 200 kroků)
+
+| běh | konfigurace | best val bpb | Δ vs baseline | grad norm |
+|---|---|---|---|---|
+| baseline | bez víru | **3.526** | — | 2.2→0.9 |
+| B | ring + vír, plný readout, bez sinku | 3.601 | **+0.075** (regrese > šum) | 6.6→1.4 |
+| C | ring + vír + horizont + sink 0.5 | 3.512 | −0.014 (remíza, v šumu) | 3.9→0.8 |
+
+**Zjištění (potvrzují předběžnou analýzu):**
+1. **Vír/transport samotný škodí** (B +0.075, nad šumem). Koncentrace bez
+   drénu + transportní zpoždění ředí čerstvý token v readoutu; navíc B má
+   **nejhlučnější gradienty** (start gn 6.6). Konzistentní s tím, že transport
+   je „marginální osa" (zachování/difuze byly v §16 taky na šumu), zatímco
+   readout je rozhodující.
+2. **Plná sestava (C) dorovná baseline s nejnižší grad norm** (tail 0.8).
+   Ve stabilním režimu je ale všechno stabilní (i B), takže to je jen drobný
+   rozdíl — skutečná stabilizace se ukáže až v agresivním režimu níže (a je to
+   **pár vír+sink**, ne sink samotný — viz ablace).
+3. **Read hlava na horizontu nepřidává kapacitu** (C ji obsahuje a jen
+   remizuje — bottleneck, konzistentní s „víc info v readoutu vyhrává").
+4. **Net BPB ve stabilním režimu: neutrální až záporný.** Vír je dynamická
+   intervence; dynamika dělá ~šum, readout dělá signál (lekce T0/T1 platí).
+
+### Stabilitní test + ablace — co vlastně stabilizuje (agresivní režim)
+
+T0 doložil, že `seq32·K4·dt0.5` (128 sub-kroků) **exploduje**. Reprodukce +
+úplná 2×2 ablace vír × sink (seed 12345, 150 kroků, ring jen aby injekce
+nepadala do sinku):
+
+| běh | vír | sink | best val | trajektorie ‖g‖ |
+|---|---|---|---|---|
+| D1 | ✗ | ✗ | 4.78 ❌ | 3e6 → 2e15 → **NaN** @100 |
+| E1 | ✗ | ✓ (center) | 4.37 ❌ | klesá, pak vyletí @100 (gn 6826) |
+| E2 | ✗ | ✓ (ring) | 5.31 ❌ | **NaN** @100 |
+| F1 | ✓ | ✗ (ring) | 6.45 ❌ | drží do 75, pak **NaN** @100 |
+| **D2** | ✓ | ✓ (ring) | **3.499 ✅** | ~1–3 stabilní, val monotónně dolů |
+
+**Stabilizuje jen PÁR vír+sink — žádná půlka sama.** Ablace vyvrací první
+(ukvapený) závěr „sink je stabilizátor": sink samotný (E1/E2) i vír samotný
+(F1) **stejně divergují** jako baseline. Mechanismus = přesně ta vazba z úvodní
+analýzy:
+- **vír** = dovnitř mířící advekce (dopravník) → koncentruje pole do jádra;
+  sám o sobě jen hromadí, až to bublne (F1 drží do kroku 75, pak runaway);
+- **sink** = drén jádra; sám o sobě nemá co odebírat (do jádra nic neteče),
+  distribuovanou conv-explozi v objemu neutlumí (E1/E2 → NaN);
+- **spolu** = dopravník + drén = **ohraničený akreční průtok**: vír doveze
+  energii pole k ústí horizontu, sink ji tam zničí. To drží magnitudu pole přes
+  celý hluboký rollout → `‖g‖` zůstane O(1), val klesne na 3.499 (= dorovná
+  *šetrný* baseline 3.526 v režimu, který je jinak netrénovatelný).
+
+Tím je doslovný „akreční disk + černá díra" jako **celek** stabilizátorem —
+přesně fyzikální coupling, který zachování vynucuje (uzavřená krabice: sání bez
+drénu = hromadění, ne proud).
+
+### Škálování dat — tiny.txt (1.1M, 5.5×), 3 seedy
+
+Test, jestli „víc dat" promění neutrální stabilizátor ve výhru. Model fixní
+(grid16 c8 conv24), 350 kroků, byte-level, bigram baseline 3.597:
+
+| běh | konfigurace | best val (seed 12345) |
+|---|---|---|
+| G-base | seq16·dt0.1, bez víru | 3.342 |
+| G-vtx | seq16·dt0.1 + vír+sink | 3.347 (remíza) |
+| G-base32 | seq32·dt0.1, bez víru (kontrola) | 3.229 |
+| A-vtx | seq32·dt0.5 + vír+sink | **3.172** |
+
+**Dekompozice je klíčová** (vyhýbá se záměně délky sekvence s vírem):
+1. **Většinu zisku udělala délka sekvence** (G-base→G-base32 = **−0.113**),
+   bez víru. Potvrzuje „scale/kontext dominuje" ([[aurora-bpb-scale-dominated]]).
+2. **Vír+sink ve šetrném režimu zůstává neutrální** i s víc daty (G-vtx remíza).
+3. **A-vtx vs férová kontrola G-base32** (stejná seq32, jen dt0.1 vs dt0.5+vír):
+   3-seedová replikace (seedy 12345/222/333):
+
+   | | A-vtx | G-base32 | rozdíl |
+   |---|---|---|---|
+   | seedy | 3.172 / 3.198 / 3.161 | 3.229 / 3.222 / 3.196 | −0.057 / −0.024 / −0.035 |
+   | **průměr** | **3.177** | **3.216** | **−0.039** |
+
+   A-vtx přebíjí kontrolu **3/3 seedy** s téměř čistou separací (A-vtx ≤3.198,
+   kontrola ≥3.196). Průměr **−0.039** je **těsně nad** šumovou podlahou 0.035.
+
+**Závěr škálování:** s víc daty se vír+sink posouvá z „neutrální" na **slabý,
+konzistentně replikovaný pozitiv ~0.04** — ale jen skrz odemčení `dt0.5` režimu
+(který je bez stabilizátoru NaN). Tedy: hodnota = „smět trénovat při větším dt",
+přístupná pouze přes vír+sink. Na šumové hraně, ne robustní výhra, ale 3/3
+znaménkově konzistentní.
+
+### Verdikt §19
+
+Vír/černá díra **mechanicky funguje** (gradient-checked, vír zachovává exaktně,
+trénuje). Empiricky:
+- **BPB: ve šetrném režimu neutrální; s víc daty slabý pozitiv ~0.04** (3/3
+  seedy nad kontrolou, těsně nad šumem) — ale jen jako vedlejší efekt
+  stabilizace většího `dt`. Hlavní páka „víc dat" byla délka sekvence (−0.11,
+  bez víru). Transport/ring/horizont samy jsou marginální (jako zachování/difuze
+  v §16); readout zůstává dominantní páka.
+- **Stabilizace patří PÁRU vír+sink, ne jedné komponentě.** V `seq32·dt0.5`
+  všechny čtyři ostatní cely (D1/E1/E2/F1) divergují do NaN; jen vír+sink (D2)
+  trénuje čistě na 3.499. Coupled dopravník+drén ohraničí magnitudu přes hluboký
+  rollout — adresuje #1 killer linie (§10 riziko 1, §5) jako *geometrickou*
+  alternativu k difuzi/malému dt.
+
+**Další směr (jestli honit):** vír+sink pár jako stabilizátor pro K-curriculum /
+delší seq / cross-window TBPTT (§5.5), kde difuze+malé dt nestačí — ale měřit
+proti prostému „silnější difuze / menší dt / grad-clip", jestli ten geometrický
+trik vůbec něco přidá nad levnější páky. Vír/ring/horizont jako BPB páky
+**mrtvé** (šumová podlaha 0.035; dynamika ≪ readout). GPU port pouze pokud se
+pár osvědčí nad baseline stabilizátory (vír = upravit flux extract, sink =
+elementwise maska ve step fwd/bwd).
+
+---
+
+## 20. Stromový (hyperbolický) substrát — netradiční geometrie #2 (EXPERIMENT)
+
+Po víru (prostorový *transport*) druhá geometrie: nahradit plochou mřížku
+**k-árním stromem** — lokální operátor pak má *exponenciální* receptivní pole
+(`~k^K` uzlů za K kroků vs `~K` na mřížce), geometrie záporné křivosti /
+hierarchie jazyka.
+
+**Design (klíč k levné implementaci):** strom = degenerovaná mřížka
+`d=1,h=1,w=N`, `pool=1`. Jediná tree-specifická věc je **conv** (graph-conv přes
+tapy `{self, parent, k×child}`); `inject` (profil na listy) + `readout` (pool=1
+momenty přes N uzlů) + optimizer/rollout se **reusnou**. v1 bez flux/difuze
+(~neutrální dle §16/§19). Standalone `TreeLM` — **nezasahuje grid/GPU path**.
+Soubory: `tree.rs` (topologie + `tree_conv` fwd/bwd), `tree_model.rs` (`TreeLM`),
+`examples/tree_train.rs`. Gradient checks (`tests/thermo_tree.rs`): `tree_conv`
+(binary/ternary/path) + **end-to-end rollout BPTT** — zelené.
+
+**Výsledky** (tiny.txt, seq16, 350 kroků, seed default, binary depth8 = 255
+uzlů ≈ 16² mřížka, ~525–528K params jako grid):
+
+| model | best val | vs flat |
+|---|---|---|
+| flat grid (G-base) | **3.342** | — |
+| strom, conv_hidden 24 (lean operátor) | 3.383 | +0.041 |
+| strom, conv_hidden 96 (fair operator capacity) | 3.411 | +0.069 |
+
+Strom je **konzistentně horší** a víc operator-kapacity nepomohlo (vyloučen
+param confound — total params ~stejné, readout dominuje obě). Trénuje stabilně
+(K=8 = 128 sub-kroků, gn ~1–3, monotónní), přebíjí bigram, ale **ne plochou
+mřížku**. Exponenciální dosah nepřinesl nic.
+
+**Sdílená příčina s vírem (potvrzeno 2×):** `pool=1` readout vidí **každý**
+uzel, takže prostorová geometrie — ať ji *přeskupíš* (vír) nebo *přepojíš*
+(strom) — je pro loss **neviditelná**. Dosah nepomohl, protože readout stejně
+čte všechny uzly.
+
+### Meta-lekce po dvou geometriích
+
+**Prostorová geometrie substrátu = neutrální až mírně záporná pro BPB.** Aby
+geometrie hrála roli, musí cílit osu, kterou globálně-prostorový readout
+*nedokáže* zahladit:
+- **(a) readout sám** — multi-scale / fraktální pyramida (cílí prokázanou páku);
+- **(b) časovou/sekvenční osu** — „spacetime" substrát, kde se sekvence rozloží
+  jako prostorová geometrie. Long-range *temporal* je skutečná mezera (drží ji
+  jen rekurentní carry), a readout je globální jen prostorově, ne časově.
+
+Transport (vír) i konektivita (strom) jsou obě prostorové → obě mrtvé. Další
+geometrie, pokud nějaká, jen (a) nebo (b).
+
+---
+
+## 21. Spacetime substrát — netradiční geometrie #3 (EXPERIMENT, VELKÁ VÝHRA)
+
+Volba (b) z meta-lekce §20: **sekvence jako osa pole**, zpracovaná **paralelně**
+(žádný rekurentní carry). embed-na-čas → K **kauzálních dilatovaných conv**
+kroků → **per-pozici (časově-lokální) readout**. Tři důsledky, každý míří na
+prokázanou slabinu:
+- **readout je časově-lokální** (každá pozice čte svou kauzálně-akumulovanou
+  buňku, ne globální pool) → časová geometrie je *viditelná* pro loss — to, co
+  prostorová nikdy nebyla (§19/§20);
+- **BPTT hloubka = K, ne T·K** (není rekurence) → likviduje #1 killer (exploze
+  přes hluboký rollout, §10 riziko 1);
+- **dilatované kauzální tapy** `d=base^k` → exponenciální *časový* dosah
+  (WaveNet) — dilatace na ose, kde dosah konečně platí.
+
+**Implementace:** novum je **kauzální dilatovaná 1D conv** (`spacetime.rs`,
+`Conv1x1(GELU(CausalConv1d))`, tap `j` čte `t−j·d`, nikdy budoucnost).
+Standalone `StLM` (`spacetime_model.rs`) — grid/GPU netknuté, reuse AdamW/Muon +
+CE. Gradient checks (`tests/thermo_spacetime.rs`): conv (dil 1/2/4) + **striktní
+kauzalita** (perturbace v `t0` nezmění výstup pro `t<t0`) + end-to-end StLM BPTT
+— vše zelené. v1 = interní šířka S=1 (čistá 1D conv); S>1 (gas flavor + difuze
+podél S) je možný refinement.
+
+**Výsledek (tiny.txt, seq64, 350 kroků, seed default, c128 K6 dil_base2 reach~63):**
+
+| model | best val | params | čas | pozn. |
+|---|---|---|---|---|
+| bigram | 3.597 | — | — | |
+| flat grid seq16 @350 | 3.342 | 530K | — | rekurentní |
+| flat grid seq16 @600 | 3.165 | 530K | — | nejlepší rekurentní session |
+| strom | 3.38–3.41 | 525K | — | rekurentní |
+| **spacetime seq64 @350** | **2.791** | **164K** | **144 s** | paralelní, kauzální |
+
+**−0.37 pod nejlepším rekurentním, −0.55 pod matched gridem** — řádově nad
+šumovou podlahou 0.035. A to s **⅓ parametrů** a **3–6× rychleji** (paralelní,
+mělké BPTT). train 2.55 ≪ val 2.79 → **podtrénováno** (klesalo by dál), gn
+stabilní ~1. Sampling viditelně koherentnější.
+
+**Proč to vyhrálo (meta-lekce naplněná):** prostorová geometrie byla neviditelná
+globálnímu readoutu; **časová geometrie s časově-lokálním readoutem** je velká
+výhra — a zrušení rekurence sundá BPTT bottleneck. Dva „neúspěchy" (vír, strom)
+vyrobily poznatek, který našel vítěze.
+
+**Poctivá výhrada:** S=1 spacetime je v jádru **kauzální dilatovaná CNN (TCN)** —
+známo-silná architektura. V rámci téhle linie je to ale jasný, velký, doložený
+vítěz a správný konec geometrického oblouku (rekurentní gas → paralelní
+spacetime).
+
+**Potvrzeno (replikace + matched kontrola, vše seq64 @350, tiny.txt):**
+
+| | best val | čas | params |
+|---|---|---|---|
+| rekurentní grid (matched kontrola) | 3.159 | 762 s | 530K |
+| spacetime, 3 seedy (12345/222/333) | **2.791 / 2.777 / 2.770** (mean 2.779) | ~144 s | 164K |
+
+Plně kontrolovaná shoda (stejný korpus/seq/kroky/seed): **Δ = 0.38**,
+**~5× rychleji**, **⅓ parametrů**, seedově těsné (2.77–2.79) → výhra je
+jednoznačná a replikovaná, ≫ šumová podlaha 0.035.
+
+**Další směr:** spacetime je podtrénovaný (train ≪ val) → víc kroků / scale je
+reálná páka; S>1 (gas flavor: interní šířka + teplotně-řízená difuze podél S,
+readout pooluje S per časový řez) je možný novel refinement. Tohle je směr pro
+BPB téhle linie, ne další rekurentní-gas tweaky.
+
+---
+
+## 22. Selektivní SSM — deep-research top pick (EXPERIMENT, nano caveat POTVRZEN)
+
+Deep-research workflow (105 agentů, 23 zdrojů, 25 tvrzení 3-hlasně ověřeno) na
+„jaká geometrie = BPB breakthrough" → **top pick: selektivní SSM** (Mamba-styl
+vstupně-závislé forget hradlo; MambaByte má jediné replikované byte-BPB výhry).
+Náš spacetime je statický LTI-SSM; lekce: statické míchání selhává na recall.
+
+**Postaveno + gradient-checked** (`ssm.rs` selektivní scan fwd/bwd + kauzalita;
+`ssm_model.rs` `SsmLM` = embed → N residual bloků [v=x·Win, a=σ(x·Wg+bg),
+y=scan(a,v), x+=y·Wo] → per-pozici readout; `examples/ssm_train.rs`). Scan
+adjoint `dh_t=dy_t+a_{t+1}·dh_{t+1}`, O(L·C), bez tape.
+
+**A/B (tiny.txt seq64 @350, seed default) — caveat reportu HELD:**
+
+| model | params | best val |
+|---|---|---|
+| spacetime (statický, kontrola) | 164K | **2.78** |
+| selektivní SSM, 2 vrstvy | 164K | 2.959 |
+| selektivní SSM, 4 vrstvy | 263K | 2.861 |
+| selektivní SSM, 6 vrstev | 361K | 2.829 |
+| selektivní SSM, 4 vrstvy c96 (matched) | 160K | 2.894 |
+
+Hloubka pomáhá (2.96→2.83) ale **asymptotuje NAD spacetime — ani 2.2× params
+nepřebije 2.78; matched je ~0.11 horší.** SSM trénuje rock-stable + 3× rychleji,
+ale ne líp. **Potvrzuje explicitní caveat reportu: SSM výhry jsou na 350M–3B, na
+nano (0.1–0.4M, char) se nepřenesou.** Praktický nano šampion zůstává **statický
+spacetime 2.78**.
+
+Výhrada: jde o zjednodušený Mamba-lite (gated EMA, diagonální, bez HiPPO/Δ-
+diskretizace/input-dependent B,C) — plný Mamba *by mohl* mezeru zavřít, ale 4
+kontrolované configy nad 2.78 + nano-caveat = slabá EV honit ho na téhle škále.
+
+### Závěr geometrického oblouku (§19–22)
+spatial (vír, strom) = mrtvé (globální readout je zahladí) → **temporal
+(spacetime) = velká výhra, 2.78** → selektivita (SSM) = na nano nezabere.
+**Šampion = statický spacetime.** Reálné páky dál: scale (data/kroky/params),
+ne další exotická geometrie.
