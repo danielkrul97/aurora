@@ -1101,7 +1101,10 @@ time-local readout = GEMM, caches jen K+1/K (ne L·K).
 direct), embed-inject, axpy. **Reuse:** ThermoConv1x1, ConvBwdHidden,
 Gemm/GemmTransposeB, OuterProductAccum, RowReduceAdd, BiasRowAdd, SoftmaxCE,
 EmbedScatterReduce, AdamW, celý Muon (`muon_one` verbatim — matrix-generic),
-GradNorm. `--gpu` v `examples/spacetime_train.rs`.
+GradNorm. `--gpu` v `examples/spacetime_train.rs`. **`--gpu --viz` funguje** —
+trénink běží na GPU ve vlákně, Bevy okno na main threadu (dvě wgpu kontexty
+koexistují), pole se publikuje na eval krocích přes `gpu.to_cpu()` →
+`forward_field` → heatmapy kanál×čas (vzor z mřížkového `--gpu --viz`).
 
 **Parity GREEN** (`tests/thermo_spacetime_gpu.rs`): fwd logity vs CPU `< 5e-3`;
 bwd všech 7 grad tenzorů + loss vs CPU `< 2e-2`. Celé jádro (fwd+bwd+optim)

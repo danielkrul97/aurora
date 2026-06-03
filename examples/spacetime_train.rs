@@ -21,6 +21,11 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rayon::prelude::*;
 
+#[cfg(all(feature = "gpu", feature = "viz"))]
+type GpuVizSnap = Option<aurora::viz::ThermoSnapshotArc>;
+#[cfg(all(feature = "gpu", not(feature = "viz")))]
+type GpuVizSnap = Option<()>;
+
 #[derive(Clone)]
 struct Cli {
     corpus: PathBuf,
@@ -176,7 +181,20 @@ fn main() -> ExitCode {
         match aurora::gpu::GpuContext::new() {
             Ok(gctx) => {
                 println!(" GPU        : {}", gctx.adapter_info().name);
-                run_training_gpu(cli, model, tokens, n_train, comp, bpe, bigram, gctx);
+                #[cfg(feature = "viz")]
+                if cli.viz {
+                    let snapshot = aurora::viz::new_thermo_snapshot(
+                        cli.channels, cli.seq_len, cli.k_steps, cli.dt, model.param_count(),
+                        cli.steps as u64, bigram,
+                        &["Field after embed (chan×time)", "Field final (chan×time)"],
+                    );
+                    let snap2 = std::sync::Arc::clone(&snapshot);
+                    let handle = std::thread::spawn(move || run_training_gpu(cli, model, tokens, n_train, comp, bpe, bigram, gctx, Some(snap2)));
+                    aurora::viz::run_thermo_window(snapshot);
+                    let _ = handle.join();
+                    return ExitCode::SUCCESS;
+                }
+                run_training_gpu(cli, model, tokens, n_train, comp, bpe, bigram, gctx, None);
                 return ExitCode::SUCCESS;
             }
             Err(e) => eprintln!("⚠ GPU init failed: {e}; falling back to CPU"),
@@ -414,8 +432,10 @@ fn publish_st(
 }
 
 #[cfg(feature = "gpu")]
-fn run_training_gpu(cli: Cli, model: StLM, tokens: Vec<u32>, n_train: usize, comp: f32, bpe: BpeTokenizer, bigram: f32, gctx: aurora::gpu::GpuContext) {
+fn run_training_gpu(cli: Cli, model: StLM, tokens: Vec<u32>, n_train: usize, comp: f32, bpe: BpeTokenizer, bigram: f32, gctx: aurora::gpu::GpuContext, snapshot: GpuVizSnap) {
     use aurora::gpu::StLmGpu;
+    #[cfg(not(feature = "viz"))]
+    let _ = &snapshot;
     let (train_toks, val_toks) = tokens.split_at(n_train);
     let (seq, b) = (cli.seq_len, cli.batch_size.max(1));
     let stream_len = train_toks.len() / b;
@@ -458,6 +478,13 @@ fn run_training_gpu(cli: Cli, model: StLM, tokens: Vec<u32>, n_train: usize, com
                 "  step {:>4}/{:<4}  loss {:.3}  train_bpb {:.3}  val_bpb {:.3}  lr {:.1e}  {:>5.1}s  [GPU B={}]",
                 step + 1, cli.steps, loss, train_bpb, val, lr, start.elapsed().as_secs_f64(), b
             );
+            #[cfg(feature = "viz")]
+            if let Some(snap) = snapshot.as_ref() {
+                let model_cpu = gpu.to_cpu();
+                let s_in = &train_toks[0..seq];
+                let s_tgt = train_toks[seq];
+                publish_st(snap, &model_cpu, &cli, &bpe, s_in, s_tgt, (step + 1) as u64, cli.steps as u64, loss, train_bpb, val, best_val, lr, 0.0, start.elapsed().as_secs_f64());
+            }
         }
     }
 
@@ -477,6 +504,13 @@ fn run_training_gpu(cli: Cli, model: StLM, tokens: Vec<u32>, n_train: usize, com
     let seed: Vec<u32> = val_toks.iter().take(16).copied().collect();
     let cont = generate(&model, &seed, cli.sample_len, cli.sample_temp, &mut grng);
     println!(" cont: {:?}", String::from_utf8_lossy(&bpe.decode(&cont)));
+
+    #[cfg(feature = "viz")]
+    if let Some(snap) = snapshot.as_ref() {
+        if let Ok(mut s) = snap.lock() {
+            s.finished = true;
+        }
+    }
 }
 
 fn unigram_log_bias(train: &[u32], vocab: usize) -> Vec<f32> {
