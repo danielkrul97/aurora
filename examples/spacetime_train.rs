@@ -46,6 +46,7 @@ struct Cli {
     sample_temp: f32,
     muon_lr: f32,
     viz: bool,
+    gpu: bool,
 }
 
 impl Cli {
@@ -74,6 +75,7 @@ impl Cli {
             sample_temp: 0.8,
             muon_lr: 0.04,
             viz: false,
+            gpu: false,
         };
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -105,6 +107,10 @@ impl Cli {
                 "--muon-lr" => c.muon_lr = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--viz" => {
                     c.viz = true;
+                    stp = 1;
+                }
+                "--gpu" => {
+                    c.gpu = true;
                     stp = 1;
                 }
                 other => return Err(format!("unknown flag {other}")),
@@ -164,6 +170,22 @@ fn main() -> ExitCode {
         cli.seq_len, cli.batch_size, cli.steps, cli.lr, cli.min_lr, cli.muon_lr, cli.eval_every, cli.k_steps);
     println!(" BASELINE   : bigram val bpb {bigram:.4}   ← must beat this");
     println!("════════════════════════════════════════════════════════════");
+
+    #[cfg(feature = "gpu")]
+    if cli.gpu {
+        match aurora::gpu::GpuContext::new() {
+            Ok(gctx) => {
+                println!(" GPU        : {}", gctx.adapter_info().name);
+                run_training_gpu(cli, model, tokens, n_train, comp, bpe, bigram, gctx);
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => eprintln!("⚠ GPU init failed: {e}; falling back to CPU"),
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    if cli.gpu {
+        eprintln!("⚠ --gpu given but built without --features gpu; running on CPU");
+    }
 
     #[cfg(feature = "viz")]
     let snapshot = if cli.viz {
@@ -389,6 +411,72 @@ fn publish_st(
     s.pred_correct = Some(argmax == sample_target);
     s.push_bpb(step, train_bpb);
     s.step_tick = s.step_tick.wrapping_add(1);
+}
+
+#[cfg(feature = "gpu")]
+fn run_training_gpu(cli: Cli, model: StLM, tokens: Vec<u32>, n_train: usize, comp: f32, bpe: BpeTokenizer, bigram: f32, gctx: aurora::gpu::GpuContext) {
+    use aurora::gpu::StLmGpu;
+    let (train_toks, val_toks) = tokens.split_at(n_train);
+    let (seq, b) = (cli.seq_len, cli.batch_size.max(1));
+    let stream_len = train_toks.len() / b;
+    let n_windows = stream_len.saturating_sub(1) / seq.max(1);
+    if n_windows == 0 {
+        eprintln!("corpus too small for batch×seq_len");
+        return;
+    }
+    let mut gpu = StLmGpu::new(&gctx, &model, seq, b);
+    let adam_base = AdamWConfig { weight_decay: cli.weight_decay, ..AdamWConfig::default() };
+    let muon_base = MuonConfig { weight_decay: cli.weight_decay, ..MuonConfig::default() };
+    let start = Instant::now();
+    let mut best_val = f32::INFINITY;
+    // Per-window-contiguous [B*L] window matrices (row = bi*seq + ti).
+    let mut toks = vec![0u32; seq * b];
+    let mut tgts = vec![0u32; seq * b];
+
+    for step in 0..cli.steps {
+        let lr = cosine_warmup(step, cli.warmup_steps, cli.steps.max(1), cli.lr, cli.min_lr);
+        let mlr = cosine_warmup(step, cli.warmup_steps, cli.steps.max(1), cli.muon_lr, cli.muon_lr * 0.1);
+        let adam = AdamWConfig { lr, ..adam_base };
+        let mcfg = MuonConfig { lr: mlr, ..muon_base };
+        let window = step % n_windows;
+        for bi in 0..b {
+            let base = bi * stream_len + window * seq;
+            for ti in 0..seq {
+                toks[bi * seq + ti] = train_toks[base + ti];
+                tgts[bi * seq + ti] = train_toks[base + ti + 1];
+            }
+        }
+        let do_eval = step == 0 || (step + 1) % cli.eval_every == 0 || step + 1 == cli.steps;
+        let loss = gpu.train_step_muon(&toks, &tgts, &adam, &mcfg, do_eval);
+        if do_eval {
+            let (nats, ntok) = gpu.eval_nats(val_toks, cli.eval_windows);
+            let val = bits_per_byte(nats as f32, (ntok as f32 * comp) as usize);
+            best_val = best_val.min(val);
+            let loss = loss.unwrap_or(f32::NAN);
+            let train_bpb = bits_per_byte(loss * seq as f32, (seq as f32 * comp) as usize);
+            println!(
+                "  step {:>4}/{:<4}  loss {:.3}  train_bpb {:.3}  val_bpb {:.3}  lr {:.1e}  {:>5.1}s  [GPU B={}]",
+                step + 1, cli.steps, loss, train_bpb, val, lr, start.elapsed().as_secs_f64(), b
+            );
+        }
+    }
+
+    let (nats, ntok) = gpu.eval_nats(val_toks, 0);
+    let final_val = bits_per_byte(nats as f32, (ntok as f32 * comp) as usize);
+    best_val = best_val.min(final_val);
+    let model = gpu.to_cpu();
+    println!("════════════════════════════════════════════════════════════");
+    println!(" RESULT (GPU): spacetime best val bpb {best_val:.4}  vs  bigram {:.4}", bigram);
+    if best_val < bigram {
+        println!(" ✅ beats bigram by {:.4} bpb", bigram - best_val);
+    } else {
+        println!(" ❌ does not beat bigram (Δ {:.4})", best_val - bigram);
+    }
+    println!("════════════════════════════════════════════════════════════");
+    let mut grng = StdRng::seed_from_u64(cli.seed ^ 0xABCD);
+    let seed: Vec<u32> = val_toks.iter().take(16).copied().collect();
+    let cont = generate(&model, &seed, cli.sample_len, cli.sample_temp, &mut grng);
+    println!(" cont: {:?}", String::from_utf8_lossy(&bpe.decode(&cont)));
 }
 
 fn unigram_log_bias(train: &[u32], vocab: usize) -> Vec<f32> {

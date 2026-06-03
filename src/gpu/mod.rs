@@ -30,6 +30,7 @@ pub mod muon;
 pub mod optimizer;
 pub mod reduce;
 pub mod softmax_ce;
+pub mod spacetime_gpu;
 pub mod thermo_conv;
 pub mod thermo_model;
 pub mod thermo_step;
@@ -54,6 +55,7 @@ pub use reduce::{
     OuterProductAccumKernel, OuterProductSplitKKernel, RowReduceAddKernel, ScaleByBufferKernel,
 };
 pub use softmax_ce::SoftmaxCrossEntropyKernel;
+pub use spacetime_gpu::StLmGpu;
 pub use thermo_model::ThermoGpu;
 pub use thermo_conv::{
     ThermoConv1x1Kernel, ThermoConv3x3Dw1Kernel, ThermoConv3x3Dw1SplitKKernel,
