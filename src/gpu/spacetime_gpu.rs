@@ -138,30 +138,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-const ST_DW1_WGSL: &str = r#"
+// im2col for the fast d_w1 path: patch[cell, ci*taps+tap] = s[cell-off, ci]
+// (causal, 0 when off>tlocal). Column order ci*taps+tap lands directly in the
+// canonical w1 layout, so `d_w1 = OuterProductAccum(patch, dhpre)` (coalesced,
+// output-tiled) drops straight in — no strided reads, no row-reduce limit.
+const ST_IM2COL_WGSL: &str = r#"
 struct P { l:u32, c:u32, ch:u32, taps:u32, dil:u32, nb:u32, _p0:u32, _p1:u32 };
-@group(0) @binding(0) var<storage, read>       dhp: array<f32>;
-@group(0) @binding(1) var<storage, read>       s:   array<f32>;
-@group(0) @binding(2) var<storage, read_write> dw1: array<f32>;
+@group(0) @binding(0) var<storage, read>       s:   array<f32>;
+@group(0) @binding(1) var<storage, read_write> pat: array<f32>;
 var<push_constant> p: P;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let widx = gid.x;
-    if (widx >= p.ch * p.c * p.taps) { return; }
-    let tap = widx % p.taps;
-    let r = widx / p.taps;
-    let ci = r % p.c;
-    let co = r / p.c;
-    let off = tap * p.dil;
-    var acc = 0.0;
-    for (var g: u32 = 0u; g < p.nb; g = g + 1u) {
-        for (var t: u32 = off; t < p.l; t = t + 1u) {
-            let o  = (g * p.l + t) * p.ch + co;
-            let ins = (g * p.l + (t - off)) * p.c + ci;
-            acc = acc + dhp[o] * s[ins];
-        }
+    let idx = gid.x;
+    if (idx >= p.nb * p.l * p.c) { return; }
+    let ci = idx % p.c;
+    let cell = idx / p.c;
+    let tlocal = cell % p.l;
+    let g = cell / p.l;
+    let ct = p.c * p.taps;
+    let out_base = cell * ct + ci * p.taps;
+    for (var tap: u32 = 0u; tap < p.taps; tap = tap + 1u) {
+        let off = tap * p.dil;
+        var v = 0.0;
+        if (off <= tlocal) { v = s[(g * p.l + (tlocal - off)) * p.c + ci]; }
+        pat[out_base + tap] = v;
     }
-    dw1[widx] = dw1[widx] + acc;
 }
 "#;
 
@@ -206,7 +207,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 struct StConvGeluKernel { pipeline: Arc<wgpu::ComputePipeline>, bgl: Arc<wgpu::BindGroupLayout> }
 struct StConvDsKernel { pipeline: Arc<wgpu::ComputePipeline>, bgl: Arc<wgpu::BindGroupLayout> }
-struct StConvDw1Kernel { pipeline: Arc<wgpu::ComputePipeline>, bgl: Arc<wgpu::BindGroupLayout> }
+struct StIm2colKernel { pipeline: Arc<wgpu::ComputePipeline>, bgl: Arc<wgpu::BindGroupLayout> }
 struct StInjectKernel { pipeline: Arc<wgpu::ComputePipeline>, bgl: Arc<wgpu::BindGroupLayout> }
 struct StAxpyKernel { pipeline: Arc<wgpu::ComputePipeline>, bgl: Arc<wgpu::BindGroupLayout> }
 
@@ -230,14 +231,14 @@ impl StConvDsKernel {
         dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[dhp, w1, ds], bytemuck::bytes_of(&p), (nb * l * c).div_ceil(WG));
     }
 }
-impl StConvDw1Kernel {
+impl StIm2colKernel {
     fn new(ctx: &GpuContext) -> Self {
-        let (pipeline, bgl) = build(ctx, "st_conv_dw1", ST_DW1_WGSL, &[true, true, false]);
+        let (pipeline, bgl) = build(ctx, "st_im2col", ST_IM2COL_WGSL, &[true, false]);
         Self { pipeline, bgl }
     }
-    fn dispatch(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, dhp: &GpuBuffer, s: &GpuBuffer, dw1: &GpuBuffer, l: u32, c: u32, ch: u32, taps: u32, dil: u32, nb: u32) {
-        let p = ConvP { l, c, ch, taps, dil, nb, _p0: 0, _p1: 0 };
-        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[dhp, s, dw1], bytemuck::bytes_of(&p), (ch * c * taps).div_ceil(WG));
+    fn dispatch(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, s: &GpuBuffer, patch: &GpuBuffer, l: u32, c: u32, taps: u32, dil: u32, nb: u32) {
+        let p = ConvP { l, c, ch: 0, taps, dil, nb, _p0: 0, _p1: 0 };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[s, patch], bytemuck::bytes_of(&p), (nb * l * c).div_ceil(WG));
     }
 }
 impl StInjectKernel {
@@ -287,7 +288,7 @@ pub struct StLmGpu {
     // new kernels
     st_gelu: StConvGeluKernel,
     st_ds: StConvDsKernel,
-    st_dw1: StConvDw1Kernel,
+    im2col: StIm2colKernel,
     inject: StInjectKernel,
     axpy: StAxpyKernel,
     // reused kernels
@@ -348,6 +349,7 @@ pub struct StLmGpu {
     d_raw: GpuBuffer,
     dhpre: GpuBuffer,
     dsconv: GpuBuffer,
+    patch: GpuBuffer,
     tokens_buf: GpuBuffer,
     targets_buf: GpuBuffer,
 }
@@ -378,7 +380,7 @@ impl StLmGpu {
             step_count: model.step_count,
             st_gelu: StConvGeluKernel::new(ctx),
             st_ds: StConvDsKernel::new(ctx),
-            st_dw1: StConvDw1Kernel::new(ctx),
+            im2col: StIm2colKernel::new(ctx),
             inject: StInjectKernel::new(ctx),
             axpy: StAxpyKernel::new(ctx),
             conv1: ThermoConv1x1Kernel::new(ctx),
@@ -433,6 +435,7 @@ impl StLmGpu {
             d_raw: z(bl * c),
             dhpre: z(bl * ch),
             dsconv: z(bl * c),
+            patch: z(bl * c * taps),
             tokens_buf: GpuBuffer::from_u32_slice(ctx, "tok", &vec![0u32; bl]),
             targets_buf: GpuBuffer::from_u32_slice(ctx, "tgt", &vec![0u32; bl]),
         }
@@ -497,9 +500,10 @@ impl StLmGpu {
             self.outer.dispatch_into(&self.ctx, &mut enc, &self.hpost_traj[k], &self.d_raw, &self.w2.grad, c as u32, ch as u32, bl as u32);
             self.row.dispatch_into(&self.ctx, &mut enc, &self.d_raw, &self.b2.grad, bl as u32, c as u32);
             self.conv_bwd_hidden.dispatch_into(&self.ctx, &mut enc, &self.d_raw, &self.w2.buf, &self.hpre_traj[k], &self.dhpre, bl as u32, ch as u32, c as u32);
-            // causal conv bwd: d_s, d_w1, d_b1
+            // causal conv bwd: d_s (gather), d_w1 (im2col → output-tiled outer), d_b1
             self.st_ds.dispatch(&self.ctx, &mut enc, &self.dhpre, &self.w1.buf, &self.dsconv, l as u32, c as u32, ch as u32, taps, dil, b as u32);
-            self.st_dw1.dispatch(&self.ctx, &mut enc, &self.dhpre, &self.s_traj[k], &self.w1.grad, l as u32, c as u32, ch as u32, taps, dil, b as u32);
+            self.im2col.dispatch(&self.ctx, &mut enc, &self.s_traj[k], &self.patch, l as u32, c as u32, taps, dil, b as u32);
+            self.outer.dispatch_into(&self.ctx, &mut enc, &self.patch, &self.dhpre, &self.w1.grad, ch as u32, (c * self.taps) as u32, bl as u32);
             self.row.dispatch_into(&self.ctx, &mut enc, &self.dhpre, &self.b1.grad, bl as u32, ch as u32);
             // d_field = d_field + d_s  (residual passthrough + conv path)
             self.vadd.dispatch_into(&self.ctx, &mut enc, df[cur], &self.dsconv, df[1 - cur], (bl * c) as u32);

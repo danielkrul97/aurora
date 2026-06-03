@@ -1119,12 +1119,15 @@ trajektorie sedí na CPU (GPU 200 kroků 2.99 ≈ CPU).
 1. `d_w2` redukce dispatchla `c·ch=131072` workgroups > limit 65535 (grid model
    to nikdy netrefil, tam je `c·ch` malé) → přepnuto na output-tiled
    `OuterProductAccum`.
-2. **`d_w1` direct kernel je memory-bound pro velké `ch·c`** (strided uncoalesced
-   čtení `s`; GPU util ~13 % → ~3 s/krok). Fast path = **im2col + tiled GEMM**
-   (přesně jako grid §18). Odložené; lean config (`ch·c` skromné) jede plnou
-   rychlostí (0.17 s/krok). To je hlavní zbývající GPU optimalizace, jestli se
-   bude škálovat spacetime výš.
+2. **`d_w1` SHIPPED jako im2col + output-tiled outer-product** (`StIm2colKernel`
+   staví patch `[B·L × c·taps]` se sloupci `ci·taps+tap` = kanonický w1 layout,
+   pak `OuterProductAccum(patch, dhpre)`). Nahradil direct kernel, který byl
+   memory-bound (strided `s` čtení, GPU ~13 %, ~3 s/krok). Po fixu velký config
+   (c256/conv512/seq128/K8) **jede na 100 % GPU util** (compute-bound, ~1.4 s/krok
+   místo 3) a parity zůstává zelená. (Pozn.: `pat`, ne `patch` — `patch` je
+   rezervované WGSL klíčové slovo.) Stejný trik dříve vyřešil i `d_w2` redukci
+   (workgroup limit) → taky output-tiled outer.
 
-**Závěr:** šampion linie (statický spacetime) teď běží **na GPU na cílovém
-korpusu (enwik8) při parity**, řádově rychleji. Další: im2col `d_w1` (odemkne
-velké configy) + scale (delší trénink / víc dat / params).
+**Závěr:** šampion linie (statický spacetime) běží **na GPU na cílovém korpusu
+(enwik8) při parity, plně využívá GPU i u velkých configů** (im2col d_w1).
+`--gpu --viz` funguje. Další páka = scale (delší trénink / víc dat / params).
