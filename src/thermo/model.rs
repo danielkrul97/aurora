@@ -23,11 +23,15 @@ use crate::optimizer::{
 };
 use crate::thermo::field::{init_field, ThermoConfig};
 use crate::transformer::loss::cross_entropy_with_grad;
-use crate::thermo::inject::{inject_backward, inject_forward, InjectCache, InjectGrads, InjectWeights};
+use crate::thermo::inject::{
+    build_profile, inject_backward, inject_forward, InjectCache, InjectGrads, InjectWeights,
+};
 use crate::thermo::readout::{
-    readout_backward, readout_forward, ReadoutCache, ReadoutGrads, ReadoutWeights,
+    build_horizon_mask, readout_backward, readout_forward, ReadoutCache, ReadoutGrads,
+    ReadoutWeights,
 };
 use crate::thermo::step::{step_backward, step_forward, StepCache, StepGrads, StepWeights};
+use crate::thermo::vortex::{build_sink_mask, VortexField};
 
 /// Per-sub-step anneal `T_max·(1 - k/K)^α` (the §4 hot→cold schedule).
 #[must_use]
@@ -48,6 +52,30 @@ pub struct ThermoLM {
     /// Re-inject the token (anneal-scaled) before every sub-step instead of
     /// once per token (H31). Set by the trainer; default false.
     pub inject_every: bool,
+    /// Deep supervision: teacher-forced CE on the intermediate sub-step
+    /// readouts (fields `a_1..a_{K-1}`), weighted by this scalar. `0.0` = off
+    /// (final-readout-only, the default). Pressures the field to be predictive
+    /// throughout the rollout, giving the deep BPTT unroll a denser gradient.
+    /// CPU-only for now (the GPU rollout ignores it).
+    pub aux_weight: f32,
+    /// Read logits off `field_after − field_before` (the token's own effect)
+    /// instead of the absolute field. The field grows in magnitude across a
+    /// window (injection sources the conserved channels, never drained), so
+    /// the absolute readout's per-token signal shrinks with position; the
+    /// delta is scale-stable. `false` = absolute (default). CPU-only for now.
+    pub delta_readout: bool,
+    /// Vortex / black-hole geometry (the §19 experiment). All default off;
+    /// the trainer sets them and calls `rebuild_experimental`. CPU-only — the
+    /// GPU rollout ignores them. `vortex_beta` = inward advection strength,
+    /// `vortex_swirl` = azimuthal/radial ratio; `inject_ring_radius` injects on
+    /// a shell instead of the centre; `readout_horizon` reads off a shell;
+    /// `sink_radius`/`sink_strength` destroy field in the core each sub-step.
+    pub vortex_beta: f32,
+    pub vortex_swirl: f32,
+    pub inject_ring_radius: f32,
+    pub readout_horizon: f32,
+    pub sink_radius: f32,
+    pub sink_strength: f32,
 }
 
 /// Muon momentum buffers for the matrix params (conv kernels + readout
@@ -104,7 +132,38 @@ impl ThermoLM {
             muon,
             step_count: 0,
             inject_every: false,
+            aux_weight: 0.0,
+            delta_readout: false,
+            vortex_beta: 0.0,
+            vortex_swirl: 0.0,
+            inject_ring_radius: 0.0,
+            readout_horizon: 0.0,
+            sink_radius: 0.0,
+            sink_strength: 0.0,
         }
+    }
+
+    /// (Re)build the derived, parameter-free vortex/sink/ring/horizon fields
+    /// from the current scalar knobs. Idempotent; call after changing any of
+    /// them. Off-by-default scalars leave the model identical to a plain run.
+    pub fn rebuild_experimental(&mut self) {
+        let cfg = self.config.clone();
+        self.step.vortex = if self.vortex_beta != 0.0 {
+            Some(VortexField::new(&cfg, self.vortex_beta, self.vortex_swirl))
+        } else {
+            None
+        };
+        self.step.sink = if self.sink_radius > 0.0 && self.sink_strength > 0.0 {
+            Some(build_sink_mask(&cfg, self.sink_radius, self.sink_strength))
+        } else {
+            None
+        };
+        self.inject.profile = build_profile(&cfg, self.inject_ring_radius);
+        self.readout.horizon = if self.readout_horizon > 0.0 {
+            build_horizon_mask(&cfg, self.readout_horizon)
+        } else {
+            Vec::new()
+        };
     }
 
     pub fn param_count(&self) -> usize {
@@ -128,6 +187,10 @@ pub struct RolloutCache {
     pub steps: Vec<Vec<StepCache>>,
     pub readout: Vec<ReadoutCache>,
     pub logits: Vec<f32>,
+    /// Deep-supervision intermediate readouts `[T][K-1]` and their logits
+    /// `[T*(K-1)*vocab]`. Empty unless `aux_weight > 0` (and `K > 1`).
+    pub aux_readout: Vec<Vec<ReadoutCache>>,
+    pub aux_logits: Vec<f32>,
     pub t: usize,
 }
 
@@ -221,18 +284,25 @@ impl ThermoLM {
         let t = tokens.len();
         let (k, vocab) = (cfg.k_steps, cfg.vocab);
 
+        let aux = self.aux_weight > 0.0 && k > 1;
+        let delta = self.delta_readout;
+
         let mut field = init_field(cfg);
         let mut cache = RolloutCache {
             inj: Vec::with_capacity(t),
             steps: Vec::with_capacity(t),
             readout: Vec::with_capacity(t),
             logits: vec![0.0; t * vocab],
+            aux_readout: if aux { Vec::with_capacity(t) } else { Vec::new() },
+            aux_logits: if aux { Vec::with_capacity(t * (k - 1) * vocab) } else { Vec::new() },
             t,
         };
 
         for ti in 0..t {
+            let field_before = if delta { field.clone() } else { Vec::new() };
             let mut ics = Vec::with_capacity(k);
             let mut sc = Vec::with_capacity(k);
+            let mut aux_rc = Vec::new();
             if !self.inject_every {
                 let (f_inj, ic) = inject_forward(&field, tokens[ti], 1.0, &self.inject, cfg);
                 field = f_inj;
@@ -247,11 +317,29 @@ impl ThermoLM {
                 let (f_next, c) = step_forward(&field, &self.step, anneal_at(kk, cfg), cfg);
                 field = f_next;
                 sc.push(c);
+                // Deep supervision taps the intermediate fields a_1..a_{K-1};
+                // the final field a_K feeds the main readout below.
+                if aux && kk + 1 < k {
+                    let (lg, rc) = readout_forward(&field, &self.readout, cfg);
+                    cache.aux_logits.extend_from_slice(&lg);
+                    aux_rc.push(rc);
+                }
             }
             cache.inj.push(ics);
             cache.steps.push(sc);
+            if aux {
+                cache.aux_readout.push(aux_rc);
+            }
 
-            let (lg, rc) = readout_forward(&field, &self.readout, cfg);
+            let (lg, rc) = if delta {
+                let mut dlt = field.clone();
+                for i in 0..dlt.len() {
+                    dlt[i] -= field_before[i];
+                }
+                readout_forward(&dlt, &self.readout, cfg)
+            } else {
+                readout_forward(&field, &self.readout, cfg)
+            };
             cache.logits[ti * vocab..(ti + 1) * vocab].copy_from_slice(&lg);
             cache.readout.push(rc);
         }
@@ -295,6 +383,10 @@ impl ThermoLM {
         let (k, vocab) = (cfg.k_steps, cfg.vocab);
         debug_assert_eq!(targets.len(), t);
 
+        let aux = self.aux_weight > 0.0 && k > 1;
+        let aux_scale = if aux { self.aux_weight / (t as f32 * (k - 1) as f32) } else { 0.0 };
+        let delta = self.delta_readout;
+
         let mut total_loss = 0.0_f32;
         // d_field carries the gradient of the (single) field chain back
         // through positions. readout taps the field without consuming it,
@@ -321,9 +413,31 @@ impl ThermoLM {
                 if self.inject_every {
                     d_field = inject_backward(&cache.inj[ti][kk], &d_field, &self.inject, &mut grads.inject, cfg);
                 }
+                // After step (and per-step inject) backward, d_field is ∂L/∂a_kk;
+                // a_kk (kk≥1) was tapped by aux readout aux_readout[ti][kk-1].
+                if aux && kk >= 1 {
+                    let j = kk - 1;
+                    let row = &cache.aux_logits[(ti * (k - 1) + j) * vocab..(ti * (k - 1) + j + 1) * vocab];
+                    let (_loss, mut d_logits) = cross_entropy_with_grad(row, targets[ti] as usize);
+                    for g in &mut d_logits {
+                        *g *= aux_scale;
+                    }
+                    let d_aux = readout_backward(&self.readout, &cache.aux_readout[ti][j], &d_logits, &mut grads.readout, cfg);
+                    for i in 0..d_field.len() {
+                        d_field[i] += d_aux[i];
+                    }
+                }
             }
             if !self.inject_every {
                 d_field = inject_backward(&cache.inj[ti][0], &d_field, &self.inject, &mut grads.inject, cfg);
+            }
+            // delta-readout: logits = readout(field_after − field_before), so
+            // the carried field (now in d_field) takes −d_from_readout on top
+            // of what flowed back through this token's sub-steps.
+            if delta {
+                for i in 0..d_field.len() {
+                    d_field[i] -= d_from_readout[i];
+                }
             }
         }
 
@@ -361,7 +475,7 @@ impl ThermoLM {
     }
 
     /// Hybrid step: Muon (orthogonalized update) for the matrix params —
-    /// conv `W1` (`c_h × c·9`), conv `W2` (`c_out × c_h`), readout proj
+    /// conv `W1` (`c_h × c·27`), conv `W2` (`c_out × c_h`), readout proj
     /// (`vocab × readout_dim`) — and AdamW for the 1-D gates/biases and the
     /// injection table (à la the transformer's `step_muon_hybrid`).
     pub fn step_muon_hybrid(
@@ -380,7 +494,7 @@ impl ThermoLM {
             self.config.vocab,
             self.config.readout_dim(),
         );
-        muon_apply(&mut self.step.conv.w1, &grads.step.conv.d_w1, &mut self.muon.conv_w1, ch, c * 9, muon_cfg, scratch);
+        muon_apply(&mut self.step.conv.w1, &grads.step.conv.d_w1, &mut self.muon.conv_w1, ch, c * 27, muon_cfg, scratch);
         muon_apply(&mut self.step.conv.w2, &grads.step.conv.d_w2, &mut self.muon.conv_w2, cout, ch, muon_cfg, scratch);
         muon_apply(&mut self.readout.proj.w, &grads.readout.d_proj.d_w, &mut self.muon.ro_w, vocab, rdim, muon_cfg, scratch);
         let apply = |p: &mut [f32], g: &[f32], grp: &mut AdamGroup, wd: bool| {

@@ -6,7 +6,7 @@
 //! A token adds energy/momentum to the field through a fixed spatial
 //! "nozzle" profile times a learned per-channel amplitude:
 //! ```text
-//! s[i,j,c] += anneal · profile[i,j] · inj[token, c]
+//! s[z,i,j,c] += anneal · profile[z,i,j] · inj[token, c]
 //! ```
 //! `profile` is a fixed Gaussian bump centred on the grid (no params).
 //! `inj` is a learned `[vocab × c]` table — exactly the embedding-table
@@ -20,7 +20,7 @@ use crate::thermo::field::ThermoConfig;
 pub struct InjectWeights {
     /// Learned injection amplitudes `[vocab * c]`, row-major by token.
     pub inj: Vec<f32>,
-    /// Fixed spatial profile `[h*w]`, peak at grid centre.
+    /// Fixed spatial profile `[d*h*w]`, peak at grid centre.
     pub profile: Vec<f32>,
     pub vocab: usize,
     pub c: usize,
@@ -35,7 +35,7 @@ impl InjectWeights {
         let inj = (0..cfg.vocab * cfg.c)
             .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * scale)
             .collect();
-        let profile = gaussian_profile(cfg);
+        let profile = build_profile(cfg, 0.0);
         Self {
             inj,
             profile,
@@ -45,18 +45,32 @@ impl InjectWeights {
     }
 }
 
-fn gaussian_profile(cfg: &ThermoConfig) -> Vec<f32> {
-    let (h, w) = (cfg.h, cfg.w);
+/// Fixed spatial nozzle `[d*h*w]`. `ring_radius <= 0` ⇒ a Gaussian bump at the
+/// grid centre (the default "inject into the middle"). `ring_radius > 0` ⇒ a
+/// Gaussian shell peaked at that 3D radius from the centre — "inject at the
+/// rim", so the vortex has somewhere to draw from before it spirals inward.
+pub fn build_profile(cfg: &ThermoConfig, ring_radius: f32) -> Vec<f32> {
+    let (d, h, w) = (cfg.d, cfg.h, cfg.w);
+    let cz = (d as f32 - 1.0) * 0.5;
     let ci = (h as f32 - 1.0) * 0.5;
     let cj = (w as f32 - 1.0) * 0.5;
-    let sigma = (w.max(h) as f32) / 6.0;
+    let sigma = (d.max(w.max(h)) as f32) / 6.0;
     let inv = 1.0 / (2.0 * sigma * sigma);
-    let mut p = vec![0.0_f32; h * w];
-    for i in 0..h {
-        for j in 0..w {
-            let di = i as f32 - ci;
-            let dj = j as f32 - cj;
-            p[i * w + j] = (-(di * di + dj * dj) * inv).exp();
+    let mut p = vec![0.0_f32; d * h * w];
+    for z in 0..d {
+        for i in 0..h {
+            for j in 0..w {
+                let dz = z as f32 - cz;
+                let di = i as f32 - ci;
+                let dj = j as f32 - cj;
+                let r2 = dz * dz + di * di + dj * dj;
+                p[(z * h + i) * w + j] = if ring_radius <= 0.0 {
+                    (-r2 * inv).exp()
+                } else {
+                    let dr = r2.sqrt() - ring_radius;
+                    (-dr * dr * inv).exp()
+                };
+            }
         }
     }
     p

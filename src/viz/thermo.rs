@@ -65,6 +65,13 @@ pub struct ThermoSnapshot {
     pub bpb_history: VecDeque<(u64, f32)>,
     pub step_tick: u64,
     pub finished: bool,
+    /// Vortex/black-hole geometry for the overlay (grid-cell units). All 0 =
+    /// no vortex → the overlay falls back to the plain centre crosshair.
+    pub vortex_beta: f32,
+    pub vortex_swirl: f32,
+    pub inject_ring: f32,
+    pub read_horizon: f32,
+    pub sink_radius: f32,
 }
 
 impl ThermoSnapshot {
@@ -111,6 +118,11 @@ impl ThermoSnapshot {
             bpb_history: VecDeque::with_capacity(HISTORY_CAP),
             step_tick: 0,
             finished: false,
+            vortex_beta: 0.0,
+            vortex_swirl: 0.0,
+            inject_ring: 0.0,
+            read_horizon: 0.0,
+            sink_radius: 0.0,
         }
     }
 
@@ -234,7 +246,7 @@ pub fn run_thermo_window(snapshot: ThermoSnapshotArc) {
             (
                 poll_snapshot,
                 update_heatmaps,
-                draw_inject_markers,
+                draw_vortex_overlay,
                 draw_bpb_chart,
                 refresh_status,
                 refresh_subtitle,
@@ -290,7 +302,9 @@ fn setup(
     let heat_left = -win_w * 0.5 + 24.0;
     let heat_right = win_w * 0.16;
     let heat_w = heat_right - heat_left;
-    let (cols, rows) = (2usize, 2usize);
+    // 4×2 holds the 8 thermo panels (mid-slice + max-Z projection per channel);
+    // smaller channel sets just leave trailing cells empty.
+    let (cols, rows) = (4usize, 2usize);
     let col_w = heat_w / cols as f32;
     let row_h = content_h / rows as f32;
     let side = (col_w.min(row_h) * 0.74).min(300.0);
@@ -502,12 +516,101 @@ fn update_heatmaps(
     }
 }
 
-fn draw_inject_markers(panels: Res<ThermoPanels>, mut gizmos: Gizmos) {
-    let c = Color::srgba(0.95, 0.97, 0.85, 0.55);
+/// Circle from line segments (avoids depending on a specific `circle_2d`
+/// gizmo signature across Bevy versions).
+fn gizmo_circle(gizmos: &mut Gizmos, center: Vec2, radius: f32, color: Color) {
+    const N: usize = 48;
+    let mut prev = center + Vec2::new(radius, 0.0);
+    for k in 1..=N {
+        let a = k as f32 / N as f32 * std::f32::consts::TAU;
+        let cur = center + Vec2::new(radius * a.cos(), radius * a.sin());
+        gizmos.line_2d(prev, cur, color);
+        prev = cur;
+    }
+}
+
+/// Arrow as a shaft plus two head segments.
+fn gizmo_arrow(gizmos: &mut Gizmos, from: Vec2, to: Vec2, color: Color) {
+    gizmos.line_2d(from, to, color);
+    let d = (to - from).normalize_or_zero();
+    if d == Vec2::ZERO {
+        return;
+    }
+    let perp = Vec2::new(-d.y, d.x);
+    let h = ((to - from).length() * 0.4).clamp(3.0, 7.0);
+    gizmos.line_2d(to, to + (-d + perp) * h, color);
+    gizmos.line_2d(to, to + (-d - perp) * h, color);
+}
+
+/// Overlay the vortex geometry on every heatmap: injection ring (cyan), read
+/// horizon (yellow), the sink "event horizon" (red), and a ring of arrows
+/// showing the inward+swirl flow. Falls back to the plain centre crosshair
+/// when no vortex is configured.
+#[allow(clippy::cast_precision_loss)]
+fn draw_vortex_overlay(
+    live: Res<ThermoLive>,
+    panels: Res<ThermoPanels>,
+    time: Res<Time>,
+    mut gizmos: Gizmos,
+) {
+    let Some(snap) = live.0.as_ref() else { return };
+    let active = snap.vortex_beta != 0.0
+        || snap.inject_ring > 0.0
+        || snap.sink_radius > 0.0
+        || snap.read_horizon > 0.0;
+
+    if !active {
+        let c = Color::srgba(0.95, 0.97, 0.85, 0.55);
+        for p in &panels.0 {
+            let r = (p.side * 0.5 / 6.0).max(4.0); // Gaussian nozzle σ
+            gizmos.line_2d(p.center - Vec2::new(r, 0.0), p.center + Vec2::new(r, 0.0), c);
+            gizmos.line_2d(p.center - Vec2::new(0.0, r), p.center + Vec2::new(0.0, r), c);
+        }
+        return;
+    }
+
+    let ppc = |p: &PanelGeom| p.side / snap.w.max(1) as f32; // panel px per grid cell
     for p in &panels.0 {
-        let r = (p.side * 0.5 / 6.0).max(4.0); // matches the Gaussian nozzle σ
-        gizmos.line_2d(p.center - Vec2::new(r, 0.0), p.center + Vec2::new(r, 0.0), c);
-        gizmos.line_2d(p.center - Vec2::new(0.0, r), p.center + Vec2::new(0.0, r), c);
+        let s = ppc(p);
+        let ctr = p.center;
+        if snap.inject_ring > 0.0 {
+            gizmo_circle(&mut gizmos, ctr, snap.inject_ring * s, Color::srgba(0.38, 0.86, 0.96, 0.75));
+        }
+        if snap.read_horizon > 0.0 {
+            gizmo_circle(&mut gizmos, ctr, snap.read_horizon * s, Color::srgba(0.96, 0.90, 0.34, 0.70));
+        }
+        if snap.sink_radius > 0.0 {
+            let rr = snap.sink_radius * s;
+            gizmo_circle(&mut gizmos, ctr, rr, Color::srgba(0.96, 0.26, 0.22, 0.90));
+            gizmo_circle(&mut gizmos, ctr, rr * 0.55, Color::srgba(0.96, 0.26, 0.22, 0.55));
+        }
+        // Animated inflow: comet-streaks spiral from the injection ring to the
+        // sink, fading in at birth and out as they cross the horizon, then loop
+        // — the "suction" made visible. Driven by render time, so it animates
+        // smoothly regardless of how slow the training thread ticks.
+        if snap.vortex_beta != 0.0 {
+            let t = time.elapsed_secs();
+            let r_out = if snap.inject_ring > 0.0 { snap.inject_ring } else { snap.w as f32 * 0.40 };
+            let r_in = snap.sink_radius.max(0.6).min(r_out - 0.5);
+            let turns = (1.2 * snap.vortex_swirl.abs()).max(0.25); // spiral tightness
+            let sign = if snap.vortex_swirl >= 0.0 { 1.0 } else { -1.0 };
+            const M: usize = 24;
+            const INFLOW: f32 = 0.16; // loops per second (slow draw-in)
+            let tail = (p.side * 0.055).max(5.0);
+            for i in 0..M {
+                let phase = (t * INFLOW + i as f32 / M as f32).fract(); // age 0→1
+                let r_cell = r_out + (r_in - r_out) * phase; // shrink inward
+                let base = i as f32 / M as f32 * std::f32::consts::TAU;
+                let ang = base + sign * phase * turns * std::f32::consts::TAU;
+                let rhat = Vec2::new(ang.cos(), ang.sin());
+                let that = Vec2::new(-ang.sin(), ang.cos());
+                let pos = ctr + rhat * (r_cell * s);
+                let v = (-rhat + that * snap.vortex_swirl).normalize_or_zero();
+                let a = (phase * 6.0).min((1.0 - phase) * 5.0).clamp(0.0, 1.0);
+                let col = Color::srgba(0.86, 0.94, 1.0, 0.92 * a);
+                gizmo_arrow(&mut gizmos, pos - v * tail, pos, col);
+            }
+        }
     }
 }
 

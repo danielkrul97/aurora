@@ -11,9 +11,9 @@
 //!
 //! Usage:
 //!   cargo run --release --features viz --example thermo_train -- \
-//!     --corpus data/tiny_200k.txt --vocab 256 --grid 16 --k-steps 4 \
-//!     --dt 0.1 --pool 1 --seq-len 16 --batch-size 24 --steps 1500 \
-//!     --lr 2.5e-3 --viz
+//!     --corpus data/tiny_200k.txt --vocab 256 --depth 4 --grid 16 \
+//!     --k-steps 4 --dt 0.1 --pool 1 --seq-len 16 --batch-size 24 \
+//!     --steps 1500 --lr 2.5e-3 --viz
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -32,12 +32,13 @@ use rand::SeedableRng;
 use rayon::prelude::*;
 
 #[cfg(feature = "viz")]
-use aurora::thermo::field::{CH_T, CH_UX, CH_UY};
+use aurora::thermo::field::{CH_T, CH_UX, CH_UY, CH_UZ};
 
 #[derive(Clone)]
 struct Cli {
     corpus: PathBuf,
     vocab: usize,
+    depth: usize,
     grid: usize,
     channels: usize,
     conv_hidden: usize,
@@ -73,6 +74,28 @@ struct Cli {
     anneal_alpha: f32,
     t_init: f32,
     inject_every: bool,
+    no_unigram_bias: bool,
+    aux_weight: f32,
+    delta_readout: bool,
+    vortex_beta: f32,
+    vortex_swirl: f32,
+    inject_ring: f32,
+    read_horizon: f32,
+    sink_radius: f32,
+    sink_strength: f32,
+    diff_k0: f32,
+}
+
+impl Cli {
+    /// Features the GPU rollout does not implement — force CPU when any is on.
+    fn cpu_only_features(&self) -> bool {
+        self.aux_weight > 0.0
+            || self.delta_readout
+            || self.vortex_beta != 0.0
+            || self.inject_ring > 0.0
+            || self.read_horizon > 0.0
+            || (self.sink_radius > 0.0 && self.sink_strength > 0.0)
+    }
 }
 
 impl Cli {
@@ -80,6 +103,7 @@ impl Cli {
         let mut c = Self {
             corpus: "data/tiny_200k.txt".into(),
             vocab: 256,
+            depth: 1,
             grid: 16,
             channels: 8,
             conv_hidden: 24,
@@ -115,6 +139,16 @@ impl Cli {
             anneal_alpha: 1.0,
             t_init: 1.0,
             inject_every: false,
+            no_unigram_bias: false,
+            aux_weight: 0.0,
+            delta_readout: false,
+            vortex_beta: 0.0,
+            vortex_swirl: 1.0,
+            inject_ring: 0.0,
+            read_horizon: 0.0,
+            sink_radius: 0.0,
+            sink_strength: 0.0,
+            diff_k0: 0.0,
         };
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -124,6 +158,7 @@ impl Cli {
             match args[i].as_str() {
                 "--corpus" => c.corpus = val()?.into(),
                 "--vocab" => c.vocab = val()?.parse().map_err(|e| format!("{e}"))?,
+                "--depth" => c.depth = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--grid" => c.grid = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--channels" => c.channels = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--conv-hidden" => c.conv_hidden = val()?.parse().map_err(|e| format!("{e}"))?,
@@ -151,9 +186,17 @@ impl Cli {
                 "--muon-lr" => c.muon_lr = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--muon-momentum" => c.muon_momentum = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--muon-ns" => c.muon_ns = val()?.parse().map_err(|e| format!("{e}"))?,
+                "--aux-weight" => c.aux_weight = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--anneal-tmax" => c.anneal_tmax = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--anneal-alpha" => c.anneal_alpha = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--t-init" => c.t_init = val()?.parse().map_err(|e| format!("{e}"))?,
+                "--vortex-beta" => c.vortex_beta = val()?.parse().map_err(|e| format!("{e}"))?,
+                "--vortex-swirl" => c.vortex_swirl = val()?.parse().map_err(|e| format!("{e}"))?,
+                "--inject-ring" => c.inject_ring = val()?.parse().map_err(|e| format!("{e}"))?,
+                "--read-horizon" => c.read_horizon = val()?.parse().map_err(|e| format!("{e}"))?,
+                "--sink-radius" => c.sink_radius = val()?.parse().map_err(|e| format!("{e}"))?,
+                "--sink-strength" => c.sink_strength = val()?.parse().map_err(|e| format!("{e}"))?,
+                "--diff-k0" => c.diff_k0 = val()?.parse().map_err(|e| format!("{e}"))?,
                 "--viz" => {
                     c.viz = true;
                     step = 1;
@@ -174,6 +217,14 @@ impl Cli {
                     c.inject_every = true;
                     step = 1;
                 }
+                "--no-unigram-bias" => {
+                    c.no_unigram_bias = true;
+                    step = 1;
+                }
+                "--delta-readout" => {
+                    c.delta_readout = true;
+                    step = 1;
+                }
                 other => return Err(format!("unknown flag {other}")),
             }
             i += step;
@@ -188,6 +239,9 @@ impl Cli {
         if uses_moments && c.grid % c.pool != 0 {
             return Err(format!("grid {} not divisible by pool {}", c.grid, c.pool));
         }
+        if uses_moments && c.depth % c.pool != 0 {
+            return Err(format!("depth {} not divisible by pool {}", c.depth, c.pool));
+        }
         Ok(c)
     }
 
@@ -199,6 +253,7 @@ impl Cli {
         };
         ThermoConfig {
             vocab,
+            d: self.depth,
             h: self.grid,
             w: self.grid,
             c: self.channels,
@@ -259,6 +314,25 @@ fn main() -> ExitCode {
     let mut rng = StdRng::seed_from_u64(cli.seed);
     let mut model = ThermoLM::new(cfg.clone(), &mut rng);
     model.inject_every = cli.inject_every;
+    // Start the readout at the marginal token distribution (loss ≈ unigram
+    // entropy, not ln V) so capacity goes to structure, not the prior. The
+    // GPU path picks this up for free — it uploads `model.readout.bias`.
+    if !cli.no_unigram_bias {
+        model.readout.bias = unigram_log_bias(&tokens[..n_train], vocab);
+    }
+    model.aux_weight = cli.aux_weight;
+    model.delta_readout = cli.delta_readout;
+    model.vortex_beta = cli.vortex_beta;
+    model.vortex_swirl = cli.vortex_swirl;
+    model.inject_ring_radius = cli.inject_ring;
+    model.readout_horizon = cli.read_horizon;
+    model.sink_radius = cli.sink_radius;
+    model.sink_strength = cli.sink_strength;
+    model.rebuild_experimental();
+    // Stronger initial diffusion (the cheap-lever stability control vs vortex).
+    if cli.diff_k0 > 0.0 {
+        model.step.diffusion.k0 = vec![cli.diff_k0; cfg.c];
+    }
     let bigram = bigram_bpb(&tokens[..n_train], &tokens[n_train..], vocab, comp);
 
     println!("════════════════════════════════════════════════════════════");
@@ -266,8 +340,8 @@ fn main() -> ExitCode {
     println!("════════════════════════════════════════════════════════════");
     println!(" corpus     : {} ({corpus_bytes} bytes)", cli.corpus.display());
     println!(" tokens     : {} (vocab {vocab}, comp {comp:.2} B/tok)", tokens.len());
-    println!(" grid       : {0}×{0}×{1}  conv_hidden {2}  K {3}  dt {4}  pool {5}",
-        cli.grid, cli.channels, cli.conv_hidden, cli.k_steps, cli.dt, cli.pool);
+    println!(" grid       : {}×{}×{}×{}  conv_hidden {}  K {}  dt {}  pool {}",
+        cli.depth, cli.grid, cli.grid, cli.channels, cli.conv_hidden, cli.k_steps, cli.dt, cli.pool);
     let ew_disp = if cli.eval_windows == 0 { "all".into() } else { cli.eval_windows.to_string() };
     println!(" train/loop : seq {} batch {} steps {} lr {:.1e}→{:.1e} warmup {}  eval/{} w{}",
         cli.seq_len, cli.batch_size, cli.steps, cli.lr, cli.min_lr, cli.warmup_steps, cli.eval_every, ew_disp);
@@ -279,6 +353,18 @@ fn main() -> ExitCode {
     println!(" T1 opts    : readout {} (modes {}) | conserve {} | diffusion {} | K {}→{} (warmup {})",
         cli.readout, cli.modes, !cli.no_conserve, !cli.no_diffusion,
         if cli.k_warmup > 0 { cli.k_start } else { cli.k_steps }, cli.k_steps, cli.k_warmup);
+    if cli.aux_weight > 0.0 {
+        println!(" deep-sup   : aux_weight {:.2} on intermediate sub-step readouts (CPU-only)", cli.aux_weight);
+    }
+    if cli.delta_readout {
+        println!(" delta-ro   : readout on (field_after − field_before)  (CPU-only)");
+    }
+    if cli.cpu_only_features() && (cli.vortex_beta != 0.0 || cli.inject_ring > 0.0 || cli.read_horizon > 0.0 || cli.sink_radius > 0.0) {
+        println!(
+            " vortex     : β {:.2} swirl {:.2} | ring r{:.1} | read-horizon r{:.1} | sink r{:.1}×{:.2}  (CPU-only)",
+            cli.vortex_beta, cli.vortex_swirl, cli.inject_ring, cli.read_horizon, cli.sink_radius, cli.sink_strength
+        );
+    }
     println!(" BASELINE   : bigram val bpb {bigram:.4}   ← must beat this");
     println!("════════════════════════════════════════════════════════════");
 
@@ -297,11 +383,23 @@ fn main() -> ExitCode {
             model.param_count(),
             cli.steps as u64,
             bigram,
-            &["Temperature", "Density", "Energy", "|Velocity|"],
+            // Per quantity: central z-slice + max-over-z projection (3D viz).
+            &["Temp z½", "Temp maxZ", "Density z½", "Density maxZ",
+              "Energy z½", "Energy maxZ", "|Vel| z½", "|Vel| maxZ"],
         ))
     } else {
         None
     };
+    #[cfg(feature = "viz")]
+    if let Some(s) = snapshot.as_ref() {
+        if let Ok(mut g) = s.lock() {
+            g.vortex_beta = cli.vortex_beta;
+            g.vortex_swirl = cli.vortex_swirl;
+            g.inject_ring = cli.inject_ring;
+            g.read_horizon = cli.read_horizon;
+            g.sink_radius = cli.sink_radius;
+        }
+    }
 
     let ctx = TrainCtx {
         cli,
@@ -336,7 +434,9 @@ fn main() -> ExitCode {
 fn run_training(ctx: TrainCtx) {
     #[cfg(feature = "gpu")]
     {
-        if ctx.cli.gpu {
+        if ctx.cli.gpu && ctx.cli.cpu_only_features() {
+            eprintln!("⚠ --aux-weight / --delta-readout / --vortex-* / --inject-ring / --read-horizon / --sink-* are CPU-only; the GPU rollout ignores them — running on CPU");
+        } else if ctx.cli.gpu {
             match aurora::gpu::GpuContext::new() {
                 Ok(gctx) => {
                     println!(" GPU          : {}", gctx.adapter_info().name);
@@ -610,9 +710,14 @@ fn publish(
     s.step_tick = s.step_tick.wrapping_add(1);
 }
 
+/// Reduce the `D×H×W` field to per-quantity `H×W` views for the 2D-texture
+/// heatmaps: the central z-slice and the max-over-z projection (the §6 "3D
+/// řezy" choice). `D=1` makes both views identical to the single plane.
 #[cfg(feature = "viz")]
 fn extract_channels(field: &[f32], cfg: &ThermoConfig) -> Vec<aurora::viz::ThermoChannel> {
-    let (cells, c) = (cfg.cells(), cfg.c);
+    let (d, h, w, c) = (cfg.d, cfg.h, cfg.w, cfg.c);
+    let hw = h * w;
+    let zc = d / 2;
     let mk = |name: &str, vals: Vec<f32>| {
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
         for &x in &vals {
@@ -623,13 +728,47 @@ fn extract_channels(field: &[f32], cfg: &ThermoConfig) -> Vec<aurora::viz::Therm
         }
         aurora::viz::ThermoChannel { name: name.to_string(), data: vals, vmin: lo, vmax: hi }
     };
-    let t: Vec<f32> = (0..cells).map(|i| field[i * c + CH_T]).collect();
-    let rho: Vec<f32> = (0..cells).map(|i| field[i * c + CH_RHO]).collect();
-    let e: Vec<f32> = (0..cells).map(|i| field[i * c + CH_E]).collect();
-    let vel: Vec<f32> = (0..cells)
-        .map(|i| (field[i * c + CH_UX].powi(2) + field[i * c + CH_UY].powi(2)).sqrt())
-        .collect();
-    vec![mk("Temperature", t), mk("Density", rho), mk("Energy", e), mk("|Velocity|", vel)]
+    let mut out = Vec::with_capacity(8);
+    let mut views = |name: &str, val: &dyn Fn(usize) -> f32| {
+        let mut slice = vec![0.0_f32; hw];
+        let mut proj = vec![f32::NEG_INFINITY; hw];
+        for z in 0..d {
+            let base = z * hw;
+            for p in 0..hw {
+                let v = val(base + p);
+                if z == zc {
+                    slice[p] = v;
+                }
+                proj[p] = proj[p].max(v);
+            }
+        }
+        out.push(mk(&format!("{name} z½"), slice));
+        out.push(mk(&format!("{name} maxZ"), proj));
+    };
+    views("Temp", &|cell| field[cell * c + CH_T]);
+    views("Density", &|cell| field[cell * c + CH_RHO]);
+    views("Energy", &|cell| field[cell * c + CH_E]);
+    views("|Vel|", &|cell| {
+        (field[cell * c + CH_UX].powi(2)
+            + field[cell * c + CH_UY].powi(2)
+            + field[cell * c + CH_UZ].powi(2))
+        .sqrt()
+    });
+    out
+}
+
+/// Add-1 smoothed unigram log-prior over `train`, one entry per vocab id.
+/// Used to warm-start the readout bias at the marginal distribution.
+fn unigram_log_bias(train: &[u32], vocab: usize) -> Vec<f32> {
+    let mut counts = vec![0u64; vocab];
+    for &t in train {
+        counts[t as usize] += 1;
+    }
+    let denom = train.len() as f64 + vocab as f64;
+    counts
+        .iter()
+        .map(|&c| (((c as f64) + 1.0) / denom).ln() as f32)
+        .collect()
 }
 
 /// Add-1 smoothed bigram model trained on `train`, evaluated on `val`.

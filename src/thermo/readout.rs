@@ -10,10 +10,10 @@
 //! Readout head: field → vocab logits.
 //!
 //! Two feature sources, selectable per `ThermoConfig` (§3.1 + §3.2):
-//! * **moments** — `AvgPool(P×P)` of the `H×W×C` field, the coarse-grained
-//!   macroscopic moment vector.
-//! * **spectral** — projection onto the lowest 2D-DCT standing-wave modes
-//!   per channel (`readout_modes²` modes × C). The cosine basis is a fixed
+//! * **moments** — `AvgPool(P×P×P)` of the `D×H×W×C` field, the coarse-
+//!   grained macroscopic moment vector.
+//! * **spectral** — projection onto the lowest 3D-DCT standing-wave modes
+//!   per channel (`readout_modes³` modes × C). The cosine basis is a fixed
 //!   linear map (orthonormal rows), so it needs no FFT dependency and its
 //!   backward is the transpose. The doc notes modal readout is empirically
 //!   stronger for periodic/structured signals.
@@ -34,6 +34,10 @@ pub struct ReadoutWeights {
     /// Fixed DCT basis `[modes² * cells]`, unit-norm rows. Empty when the
     /// spectral readout is disabled. Not a trained parameter.
     pub basis: Vec<f32>,
+    /// Per-cell horizon mask `[cells]` gating which cells the head reads (the
+    /// §19 "read head at the event horizon"). Empty = read the whole field.
+    /// Not a trained parameter; set via `ThermoLM`.
+    pub horizon: Vec<f32>,
     pub use_moments: bool,
     pub use_spectral: bool,
     pub modes: usize,
@@ -46,6 +50,7 @@ impl ReadoutWeights {
             proj: LinearProj::new_scaled(cfg.readout_dim(), cfg.vocab, 0.1, rng),
             bias: vec![0.0; cfg.vocab],
             basis,
+            horizon: Vec::new(),
             use_moments: cfg.readout_moments,
             use_spectral: cfg.readout_spectral,
             modes: cfg.readout_modes,
@@ -58,29 +63,59 @@ impl ReadoutWeights {
     }
 }
 
-/// Lowest `modes²` 2D cosine standing-wave modes, each row L2-normalized so
-/// coefficients are well-scaled. Row `mx*modes+my`, cell `(i,j)`:
-/// `cos(π·mx·(i+½)/H)·cos(π·my·(j+½)/W)`.
-fn build_dct_basis(cfg: &ThermoConfig) -> Vec<f32> {
-    let (h, w, modes) = (cfg.h, cfg.w, cfg.readout_modes);
-    let cells = h * w;
-    let mut basis = vec![0.0_f32; modes * modes * cells];
-    let pi = std::f32::consts::PI;
-    for mx in 0..modes {
-        for my in 0..modes {
-            let row = (mx * modes + my) * cells;
-            let mut norm_sq = 0.0_f32;
-            for i in 0..h {
-                for j in 0..w {
-                    let v = (pi * mx as f32 * (i as f32 + 0.5) / h as f32).cos()
-                        * (pi * my as f32 * (j as f32 + 0.5) / w as f32).cos();
-                    basis[row + i * w + j] = v;
-                    norm_sq += v * v;
-                }
+/// Gaussian shell `[cells]` peaked at `radius` (3D distance from centre) — the
+/// horizon the read head listens on. Cells far from the shell get ≈0, so the
+/// readout sees only what the vortex has concentrated near that radius.
+pub fn build_horizon_mask(cfg: &ThermoConfig, radius: f32) -> Vec<f32> {
+    let (d, h, w) = (cfg.d, cfg.h, cfg.w);
+    let (cz, ci, cj) = (
+        (d as f32 - 1.0) * 0.5,
+        (h as f32 - 1.0) * 0.5,
+        (w as f32 - 1.0) * 0.5,
+    );
+    let sigma = (d.max(w.max(h)) as f32) / 8.0;
+    let inv = 1.0 / (2.0 * sigma * sigma);
+    let mut m = vec![0.0_f32; d * h * w];
+    for z in 0..d {
+        for i in 0..h {
+            for j in 0..w {
+                let (dz, di, dj) = (z as f32 - cz, i as f32 - ci, j as f32 - cj);
+                let dr = (dz * dz + di * di + dj * dj).sqrt() - radius;
+                m[(z * h + i) * w + j] = (-dr * dr * inv).exp();
             }
-            let inv = norm_sq.sqrt().max(1e-8).recip();
-            for c in &mut basis[row..row + cells] {
-                *c *= inv;
+        }
+    }
+    m
+}
+
+/// Lowest `modes³` 3D cosine standing-wave modes, each row L2-normalized so
+/// coefficients are well-scaled. Row `(mz*modes+mx)*modes+my`, cell
+/// `(z,i,j)`: `cos(π·mz·(z+½)/D)·cos(π·mx·(i+½)/H)·cos(π·my·(j+½)/W)`.
+fn build_dct_basis(cfg: &ThermoConfig) -> Vec<f32> {
+    let (d, h, w, modes) = (cfg.d, cfg.h, cfg.w, cfg.readout_modes);
+    let cells = d * h * w;
+    let mut basis = vec![0.0_f32; modes * modes * modes * cells];
+    let pi = std::f32::consts::PI;
+    for mz in 0..modes {
+        for mx in 0..modes {
+            for my in 0..modes {
+                let row = ((mz * modes + mx) * modes + my) * cells;
+                let mut norm_sq = 0.0_f32;
+                for z in 0..d {
+                    for i in 0..h {
+                        for j in 0..w {
+                            let v = (pi * mz as f32 * (z as f32 + 0.5) / d as f32).cos()
+                                * (pi * mx as f32 * (i as f32 + 0.5) / h as f32).cos()
+                                * (pi * my as f32 * (j as f32 + 0.5) / w as f32).cos();
+                            basis[row + (z * h + i) * w + j] = v;
+                            norm_sq += v * v;
+                        }
+                    }
+                }
+                let inv = norm_sq.sqrt().max(1e-8).recip();
+                for cc in &mut basis[row..row + cells] {
+                    *cc *= inv;
+                }
             }
         }
     }
@@ -114,19 +149,25 @@ pub struct ReadoutCache {
 }
 
 fn avg_pool(s: &[f32], cfg: &ThermoConfig) -> Vec<f32> {
-    let (h, w, c, p) = (cfg.h, cfg.w, cfg.c, cfg.pool);
-    let (ph, pw) = (h / p, w / p);
-    let inv = 1.0 / (p * p) as f32;
-    let mut out = vec![0.0_f32; ph * pw * c];
-    for bi in 0..ph {
-        for bj in 0..pw {
-            let dst = &mut out[(bi * pw + bj) * c..(bi * pw + bj + 1) * c];
-            for di in 0..p {
-                for dj in 0..p {
-                    let cell = (bi * p + di) * w + (bj * p + dj);
-                    let src = &s[cell * c..(cell + 1) * c];
-                    for ch in 0..c {
-                        dst[ch] += src[ch] * inv;
+    let (d, h, w, c, p) = (cfg.d, cfg.h, cfg.w, cfg.c, cfg.pool);
+    let (pd, ph, pw) = (d / p, h / p, w / p);
+    let inv = 1.0 / (p * p * p) as f32;
+    let mut out = vec![0.0_f32; pd * ph * pw * c];
+    for bd in 0..pd {
+        for bi in 0..ph {
+            for bj in 0..pw {
+                let blk = (bd * ph + bi) * pw + bj;
+                let dst = &mut out[blk * c..(blk + 1) * c];
+                for dz in 0..p {
+                    for di in 0..p {
+                        for dj in 0..p {
+                            let cell =
+                                ((bd * p + dz) * h + (bi * p + di)) * w + (bj * p + dj);
+                            let src = &s[cell * c..(cell + 1) * c];
+                            for ch in 0..c {
+                                dst[ch] += src[ch] * inv;
+                            }
+                        }
                     }
                 }
             }
@@ -138,7 +179,7 @@ fn avg_pool(s: &[f32], cfg: &ThermoConfig) -> Vec<f32> {
 /// `coeff[c, m] = Σ_cell basis[m, cell] · field[cell, c]`, channel-major.
 fn spectral_coeffs(s: &[f32], w: &ReadoutWeights, cfg: &ThermoConfig) -> Vec<f32> {
     let (cells, c) = (cfg.cells(), cfg.c);
-    let m = cfg.readout_modes * cfg.readout_modes;
+    let m = cfg.readout_modes * cfg.readout_modes * cfg.readout_modes;
     let mut out = vec![0.0_f32; c * m];
     for ch in 0..c {
         for mode in 0..m {
@@ -176,6 +217,23 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 pub fn readout_forward(s: &[f32], w: &ReadoutWeights, cfg: &ThermoConfig) -> (Vec<f32>, ReadoutCache) {
+    // Horizon read head: gate the field to the shell before extracting features.
+    let masked_storage;
+    let s: &[f32] = if w.horizon.is_empty() {
+        s
+    } else {
+        let c = cfg.c;
+        let mut m = s.to_vec();
+        for cell in 0..cfg.cells() {
+            let g = w.horizon[cell];
+            for ch in 0..c {
+                m[cell * c + ch] *= g;
+            }
+        }
+        masked_storage = m;
+        &masked_storage
+    };
+
     let mut features = Vec::with_capacity(cfg.readout_dim());
     if w.use_moments {
         features.extend_from_slice(&avg_pool(s, cfg));
@@ -204,36 +262,42 @@ pub fn readout_backward(
     }
     let d_features = linear_backward(&w.proj, &cache.features, d_logits, &mut g.d_proj);
 
-    let (h, ww, c, p) = (cfg.h, cfg.w, cfg.c, cfg.pool);
+    let (d, h, ww, c, p) = (cfg.d, cfg.h, cfg.w, cfg.c, cfg.pool);
     let mut d_s = vec![0.0_f32; cfg.field_len()];
     let mut off = 0;
 
     if w.use_moments {
-        // AvgPool backward: each pooled value spreads 1/P² to its block.
-        let (ph, pw) = (h / p, ww / p);
-        let inv = 1.0 / (p * p) as f32;
-        let d_pooled = &d_features[off..off + ph * pw * c];
-        for bi in 0..ph {
-            for bj in 0..pw {
-                let src = &d_pooled[(bi * pw + bj) * c..(bi * pw + bj + 1) * c];
-                for di in 0..p {
-                    for dj in 0..p {
-                        let cell = (bi * p + di) * ww + (bj * p + dj);
-                        let dst = &mut d_s[cell * c..(cell + 1) * c];
-                        for ch in 0..c {
-                            dst[ch] += src[ch] * inv;
+        // AvgPool backward: each pooled value spreads 1/P³ to its block.
+        let (pd, ph, pw) = (d / p, h / p, ww / p);
+        let inv = 1.0 / (p * p * p) as f32;
+        let d_pooled = &d_features[off..off + pd * ph * pw * c];
+        for bd in 0..pd {
+            for bi in 0..ph {
+                for bj in 0..pw {
+                    let blk = (bd * ph + bi) * pw + bj;
+                    let src = &d_pooled[blk * c..(blk + 1) * c];
+                    for dz in 0..p {
+                        for di in 0..p {
+                            for dj in 0..p {
+                                let cell = ((bd * p + dz) * h + (bi * p + di)) * ww
+                                    + (bj * p + dj);
+                                let dst = &mut d_s[cell * c..(cell + 1) * c];
+                                for ch in 0..c {
+                                    dst[ch] += src[ch] * inv;
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        off += ph * pw * c;
+        off += pd * ph * pw * c;
     }
 
     if w.use_spectral {
         // Spectral backward (transpose of the basis projection).
         let cells = cfg.cells();
-        let m = cfg.readout_modes * cfg.readout_modes;
+        let m = cfg.readout_modes * cfg.readout_modes * cfg.readout_modes;
         let d_spec = &d_features[off..off + c * m];
         for ch in 0..c {
             for mode in 0..m {
@@ -245,6 +309,16 @@ pub fn readout_backward(
                 for cell in 0..cells {
                     d_s[cell * c + ch] += brow[cell] * g_cm;
                 }
+            }
+        }
+    }
+
+    // Adjoint of the horizon gate (features were read off `mask·s`).
+    if !w.horizon.is_empty() {
+        for cell in 0..cfg.cells() {
+            let g = w.horizon[cell];
+            for ch in 0..c {
+                d_s[cell * c + ch] *= g;
             }
         }
     }

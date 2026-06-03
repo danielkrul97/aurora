@@ -9,8 +9,8 @@
 //! scalar modulates the diffusion amplitude (the §4 hot→cold schedule);
 //! the local `κ(T)` gate modulates it further per cell.
 //!
-//! Output-channel layout of the conv (`c_out = (c−n_cons) free + 2·n_cons
-//! flux`): `[free deltas | Fx per conserved | Fy per conserved]`.
+//! Output-channel layout of the conv (`c_out = (c−n_cons) free + 3·n_cons
+//! flux`): `[free deltas | Fx per cons | Fy per cons | Fz per cons]`.
 
 use rand::Rng;
 
@@ -20,11 +20,18 @@ use crate::thermo::diffusion::{
 };
 use crate::thermo::field::{free_channels_for, ThermoConfig};
 use crate::thermo::flux::{flux_div_backward, flux_div_forward};
+use crate::thermo::vortex::{vortex_flux_add, vortex_flux_backward, VortexField};
 
 #[derive(Clone, Debug)]
 pub struct StepWeights {
     pub conv: ConvWeights,
     pub diffusion: DiffusionWeights,
+    /// Prescribed advection biasing the conserved-channel fluxes (the §19
+    /// vortex). `None` = off. Parameter-free, set via `ThermoLM`.
+    pub vortex: Option<VortexField>,
+    /// Per-cell horizon attenuation mask `[cells]` applied as the last op of
+    /// the sub-step ("information destruction at the horizon"). `None` = off.
+    pub sink: Option<Vec<f32>>,
 }
 
 impl StepWeights {
@@ -32,6 +39,8 @@ impl StepWeights {
         Self {
             conv: ConvWeights::new(cfg, rng),
             diffusion: DiffusionWeights::new(cfg),
+            vortex: None,
+            sink: None,
         }
     }
 }
@@ -78,14 +87,21 @@ pub fn step_forward(
     // Decode conserved-channel edge fluxes from the conv output.
     let mut fx = vec![0.0_f32; cells * nc];
     let mut fy = vec![0.0_f32; cells * nc];
+    let mut fz = vec![0.0_f32; cells * nc];
     for cell in 0..cells {
         let base = cell * c_out;
         for m in 0..nc {
             fx[cell * nc + m] = raw[base + nfree + m];
             fy[cell * nc + m] = raw[base + nfree + nc + m];
+            fz[cell * nc + m] = raw[base + nfree + 2 * nc + m];
         }
     }
-    let div = flux_div_forward(&fx, &fy, cfg);
+    // Prescribed vortex advection rides on the same edges as the learned flux,
+    // so it telescopes too (conservation preserved). Reads the input field.
+    if let Some(vf) = &w.vortex {
+        vortex_flux_add(s, vf, cfg, &mut fx, &mut fy, &mut fz);
+    }
+    let div = flux_div_forward(&fx, &fy, &fz, cfg);
 
     let (diff_delta, diff_cache) = if cfg.use_diffusion {
         diffusion_forward(s, &w.diffusion, cfg)
@@ -111,6 +127,17 @@ pub fn step_forward(
             out[i] += dt * anneal * diff_delta[i];
         }
     }
+    // Horizon sink: destroy a fraction of whatever sits in the core. Breaks
+    // conservation by design — the literal black hole. Last op of the step.
+    if let Some(mask) = &w.sink {
+        for cell in 0..cells {
+            let m = mask[cell];
+            let dst = &mut out[cell * c..(cell + 1) * c];
+            for v in dst.iter_mut() {
+                *v *= m;
+            }
+        }
+    }
 
     (out, StepCache { conv: conv_cache, diff: diff_cache, anneal })
 }
@@ -128,6 +155,23 @@ pub fn step_backward(
     let dt = cfg.dt;
     let anneal = cache.anneal;
     let free_chs = free_channels_for(cfg);
+
+    // Sink adjoint first: `out = mask·raw_out` ⇒ `∂L/∂raw_out = mask·∂L/∂out`.
+    // Masking up front means every downstream path sees the corrected upstream.
+    let masked_storage;
+    let d_out: &[f32] = if let Some(mask) = &w.sink {
+        let mut m = d_out.to_vec();
+        for cell in 0..cells {
+            let mm = mask[cell];
+            for ch in 0..c {
+                m[cell * c + ch] *= mm;
+            }
+        }
+        masked_storage = m;
+        &masked_storage
+    } else {
+        d_out
+    };
 
     // Residual path: ∂(s + …)/∂s = identity.
     let mut d_s = d_out.to_vec();
@@ -157,17 +201,27 @@ pub fn step_backward(
             d_raw[base + k] = dt * d_out[cell * c + free_chs[k]];
         }
     }
-    let (d_fx, d_fy) = flux_div_backward(&d_div, cfg);
+    let (d_fx, d_fy, d_fz) = flux_div_backward(&d_div, cfg);
     for cell in 0..cells {
         let base = cell * c_out;
         for m in 0..nc {
             d_raw[base + nfree + m] = d_fx[cell * nc + m];
             d_raw[base + nfree + nc + m] = d_fy[cell * nc + m];
+            d_raw[base + nfree + 2 * nc + m] = d_fz[cell * nc + m];
         }
     }
     let d_s_conv = conv_backward(&w.conv, &cache.conv, &d_raw, &mut g.conv, cfg);
     for i in 0..d_s.len() {
         d_s[i] += d_s_conv[i];
+    }
+
+    // Vortex shares the same edge-flux upstream as the conv; its adjoint
+    // scatters onto the upwind source cells.
+    if let Some(vf) = &w.vortex {
+        let d_s_vtx = vortex_flux_backward(&d_fx, &d_fy, &d_fz, vf, cfg);
+        for i in 0..d_s.len() {
+            d_s[i] += d_s_vtx[i];
+        }
     }
 
     d_s
