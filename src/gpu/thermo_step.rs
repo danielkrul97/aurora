@@ -32,26 +32,28 @@ struct ExtractParams {
     nc: u32,
     nfree: u32,
     cout: u32,
-    _p0: u32,
+    d: u32,
     _p1: u32,
     _p2: u32,
 }
 
 const EXTRACT_WGSL: &str = "
-struct P { h:u32, w:u32, nc:u32, nfree:u32, cout:u32, _0:u32, _1:u32, _2:u32 };
+struct P { h:u32, w:u32, nc:u32, nfree:u32, cout:u32, d:u32, _1:u32, _2:u32 };
 @group(0) @binding(0) var<storage, read>       raw: array<f32>;  // [cells*cout]
 @group(0) @binding(1) var<storage, read_write> fx:  array<f32>;  // [cells*nc]
 @group(0) @binding(2) var<storage, read_write> fy:  array<f32>;
+@group(0) @binding(3) var<storage, read_write> fz:  array<f32>;
 var<push_constant> p: P;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.h * p.w * p.nc) { return; }
+    if (idx >= p.d * p.h * p.w * p.nc) { return; }
     let m = idx % p.nc;
     let cell = idx / p.nc;
     fx[idx] = raw[cell * p.cout + p.nfree + m];
     fy[idx] = raw[cell * p.cout + p.nfree + p.nc + m];
+    fz[idx] = raw[cell * p.cout + p.nfree + 2u * p.nc + m];
 }
 ";
 
@@ -105,12 +107,13 @@ pub struct StepAssembleKernel {
 impl ExtractFluxKernel {
     #[must_use]
     pub fn new(ctx: &GpuContext) -> Self {
-        let (pipeline, bgl) = build(ctx, "thermo_extract", EXTRACT_WGSL, &[true, false, false]);
+        let (pipeline, bgl) = build(ctx, "thermo_extract", EXTRACT_WGSL, &[true, false, false, false]);
         Self { pipeline, bgl }
     }
-    pub fn dispatch_into(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, raw: &GpuBuffer, fx: &GpuBuffer, fy: &GpuBuffer, h: u32, w: u32, nc: u32, nfree: u32, cout: u32) {
-        let p = ExtractParams { h, w, nc, nfree, cout, _p0: 0, _p1: 0, _p2: 0 };
-        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[raw, fx, fy], bytemuck::bytes_of(&p), (h * w * nc).div_ceil(WG));
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_into(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, raw: &GpuBuffer, fx: &GpuBuffer, fy: &GpuBuffer, fz: &GpuBuffer, h: u32, w: u32, nc: u32, nfree: u32, cout: u32, d: u32) {
+        let p = ExtractParams { h, w, nc, nfree, cout, d, _p1: 0, _p2: 0 };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[raw, fx, fy, fz], bytemuck::bytes_of(&p), (d * h * w * nc).div_ceil(WG));
     }
 }
 
@@ -120,9 +123,12 @@ impl StepAssembleKernel {
         let (pipeline, bgl) = build(ctx, "thermo_assemble", ASSEMBLE_WGSL, &[true, true, true, true, true, true, false]);
         Self { pipeline, bgl }
     }
-    pub fn dispatch_into(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, s: &GpuBuffer, div: &GpuBuffer, raw: &GpuBuffer, diff: &GpuBuffer, kind: &GpuBuffer, slot: &GpuBuffer, out: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, diff_on: u32, dt: f32, anneal: f32) {
-        let p = AssembleParams { h, w, c, nc, cout, diff_on, dt, anneal };
-        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[s, div, raw, diff, kind, slot, out], bytemuck::bytes_of(&p), (h * w * c).div_ceil(WG));
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_into(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, s: &GpuBuffer, div: &GpuBuffer, raw: &GpuBuffer, diff: &GpuBuffer, kind: &GpuBuffer, slot: &GpuBuffer, out: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, diff_on: u32, dt: f32, anneal: f32, d: u32) {
+        // ASSEMBLE is purely per-element (it never decodes spatial coords), so
+        // depth folds into the flattened cell extent — no extra param slot.
+        let p = AssembleParams { h: h * d, w, c, nc, cout, diff_on, dt, anneal };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[s, div, raw, diff, kind, slot, out], bytemuck::bytes_of(&p), (h * d * w * c).div_ceil(WG));
     }
 }
 
@@ -163,7 +169,7 @@ struct DisassembleParams {
     c: u32,
     nc: u32,
     cout: u32,
-    _p0: u32,
+    d: u32,
     dt: f32,
     _p1: u32,
 }
@@ -172,7 +178,7 @@ struct DisassembleParams {
 /// `d_div` (conserved channels) and the free-delta slots of `d_raw`.
 /// `d_raw` must be pre-zeroed (the flux slots are filled by `FluxScatter`).
 const DISASSEMBLE_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, nc:u32, cout:u32, _0:u32, dt:f32, _1:u32 };
+struct P { h:u32, w:u32, c:u32, nc:u32, cout:u32, d:u32, dt:f32, _1:u32 };
 @group(0) @binding(0) var<storage, read>       d_out: array<f32>;  // [cells*c]
 @group(0) @binding(1) var<storage, read>       kind:  array<u32>;  // [c]
 @group(0) @binding(2) var<storage, read>       slot:  array<u32>;  // [c]
@@ -182,7 +188,7 @@ var<push_constant> p: P;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = gid.x;
-    if (g >= p.h * p.w * p.c) { return; }
+    if (g >= p.d * p.h * p.w * p.c) { return; }
     let ch = g % p.c;
     let cell = g / p.c;
     let v = p.dt * d_out[g];
@@ -193,19 +199,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// Adjoint of `ExtractFlux`: write `d_fx`/`d_fy` into `d_raw`'s flux slots.
 const FLUX_SCATTER_WGSL: &str = "
-struct P { h:u32, w:u32, nc:u32, nfree:u32, cout:u32, _0:u32, _1:u32, _2:u32 };
+struct P { h:u32, w:u32, nc:u32, nfree:u32, cout:u32, d:u32, _1:u32, _2:u32 };
 @group(0) @binding(0) var<storage, read>       d_fx:  array<f32>;  // [cells*nc]
 @group(0) @binding(1) var<storage, read>       d_fy:  array<f32>;
-@group(0) @binding(2) var<storage, read_write> d_raw: array<f32>;  // [cells*cout]
+@group(0) @binding(2) var<storage, read>       d_fz:  array<f32>;
+@group(0) @binding(3) var<storage, read_write> d_raw: array<f32>;  // [cells*cout]
 var<push_constant> p: P;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.h * p.w * p.nc) { return; }
+    if (idx >= p.d * p.h * p.w * p.nc) { return; }
     let m = idx % p.nc;
     let cell = idx / p.nc;
     d_raw[cell * p.cout + p.nfree + m] = d_fx[idx];
     d_raw[cell * p.cout + p.nfree + p.nc + m] = d_fy[idx];
+    d_raw[cell * p.cout + p.nfree + 2u * p.nc + m] = d_fz[idx];
 }
 ";
 
@@ -287,22 +295,22 @@ impl ThermoDisassembleKernel {
         Self { pipeline, bgl }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_into(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, d_out: &GpuBuffer, kind: &GpuBuffer, slot: &GpuBuffer, d_div: &GpuBuffer, d_raw: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, dt: f32) {
-        let p = DisassembleParams { h, w, c, nc, cout, _p0: 0, dt, _p1: 0 };
-        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[d_out, kind, slot, d_div, d_raw], bytemuck::bytes_of(&p), (h * w * c).div_ceil(WG));
+    pub fn dispatch_into(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, d_out: &GpuBuffer, kind: &GpuBuffer, slot: &GpuBuffer, d_div: &GpuBuffer, d_raw: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, dt: f32, d: u32) {
+        let p = DisassembleParams { h, w, c, nc, cout, d, dt, _p1: 0 };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[d_out, kind, slot, d_div, d_raw], bytemuck::bytes_of(&p), (d * h * w * c).div_ceil(WG));
     }
 }
 
 impl ThermoFluxScatterKernel {
     #[must_use]
     pub fn new(ctx: &GpuContext) -> Self {
-        let (pipeline, bgl) = build(ctx, "thermo_flux_scatter", FLUX_SCATTER_WGSL, &[true, true, false]);
+        let (pipeline, bgl) = build(ctx, "thermo_flux_scatter", FLUX_SCATTER_WGSL, &[true, true, true, false]);
         Self { pipeline, bgl }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_into(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, d_fx: &GpuBuffer, d_fy: &GpuBuffer, d_raw: &GpuBuffer, h: u32, w: u32, nc: u32, nfree: u32, cout: u32) {
-        let p = ExtractParams { h, w, nc, nfree, cout, _p0: 0, _p1: 0, _p2: 0 };
-        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[d_fx, d_fy, d_raw], bytemuck::bytes_of(&p), (h * w * nc).div_ceil(WG));
+    pub fn dispatch_into(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, d_fx: &GpuBuffer, d_fy: &GpuBuffer, d_fz: &GpuBuffer, d_raw: &GpuBuffer, h: u32, w: u32, nc: u32, nfree: u32, cout: u32, d: u32) {
+        let p = ExtractParams { h, w, nc, nfree, cout, d, _p1: 0, _p2: 0 };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[d_fx, d_fy, d_fz, d_raw], bytemuck::bytes_of(&p), (d * h * w * nc).div_ceil(WG));
     }
 }
 
@@ -323,12 +331,13 @@ struct TransportFwdParams {
     nc: u32,
     cout: u32,
     nb: u32,
+    d: u32,
     dt: f32,
     anneal: f32,
 }
 
 const TRANSPORT_FWD_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, nc:u32, cout:u32, nb:u32, dt:f32, anneal:f32 };
+struct P { h:u32, w:u32, c:u32, nc:u32, cout:u32, nb:u32, d:u32, dt:f32, anneal:f32 };
 @group(0) @binding(0) var<storage, read>       s:    array<f32>;  // [nb*cells*c]
 @group(0) @binding(1) var<storage, read>       raw:  array<f32>;  // [nb*cells*cout]
 @group(0) @binding(2) var<storage, read>       diff: array<f32>;  // [nb*cells*c]
@@ -340,28 +349,34 @@ var<push_constant> p: P;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.c) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.c) { return; }
     let ch = idx % p.c;
     let cell = idx / p.c;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let i = row % p.h;
     let j = cell % p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;
+    let g = r2 / p.d;
     let nfree = p.c - p.nc;
     let cbase = cell * p.cout;
-    let gbase = g * p.h * p.w;
+    let gbase = g * p.d * p.h * p.w;
     var v = s[idx] + p.dt * p.anneal * diff[idx];
     if (kind[ch] == 1u) {
         let m = slot[ch];
         var in_left = 0.0;
-        if (j > 0u) { in_left = raw[(gbase + i * p.w + (j - 1u)) * p.cout + nfree + m]; }
+        if (j > 0u) { in_left = raw[(gbase + (z * p.h + i) * p.w + (j - 1u)) * p.cout + nfree + m]; }
         var fx_self = 0.0;
         if (j + 1u < p.w) { fx_self = raw[cbase + nfree + m]; }
         var in_down = 0.0;
-        if (i > 0u) { in_down = raw[(gbase + (i - 1u) * p.w + j) * p.cout + nfree + p.nc + m]; }
+        if (i > 0u) { in_down = raw[(gbase + (z * p.h + (i - 1u)) * p.w + j) * p.cout + nfree + p.nc + m]; }
         var fy_self = 0.0;
         if (i + 1u < p.h) { fy_self = raw[cbase + nfree + p.nc + m]; }
-        v = v + p.dt * ((in_left - fx_self) + (in_down - fy_self));
+        var in_front = 0.0;
+        if (z > 0u) { in_front = raw[(gbase + ((z - 1u) * p.h + i) * p.w + j) * p.cout + nfree + 2u * p.nc + m]; }
+        var fz_self = 0.0;
+        if (z + 1u < p.d) { fz_self = raw[cbase + nfree + 2u * p.nc + m]; }
+        v = v + p.dt * ((in_left - fx_self) + (in_down - fy_self) + (in_front - fz_self));
     } else {
         v = v + p.dt * raw[cbase + slot[ch]];
     }
@@ -385,11 +400,11 @@ struct TransportBwdParams {
     cout: u32,
     nb: u32,
     dt: f32,
-    _pad: u32,
+    d: u32,
 }
 
 const TRANSPORT_BWD_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, nc:u32, cout:u32, nb:u32, dt:f32, _pad:u32 };
+struct P { h:u32, w:u32, c:u32, nc:u32, cout:u32, nb:u32, dt:f32, d:u32 };
 @group(0) @binding(0) var<storage, read>       d_out:   array<f32>;  // [nb*cells*c]
 @group(0) @binding(1) var<storage, read>       cons_ch: array<u32>;  // [nc]
 @group(0) @binding(2) var<storage, read>       free_ch: array<u32>;  // [nfree]
@@ -399,16 +414,18 @@ var<push_constant> p: P;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.cout) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.cout) { return; }
     let co = idx % p.cout;
     let cell = idx / p.cout;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let i = row % p.h;
     let j = cell % p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;
+    let g = r2 / p.d;
     let nfree = p.c - p.nc;
     let cbase = cell * p.c;
-    let gbase = g * p.h * p.w;
+    let gbase = g * p.d * p.h * p.w;
     var val = 0.0;
     if (co < nfree) {
         let ch = free_ch[co];
@@ -418,16 +435,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let ch = cons_ch[m];
         if (j + 1u < p.w) {
             let self_v = p.dt * d_out[cbase + ch];
-            let right = p.dt * d_out[(gbase + i * p.w + (j + 1u)) * p.c + ch];
+            let right = p.dt * d_out[(gbase + (z * p.h + i) * p.w + (j + 1u)) * p.c + ch];
             val = right - self_v;
         }
-    } else {
+    } else if (co < nfree + 2u * p.nc) {
         let m = co - nfree - p.nc;
         let ch = cons_ch[m];
         if (i + 1u < p.h) {
             let self_v = p.dt * d_out[cbase + ch];
-            let bottom = p.dt * d_out[(gbase + (i + 1u) * p.w + j) * p.c + ch];
+            let bottom = p.dt * d_out[(gbase + (z * p.h + (i + 1u)) * p.w + j) * p.c + ch];
             val = bottom - self_v;
+        }
+    } else {
+        let m = co - nfree - 2u * p.nc;
+        let ch = cons_ch[m];
+        if (z + 1u < p.d) {
+            let self_v = p.dt * d_out[cbase + ch];
+            let back = p.dt * d_out[(gbase + ((z + 1u) * p.h + i) * p.w + j) * p.c + ch];
+            val = back - self_v;
         }
     }
     draw[idx] = val;
@@ -450,9 +475,9 @@ impl StepTransportFwdKernel {
         Self { pipeline, bgl }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_b(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, s: &GpuBuffer, raw: &GpuBuffer, diff: &GpuBuffer, kind: &GpuBuffer, slot: &GpuBuffer, out: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, nb: u32, dt: f32, anneal: f32) {
-        let p = TransportFwdParams { h, w, c, nc, cout, nb, dt, anneal };
-        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[s, raw, diff, kind, slot, out], bytemuck::bytes_of(&p), (nb * h * w * c).div_ceil(WG));
+    pub fn dispatch_b(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, s: &GpuBuffer, raw: &GpuBuffer, diff: &GpuBuffer, kind: &GpuBuffer, slot: &GpuBuffer, out: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, nb: u32, dt: f32, anneal: f32, d: u32) {
+        let p = TransportFwdParams { h, w, c, nc, cout, nb, d, dt, anneal };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[s, raw, diff, kind, slot, out], bytemuck::bytes_of(&p), (nb * d * h * w * c).div_ceil(WG));
     }
 }
 
@@ -463,9 +488,9 @@ impl StepTransportBwdKernel {
         Self { pipeline, bgl }
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_b(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, d_out: &GpuBuffer, cons_ch: &GpuBuffer, free_ch: &GpuBuffer, draw: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, nb: u32, dt: f32) {
-        let p = TransportBwdParams { h, w, c, nc, cout, nb, dt, _pad: 0 };
-        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[d_out, cons_ch, free_ch, draw], bytemuck::bytes_of(&p), (nb * h * w * cout).div_ceil(WG));
+    pub fn dispatch_b(&self, ctx: &GpuContext, enc: &mut wgpu::CommandEncoder, d_out: &GpuBuffer, cons_ch: &GpuBuffer, free_ch: &GpuBuffer, draw: &GpuBuffer, h: u32, w: u32, c: u32, nc: u32, cout: u32, nb: u32, dt: f32, d: u32) {
+        let p = TransportBwdParams { h, w, c, nc, cout, nb, dt, d };
+        dispatch_n(ctx, enc, &self.pipeline, &self.bgl, &[d_out, cons_ch, free_ch, draw], bytemuck::bytes_of(&p), (nb * d * h * w * cout).div_ceil(WG));
     }
 }
 
@@ -508,6 +533,7 @@ pub struct ThermoGpuForward {
     raw: GpuBuffer,
     fx: GpuBuffer,
     fy: GpuBuffer,
+    fz: GpuBuffer,
     div: GpuBuffer,
     diff_delta: GpuBuffer,
     lap: GpuBuffer,
@@ -569,6 +595,7 @@ impl ThermoGpuForward {
             raw: GpuBuffer::zeros(ctx, "raw", cells * cout),
             fx: GpuBuffer::zeros(ctx, "fx", cells * nc),
             fy: GpuBuffer::zeros(ctx, "fy", cells * nc),
+            fz: GpuBuffer::zeros(ctx, "fz", cells * nc),
             div: GpuBuffer::zeros(ctx, "div", cells * nc),
             diff_delta: GpuBuffer::zeros(ctx, "diff_delta", cells * c),
             lap: GpuBuffer::zeros(ctx, "lap", cells * c),
@@ -592,7 +619,7 @@ impl ThermoGpuForward {
         let t = tokens.len();
         let (cells, c, chid, cout, nc) =
             (cfg.cells(), cfg.c, cfg.conv_hidden, cfg.c_out(), cfg.n_conserved());
-        let (h, w) = (cfg.h, cfg.w);
+        let (d, h, w) = (cfg.d, cfg.h, cfg.w);
         let vocab = cfg.vocab;
         let logits = GpuBuffer::zeros(&self.ctx, "logits", t * vocab);
 
@@ -617,14 +644,14 @@ impl ThermoGpuForward {
                 let anneal = anneal_at(k, cfg);
                 let src = fields[cur];
                 let dst = fields[1 - cur];
-                self.conv3.dispatch_into(&self.ctx, &mut enc, src, &self.w1, &self.b1, &self.h_post, h as u32, w as u32, c as u32, chid as u32);
+                self.conv3.dispatch_into(&self.ctx, &mut enc, src, &self.w1, &self.b1, &self.h_post, h as u32, w as u32, c as u32, chid as u32, d as u32);
                 self.conv1.dispatch_into(&self.ctx, &mut enc, &self.h_post, &self.w2, &self.b2, &self.raw, cells as u32, chid as u32, cout as u32);
-                self.extract_flux(&mut enc, h, w, nc, cfg.c - nc, cout);
-                self.flux.dispatch_into(&self.ctx, &mut enc, &self.fx, &self.fy, &self.div, h as u32, w as u32, nc as u32);
+                self.extract_flux(&mut enc, h, w, nc, cfg.c - nc, cout, d);
+                self.flux.dispatch_into(&self.ctx, &mut enc, &self.fx, &self.fy, &self.fz, &self.div, h as u32, w as u32, nc as u32, d as u32);
                 if cfg.use_diffusion {
-                    self.diff.dispatch_into(&self.ctx, &mut enc, src, &self.k0, &self.a, &self.b, &self.diff_delta, &self.lap, h as u32, w as u32, c as u32);
+                    self.diff.dispatch_into(&self.ctx, &mut enc, src, &self.k0, &self.a, &self.b, &self.diff_delta, &self.lap, h as u32, w as u32, c as u32, d as u32);
                 }
-                self.assemble_step(&mut enc, src, dst, h, w, c, nc, cout, diff_on, cfg.dt, anneal);
+                self.assemble_step(&mut enc, src, dst, h, w, c, nc, cout, diff_on, cfg.dt, anneal, d);
                 cur = 1 - cur;
             }
 
@@ -632,15 +659,15 @@ impl ThermoGpuForward {
             let rdim = cfg.readout_dim();
             if cfg.readout_spectral {
                 if cfg.readout_moments {
-                    self.pool.dispatch_into(&self.ctx, &mut enc, fields[cur], &self.pooled, h as u32, w as u32, c as u32, cfg.pool as u32);
+                    self.pool.dispatch_into(&self.ctx, &mut enc, fields[cur], &self.pooled, h as u32, w as u32, c as u32, cfg.pool as u32, d as u32);
                 }
-                let msq = (cfg.readout_modes * cfg.readout_modes) as u32;
+                let msq = (cfg.readout_modes * cfg.readout_modes * cfg.readout_modes) as u32;
                 self.spectral.dispatch_b(&self.ctx, &mut enc, fields[cur], &self.basis, &self.spec, cells as u32, c as u32, msq, 1);
                 let mdim = if cfg.readout_moments { cfg.pooled_dim() } else { 0 };
                 self.feat_assemble.dispatch_b(&self.ctx, &mut enc, &self.pooled, &self.spec, &self.feat, mdim as u32, cfg.spectral_dim() as u32, 1);
                 self.gtb.dispatch_into(&self.ctx, &mut enc, &self.feat, &self.projw, &self.lraw, 1, vocab as u32, rdim as u32);
             } else {
-                self.pool.dispatch_into(&self.ctx, &mut enc, fields[cur], &self.pooled, h as u32, w as u32, c as u32, cfg.pool as u32);
+                self.pool.dispatch_into(&self.ctx, &mut enc, fields[cur], &self.pooled, h as u32, w as u32, c as u32, cfg.pool as u32, d as u32);
                 self.gtb.dispatch_into(&self.ctx, &mut enc, &self.pooled, &self.projw, &self.lraw, 1, vocab as u32, rdim as u32);
             }
             self.vadd.dispatch_into(&self.ctx, &mut enc, &self.lraw, &self.bias, &self.logits_t, vocab as u32);
@@ -651,12 +678,13 @@ impl ThermoGpuForward {
         logits.download(&self.ctx)
     }
 
-    fn extract_flux(&self, enc: &mut wgpu::CommandEncoder, h: usize, w: usize, nc: usize, nfree: usize, cout: usize) {
-        self.extract.dispatch_into(&self.ctx, enc, &self.raw, &self.fx, &self.fy, h as u32, w as u32, nc as u32, nfree as u32, cout as u32);
+    #[allow(clippy::too_many_arguments)]
+    fn extract_flux(&self, enc: &mut wgpu::CommandEncoder, h: usize, w: usize, nc: usize, nfree: usize, cout: usize, d: usize) {
+        self.extract.dispatch_into(&self.ctx, enc, &self.raw, &self.fx, &self.fy, &self.fz, h as u32, w as u32, nc as u32, nfree as u32, cout as u32, d as u32);
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn assemble_step(&self, enc: &mut wgpu::CommandEncoder, s: &GpuBuffer, out: &GpuBuffer, h: usize, w: usize, c: usize, nc: usize, cout: usize, diff_on: u32, dt: f32, anneal: f32) {
-        self.assemble.dispatch_into(&self.ctx, enc, s, &self.div, &self.raw, &self.diff_delta, &self.kind, &self.slot, out, h as u32, w as u32, c as u32, nc as u32, cout as u32, diff_on, dt, anneal);
+    fn assemble_step(&self, enc: &mut wgpu::CommandEncoder, s: &GpuBuffer, out: &GpuBuffer, h: usize, w: usize, c: usize, nc: usize, cout: usize, diff_on: u32, dt: f32, anneal: f32, d: usize) {
+        self.assemble.dispatch_into(&self.ctx, enc, s, &self.div, &self.raw, &self.diff_delta, &self.kind, &self.slot, out, h as u32, w as u32, c as u32, nc as u32, cout as u32, diff_on, dt, anneal, d as u32);
     }
 }

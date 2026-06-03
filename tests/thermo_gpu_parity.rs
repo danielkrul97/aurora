@@ -95,7 +95,7 @@ fn conv_forward_matches_cpu() {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("conv fwd") });
         k3.dispatch_into(&ctx, &mut enc, &s_gpu, &w1_gpu, &b1_gpu, &hp_gpu,
-            h as u32, w as u32, c as u32, ch as u32);
+            h as u32, w as u32, c as u32, ch as u32, cfg.d as u32);
         k1.dispatch_into(&ctx, &mut enc, &hp_gpu, &w2_gpu, &b2_gpu, &raw_gpu,
             cells as u32, ch as u32, cout as u32);
         ctx.queue.submit(Some(enc.finish()));
@@ -143,7 +143,7 @@ fn conv_backward_matches_cpu() {
         let dhpost_g = GpuBuffer::zeros(&ctx, "dhpost", cells * ch);
         let dhpre_g = GpuBuffer::zeros(&ctx, "dhpre", cells * ch);
         let ds_g = GpuBuffer::zeros(&ctx, "ds", cells * c);
-        let dw1_g = GpuBuffer::zeros(&ctx, "dw1", ch * c * 9);
+        let dw1_g = GpuBuffer::zeros(&ctx, "dw1", ch * c * 27);
         let db1_g = GpuBuffer::zeros(&ctx, "db1", ch);
         let dw2_g = GpuBuffer::zeros(&ctx, "dw2", cout * ch);
         let db2_g = GpuBuffer::zeros(&ctx, "db2", cout);
@@ -160,8 +160,8 @@ fn conv_backward_matches_cpu() {
         // GELU backward.
         gelu_bwd.dispatch_into(&ctx, &mut enc, &hpre_g, &dhpost_g, &dhpre_g, (cells * ch) as u32);
         // conv3x3 backward.
-        k_ds.dispatch_into(&ctx, &mut enc, &dhpre_g, &w1_g, &ds_g, h as u32, w as u32, c as u32, ch as u32);
-        k_dw1.dispatch_into(&ctx, &mut enc, &dhpre_g, &s_g, &dw1_g, h as u32, w as u32, c as u32, ch as u32);
+        k_ds.dispatch_into(&ctx, &mut enc, &dhpre_g, &w1_g, &ds_g, h as u32, w as u32, c as u32, ch as u32, cfg.d as u32);
+        k_dw1.dispatch_into(&ctx, &mut enc, &dhpre_g, &s_g, &dw1_g, h as u32, w as u32, c as u32, ch as u32, cfg.d as u32);
         row.dispatch_into(&ctx, &mut enc, &dhpre_g, &db1_g, cells as u32, ch as u32);
         ctx.queue.submit(Some(enc.finish()));
 
@@ -190,28 +190,32 @@ fn flux_div_matches_cpu() {
         let n = cfg.cells() * nc;
         let fx = random_vec(n, &mut rng);
         let fy = random_vec(n, &mut rng);
+        let fz = random_vec(n, &mut rng);
         let d_div = random_vec(n, &mut rng);
 
         // forward
-        let div_cpu = flux_div_forward(&fx, &fy, &cfg);
+        let div_cpu = flux_div_forward(&fx, &fy, &fz, &cfg);
         let fx_g = GpuBuffer::from_slice(&ctx, "fx", &fx);
         let fy_g = GpuBuffer::from_slice(&ctx, "fy", &fy);
+        let fz_g = GpuBuffer::from_slice(&ctx, "fz", &fz);
         let div_g = GpuBuffer::zeros(&ctx, "div", n);
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("flux fwd") });
-        kf.dispatch_into(&ctx, &mut enc, &fx_g, &fy_g, &div_g, h as u32, w as u32, nc as u32);
+        kf.dispatch_into(&ctx, &mut enc, &fx_g, &fy_g, &fz_g, &div_g, h as u32, w as u32, nc as u32, cfg.d as u32);
         ctx.queue.submit(Some(enc.finish()));
         assert!(max_rel_err(&div_cpu, &div_g.download(&ctx)) < 5e-3, "flux fwd {h}x{w}");
 
         // backward
-        let (dfx_cpu, dfy_cpu) = flux_div_backward(&d_div, &cfg);
+        let (dfx_cpu, dfy_cpu, dfz_cpu) = flux_div_backward(&d_div, &cfg);
         let dd_g = GpuBuffer::from_slice(&ctx, "dd", &d_div);
         let dfx_g = GpuBuffer::zeros(&ctx, "dfx", n);
         let dfy_g = GpuBuffer::zeros(&ctx, "dfy", n);
+        let dfz_g = GpuBuffer::zeros(&ctx, "dfz", n);
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("flux bwd") });
-        kb.dispatch_into(&ctx, &mut enc, &dd_g, &dfx_g, &dfy_g, h as u32, w as u32, nc as u32);
+        kb.dispatch_into(&ctx, &mut enc, &dd_g, &dfx_g, &dfy_g, &dfz_g, h as u32, w as u32, nc as u32, cfg.d as u32);
         ctx.queue.submit(Some(enc.finish()));
         assert!(max_rel_err(&dfx_cpu, &dfx_g.download(&ctx)) < 5e-3, "flux bwd d_fx {h}x{w}");
         assert!(max_rel_err(&dfy_cpu, &dfy_g.download(&ctx)) < 5e-3, "flux bwd d_fy {h}x{w}");
+        assert!(max_rel_err(&dfz_cpu, &dfz_g.download(&ctx)) < 5e-3, "flux bwd d_fz {h}x{w}");
     }
 }
 
@@ -238,7 +242,7 @@ fn diffusion_forward_matches_cpu() {
         let delta_g = GpuBuffer::zeros(&ctx, "delta", cfg.field_len());
         let lap_g = GpuBuffer::zeros(&ctx, "lap", cfg.field_len());
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("diff fwd") });
-        kd.dispatch_into(&ctx, &mut enc, &s_g, &k0_g, &a_g, &b_g, &delta_g, &lap_g, h as u32, w as u32, c as u32);
+        kd.dispatch_into(&ctx, &mut enc, &s_g, &k0_g, &a_g, &b_g, &delta_g, &lap_g, h as u32, w as u32, c as u32, cfg.d as u32);
         ctx.queue.submit(Some(enc.finish()));
 
         assert!(max_rel_err(&delta_cpu, &delta_g.download(&ctx)) < 5e-3, "diffusion delta {h}x{w}x{c}");
@@ -289,9 +293,9 @@ fn diffusion_backward_matches_cpu() {
         let mut enc = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("diff bwd") });
-        pre.dispatch_into(&ctx, &mut enc, &dd_g, &lap_g, &s_g, &gate_g, &gbuf_g, &ct_g, h as u32, w as u32, c as u32);
-        param.dispatch_into(&ctx, &mut enc, &dd_g, &lap_g, &s_g, &gate_g, &dk0_g, &da_g, &db_g, h as u32, w as u32, c as u32);
-        ds.dispatch_into(&ctx, &mut enc, &gbuf_g, &ct_g, &ds_g, h as u32, w as u32, c as u32);
+        pre.dispatch_into(&ctx, &mut enc, &dd_g, &lap_g, &s_g, &gate_g, &gbuf_g, &ct_g, h as u32, w as u32, c as u32, cfg.d as u32);
+        param.dispatch_into(&ctx, &mut enc, &dd_g, &lap_g, &s_g, &gate_g, &dk0_g, &da_g, &db_g, h as u32, w as u32, c as u32, cfg.d as u32);
+        ds.dispatch_into(&ctx, &mut enc, &gbuf_g, &ct_g, &ds_g, h as u32, w as u32, c as u32, cfg.d as u32);
         ctx.queue.submit(Some(enc.finish()));
 
         let chk = |name: &str, cpu: &[f32], gpu: Vec<f32>| {
@@ -385,7 +389,7 @@ fn readout_moments_matches_cpu() {
 
         // forward: avgpool → gemm(pooled @ projᵀ) → +bias.
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ro fwd") });
-        pool.dispatch_into(&ctx, &mut enc, &s_g, &pooled_g, h as u32, w as u32, c as u32, p as u32);
+        pool.dispatch_into(&ctx, &mut enc, &s_g, &pooled_g, h as u32, w as u32, c as u32, p as u32, cfg.d as u32);
         gtb.dispatch_into(&ctx, &mut enc, &pooled_g, &projw_g, &lraw_g, 1, vocab as u32, pdim as u32);
         vadd.dispatch_into(&ctx, &mut enc, &lraw_g, &bias_g, &logits_g, vocab as u32);
         ctx.queue.submit(Some(enc.finish()));
@@ -401,7 +405,7 @@ fn readout_moments_matches_cpu() {
         row.dispatch_into(&ctx, &mut enc, &dl_g, &dbias_g, 1, vocab as u32);
         outer.dispatch_into(&ctx, &mut enc, &pooled_g, &dl_g, &dproj_g, vocab as u32, pdim as u32, 1);
         gemm.dispatch_into(&ctx, &mut enc, &dl_g, &projw_g, &dpooled_g, 1, pdim as u32, vocab as u32);
-        pool_bwd.dispatch_into(&ctx, &mut enc, &dpooled_g, &ds_g, h as u32, w as u32, c as u32, p as u32);
+        pool_bwd.dispatch_into(&ctx, &mut enc, &dpooled_g, &ds_g, h as u32, w as u32, c as u32, p as u32, cfg.d as u32);
         ctx.queue.submit(Some(enc.finish()));
 
         let chk = |name: &str, cpu: &[f32], gpu: Vec<f32>| {
@@ -420,6 +424,7 @@ fn rollout_forward_matches_cpu() {
     let mut rng = StdRng::seed_from_u64(0x5011);
     let cfg = ThermoConfig {
         vocab: 16,
+        d: 2,
         h: 8,
         w: 8,
         c: 6,
@@ -519,12 +524,13 @@ fn step_backward_matches_cpu() {
         let draw_g = GpuBuffer::zeros(&ctx, "draw", cells * cout);
         let dfx_g = GpuBuffer::zeros(&ctx, "dfx", cells * nc);
         let dfy_g = GpuBuffer::zeros(&ctx, "dfy", cells * nc);
+        let dfz_g = GpuBuffer::zeros(&ctx, "dfz", cells * nc);
         let dhpost_g = GpuBuffer::zeros(&ctx, "dhpost", cells * ch);
         let dhpre_g = GpuBuffer::zeros(&ctx, "dhpre", cells * ch);
         let dsconv_g = GpuBuffer::zeros(&ctx, "dsconv", cells * c);
         let tmp_g = GpuBuffer::zeros(&ctx, "tmp", cells * c);
         let ds_g = GpuBuffer::zeros(&ctx, "ds", cells * c);
-        let dw1_g = GpuBuffer::zeros(&ctx, "dw1", ch * c * 9);
+        let dw1_g = GpuBuffer::zeros(&ctx, "dw1", ch * c * 27);
         let db1_g = GpuBuffer::zeros(&ctx, "db1", ch);
         let dw2_g = GpuBuffer::zeros(&ctx, "dw2", cout * ch);
         let db2_g = GpuBuffer::zeros(&ctx, "db2", cout);
@@ -534,24 +540,25 @@ fn step_backward_matches_cpu() {
 
         let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("step bwd") });
         let (hu, wu, cu, ncu, coutu, chu) = (h as u32, w as u32, c as u32, nc as u32, cout as u32, ch as u32);
+        let du = cfg.d as u32;
 
         // diffusion path: d_diff_delta = dt*anneal*d_out → PRE → PARAM → DS
         scale.dispatch_into(&ctx, &mut enc, &dout_g, &ddelta_g, (cells * c) as u32, dt * anneal);
-        pre.dispatch_into(&ctx, &mut enc, &ddelta_g, &lap_g, &s_g, &gate_g, &gbuf_g, &ct_g, hu, wu, cu);
-        param.dispatch_into(&ctx, &mut enc, &ddelta_g, &lap_g, &s_g, &gate_g, &dk0_g, &da_g, &db_g, hu, wu, cu);
-        dds.dispatch_into(&ctx, &mut enc, &gbuf_g, &ct_g, &dsdiff_g, hu, wu, cu);
+        pre.dispatch_into(&ctx, &mut enc, &ddelta_g, &lap_g, &s_g, &gate_g, &gbuf_g, &ct_g, hu, wu, cu, du);
+        param.dispatch_into(&ctx, &mut enc, &ddelta_g, &lap_g, &s_g, &gate_g, &dk0_g, &da_g, &db_g, hu, wu, cu, du);
+        dds.dispatch_into(&ctx, &mut enc, &gbuf_g, &ct_g, &dsdiff_g, hu, wu, cu, du);
 
         // transport path
-        disasm.dispatch_into(&ctx, &mut enc, &dout_g, &kind_g, &slot_g, &ddiv_g, &draw_g, hu, wu, cu, ncu, coutu, dt);
-        fluxb.dispatch_into(&ctx, &mut enc, &ddiv_g, &dfx_g, &dfy_g, hu, wu, ncu);
-        scatter.dispatch_into(&ctx, &mut enc, &dfx_g, &dfy_g, &draw_g, hu, wu, ncu, nfree as u32, coutu);
+        disasm.dispatch_into(&ctx, &mut enc, &dout_g, &kind_g, &slot_g, &ddiv_g, &draw_g, hu, wu, cu, ncu, coutu, dt, du);
+        fluxb.dispatch_into(&ctx, &mut enc, &ddiv_g, &dfx_g, &dfy_g, &dfz_g, hu, wu, ncu, du);
+        scatter.dispatch_into(&ctx, &mut enc, &dfx_g, &dfy_g, &dfz_g, &draw_g, hu, wu, ncu, nfree as u32, coutu, du);
         // conv backward (d_raw, cache) → dsconv + conv grads
         gemm.dispatch_into(&ctx, &mut enc, &draw_g, &w2_g, &dhpost_g, cells as u32, chu, coutu);
         outer.dispatch_into(&ctx, &mut enc, &hpost_g, &draw_g, &dw2_g, coutu, chu, cells as u32);
         row.dispatch_into(&ctx, &mut enc, &draw_g, &db2_g, cells as u32, coutu);
         gelu_bwd.dispatch_into(&ctx, &mut enc, &hpre_g, &dhpost_g, &dhpre_g, (cells * ch) as u32);
-        k_ds.dispatch_into(&ctx, &mut enc, &dhpre_g, &w1_g, &dsconv_g, hu, wu, cu, chu);
-        k_dw1.dispatch_into(&ctx, &mut enc, &dhpre_g, &s_g, &dw1_g, hu, wu, cu, chu);
+        k_ds.dispatch_into(&ctx, &mut enc, &dhpre_g, &w1_g, &dsconv_g, hu, wu, cu, chu, du);
+        k_dw1.dispatch_into(&ctx, &mut enc, &dhpre_g, &s_g, &dw1_g, hu, wu, cu, chu, du);
         row.dispatch_into(&ctx, &mut enc, &dhpre_g, &db1_g, cells as u32, chu);
 
         // d_s = d_out + d_s_diff + d_s_conv
@@ -580,6 +587,7 @@ fn rollout_backward_param_grads_match_cpu() {
     let mut rng = StdRng::seed_from_u64(0x6ACC);
     let cfg = ThermoConfig {
         vocab: 16,
+        d: 2,
         h: 8,
         w: 8,
         c: 6,
@@ -640,6 +648,7 @@ fn rollout_backward_batched_matches_cpu() {
     let mut rng = StdRng::seed_from_u64(0xBA7C);
     let cfg = ThermoConfig {
         vocab: 16,
+        d: 2,
         h: 8,
         w: 8,
         c: 6,
@@ -724,6 +733,7 @@ fn gpu_eval_matches_cpu() {
     let mut rng = StdRng::seed_from_u64(0xE7A1);
     let cfg = ThermoConfig {
         vocab: 16,
+        d: 2,
         h: 8,
         w: 8,
         c: 6,
@@ -773,6 +783,7 @@ fn rollout_backward_inject_every_matches_cpu() {
     let mut rng = StdRng::seed_from_u64(0x13EE);
     let cfg = ThermoConfig {
         vocab: 16,
+        d: 2,
         h: 8,
         w: 8,
         c: 6,
@@ -828,6 +839,7 @@ fn gpu_muon_matches_cpu() {
     let mut rng = StdRng::seed_from_u64(0x4D0E);
     let cfg = ThermoConfig {
         vocab: 16,
+        d: 2,
         h: 8,
         w: 8,
         c: 6,
@@ -884,6 +896,7 @@ fn gpu_muon_matches_cpu() {
 fn spectral_cfg(moments: bool, spectral: bool) -> ThermoConfig {
     ThermoConfig {
         vocab: 16,
+        d: 2,
         h: 8,
         w: 8,
         c: 6,

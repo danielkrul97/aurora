@@ -17,6 +17,7 @@ use rand::SeedableRng;
 fn cfg(grid: usize) -> ThermoConfig {
     ThermoConfig {
         vocab: 256,
+        d: 1,
         h: grid,
         w: grid,
         c: 8,

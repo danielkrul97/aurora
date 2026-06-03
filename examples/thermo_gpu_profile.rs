@@ -20,6 +20,7 @@ use rand::SeedableRng;
 fn cfg() -> ThermoConfig {
     ThermoConfig {
         vocab: 256,
+        d: 1,
         h: 16,
         w: 16,
         c: 8,
@@ -72,7 +73,7 @@ fn main() {
             gpu.train_step(&t, &tg, &adam, false);
         }
         let _ = gpu.read_mean_loss(); // drain warmup
-        let n = 60u32;
+        let n = 12u32;
         let t0 = Instant::now();
         for _ in 0..n {
             gpu.train_step(&t, &tg, &adam, false);
@@ -86,48 +87,64 @@ fn main() {
         );
     }
 
-    // ── In-process A/B: fused 3-add vs 2-vadd chain @ B=24 ──
+    // ── Correctness: im2col forward must match per-element conv3g ──
+    // Same model + input → same forward loss if the conv path is numerically
+    // equivalent (f32 GEMM rounding only).
+    {
+        let mut g_off = ThermoGpu::new(&ctx, &model, seq, 4);
+        let mut g_on = ThermoGpu::new(&ctx, &model, seq, 4);
+        g_on.conv_im2col = true;
+        let tc = toks(seq, 4, c.vocab);
+        let l_off = g_off.train_step(&tc, &tc, &adam, true).unwrap();
+        let l_on = g_on.train_step(&tc, &tc, &adam, true).unwrap();
+        println!(
+            "\ncorrectness: loss conv3g {l_off:.6}  im2col {l_on:.6}  |Δ| {:.2e}",
+            (l_off - l_on).abs()
+        );
+    }
+
+    // ── In-process A/B: forward conv per-element vs im2col + tiled GEMM ──
     // Both variants run in ONE process, alternating each round, so they share
     // the same (drifting) GPU boost clock — the per-round delta cancels clock
-    // noise. GPU clocks can't be locked without root here; min-over-rounds is
-    // the robust estimator (best round = highest sustained clock).
-    println!("\n── d_s add: fused(a+b+c) vs 2×vadd chain @ B=24, in-process A/B ──");
+    // noise. min-over-rounds = best sustained clock. Measures the full train
+    // step (fwd+bwd+optim) with only the forward conv path toggled.
+    println!("\n── fwd conv: per-element conv3g vs im2col+GEMM @ B=24, in-process A/B ──");
     let b = 24;
     let mut gpu = ThermoGpu::new(&ctx, &model, seq, b);
     let t = toks(seq, b, c.vocab);
     let tg = toks(seq, b, c.vocab);
-    let n = 80u32;
-    for _ in 0..40 {
+    let n = 40u32;
+    for _ in 0..20 {
         gpu.train_step(&t, &tg, &adam, false);
     }
     let _ = gpu.read_mean_loss();
 
-    let mut min_chain = f64::MAX;
-    let mut min_fused = f64::MAX;
-    for round in 0..8 {
-        gpu.fused_add = false;
+    let mut min_conv3g = f64::MAX;
+    let mut min_im2col = f64::MAX;
+    for round in 0..3 {
+        gpu.conv_im2col = false;
         let t0 = Instant::now();
         for _ in 0..n {
             gpu.train_step(&t, &tg, &adam, false);
         }
         let _ = gpu.read_mean_loss();
-        let chain = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+        let c3g = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
 
-        gpu.fused_add = true;
+        gpu.conv_im2col = true;
         let t0 = Instant::now();
         for _ in 0..n {
             gpu.train_step(&t, &tg, &adam, false);
         }
         let _ = gpu.read_mean_loss();
-        let fused = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+        let im2 = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
 
-        min_chain = min_chain.min(chain);
-        min_fused = min_fused.min(fused);
-        println!("  round {round}: chain {chain:7.2}  fused {fused:7.2}  Δ {:+.2} ms", chain - fused);
+        min_conv3g = min_conv3g.min(c3g);
+        min_im2col = min_im2col.min(im2);
+        println!("  round {round}: conv3g {c3g:7.2}  im2col {im2:7.2}  Δ {:+.2} ms", c3g - im2);
     }
-    let d = min_chain - min_fused;
-    println!("  ── min of 8 rounds ──");
-    println!("  2-vadd chain (before): {min_chain:7.2} ms/step");
-    println!("  fused add3   (after) : {min_fused:7.2} ms/step");
-    println!("  Δ = {d:+.2} ms/step ({:+.1}%)  [predicted ~7-8 ms from −64 dispatches]", -d / min_chain * 100.0);
+    let d = min_conv3g - min_im2col;
+    println!("  ── min of 3 rounds (B=24, d={}) ── (flip cfg().d to 4 for the conv-dominated regime)", c.d);
+    println!("  per-element conv3g : {min_conv3g:7.2} ms/step");
+    println!("  im2col + GEMM      : {min_im2col:7.2} ms/step");
+    println!("  Δ = {d:+.2} ms/step ({:+.1}%)", d / min_conv3g * 100.0);
 }

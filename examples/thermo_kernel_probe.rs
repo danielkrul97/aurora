@@ -24,6 +24,7 @@ const N: u32 = 10;
 fn base_cfg() -> ThermoConfig {
     ThermoConfig {
         vocab: 256,
+        d: 1,
         h: 32,
         w: 32,
         c: 8,

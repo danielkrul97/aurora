@@ -8,6 +8,7 @@ use std::sync::Arc;
 use super::buffers::GpuBuffer;
 use super::thermo_conv::{build, dispatch_n};
 use super::GpuContext;
+use crate::thermo::field::CH_T;
 
 const WG: u32 = 64;
 
@@ -20,83 +21,98 @@ struct StencilParams {
     c: u32,
     /// batch grids stacked in the buffer (1 = unbatched).
     nb: u32,
-    _p1: u32,
-    _p2: u32,
+    /// grid depth (`d = 1` = the 2D case).
+    d: u32,
+    /// temperature-channel index (diffusion gate keys off it).
+    cht: u32,
     _p3: u32,
     _p4: u32,
 }
 
 impl StencilParams {
-    fn new_b(h: u32, w: u32, c: u32, nb: u32) -> Self {
-        Self { h, w, c, nb, _p1: 0, _p2: 0, _p3: 0, _p4: 0 }
+    fn new_b(h: u32, w: u32, c: u32, nb: u32, d: u32) -> Self {
+        Self { h, w, c, nb, d, cht: CH_T as u32, _p3: 0, _p4: 0 }
     }
 }
 
 // ───── flux divergence (forward) ────────────────────────────────────────
 
 const FLUX_FWD_WGSL: &str = "
-struct P { h:u32, w:u32, nc:u32, nb:u32, _1:u32, _2:u32, _3:u32, _4:u32 };
+struct P { h:u32, w:u32, nc:u32, nb:u32, d:u32, cht:u32, _3:u32, _4:u32 };
 @group(0) @binding(0) var<storage, read>       fx:  array<f32>;  // [nb*cells*nc]
 @group(0) @binding(1) var<storage, read>       fy:  array<f32>;
-@group(0) @binding(2) var<storage, read_write> dv:  array<f32>;
+@group(0) @binding(2) var<storage, read>       fz:  array<f32>;
+@group(0) @binding(3) var<storage, read_write> dv:  array<f32>;
 var<push_constant> p: P;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.nc) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.nc) { return; }
     let m = idx % p.nc;
     let cell = idx / p.nc;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let i = row % p.h;
     let j = cell % p.w;
-    let gbase = g * p.h * p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;
+    let g = r2 / p.d;
+    let gbase = g * p.d * p.h * p.w;
     var in_left = 0.0;
-    if (j > 0u) { in_left = fx[(gbase + i * p.w + (j - 1u)) * p.nc + m]; }
+    if (j > 0u) { in_left = fx[(gbase + (z * p.h + i) * p.w + (j - 1u)) * p.nc + m]; }
     var in_down = 0.0;
-    if (i > 0u) { in_down = fy[(gbase + (i - 1u) * p.w + j) * p.nc + m]; }
+    if (i > 0u) { in_down = fy[(gbase + (z * p.h + (i - 1u)) * p.w + j) * p.nc + m]; }
+    var in_front = 0.0;
+    if (z > 0u) { in_front = fz[(gbase + ((z - 1u) * p.h + i) * p.w + j) * p.nc + m]; }
     var fx_self = 0.0;
     if (j + 1u < p.w) { fx_self = fx[idx]; }
     var fy_self = 0.0;
     if (i + 1u < p.h) { fy_self = fy[idx]; }
-    dv[idx] = (in_left - fx_self) + (in_down - fy_self);
+    var fz_self = 0.0;
+    if (z + 1u < p.d) { fz_self = fz[idx]; }
+    dv[idx] = (in_left - fx_self) + (in_down - fy_self) + (in_front - fz_self);
 }
 ";
 
 // ───── flux divergence (backward / adjoint) ─────────────────────────────
 
 const FLUX_BWD_WGSL: &str = "
-struct P { h:u32, w:u32, nc:u32, nb:u32, _1:u32, _2:u32, _3:u32, _4:u32 };
+struct P { h:u32, w:u32, nc:u32, nb:u32, d:u32, cht:u32, _3:u32, _4:u32 };
 @group(0) @binding(0) var<storage, read>       dd:   array<f32>;  // d_div [nb*cells*nc]
 @group(0) @binding(1) var<storage, read_write> dfx:  array<f32>;
 @group(0) @binding(2) var<storage, read_write> dfy:  array<f32>;
+@group(0) @binding(3) var<storage, read_write> dfz:  array<f32>;
 var<push_constant> p: P;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.nc) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.nc) { return; }
     let m = idx % p.nc;
     let cell = idx / p.nc;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let i = row % p.h;
     let j = cell % p.w;
-    let gbase = g * p.h * p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;
+    let g = r2 / p.d;
+    let gbase = g * p.d * p.h * p.w;
     var v = 0.0;
-    if (j + 1u < p.w) { v = -dd[idx] + dd[(gbase + i * p.w + (j + 1u)) * p.nc + m]; }
+    if (j + 1u < p.w) { v = -dd[idx] + dd[(gbase + (z * p.h + i) * p.w + (j + 1u)) * p.nc + m]; }
     dfx[idx] = v;
     var u = 0.0;
-    if (i + 1u < p.h) { u = -dd[idx] + dd[(gbase + (i + 1u) * p.w + j) * p.nc + m]; }
+    if (i + 1u < p.h) { u = -dd[idx] + dd[(gbase + (z * p.h + (i + 1u)) * p.w + j) * p.nc + m]; }
     dfy[idx] = u;
+    var wv = 0.0;
+    if (z + 1u < p.d) { wv = -dd[idx] + dd[(gbase + ((z + 1u) * p.h + i) * p.w + j) * p.nc + m]; }
+    dfz[idx] = wv;
 }
 ";
 
 // ───── temperature-gated diffusion (forward) ────────────────────────────
 
 const DIFF_FWD_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, nb:u32, _1:u32, _2:u32, _3:u32, _4:u32 };
+struct P { h:u32, w:u32, c:u32, nb:u32, d:u32, cht:u32, _3:u32, _4:u32 };
 @group(0) @binding(0) var<storage, read>       s:     array<f32>;  // [nb*cells*c]
 @group(0) @binding(1) var<storage, read>       k0:    array<f32>;  // [c]
 @group(0) @binding(2) var<storage, read>       a:     array<f32>;
@@ -105,29 +121,31 @@ struct P { h:u32, w:u32, c:u32, nb:u32, _1:u32, _2:u32, _3:u32, _4:u32 };
 @group(0) @binding(5) var<storage, read_write> lap:   array<f32>;  // [nb*cells*c]
 var<push_constant> p: P;
 
-const CH_T: u32 = 4u;
-
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.c) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.c) { return; }
     let cc = idx % p.c;
     let cell = idx / p.c;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let i = row % p.h;
     let j = cell % p.w;
-    let gbase = g * p.h * p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;
+    let g = r2 / p.d;
+    let gbase = g * p.d * p.h * p.w;
     let center = s[idx];
     var lv = 0.0;
-    if (i > 0u)        { lv = lv + s[(gbase + (i - 1u) * p.w + j) * p.c + cc] - center; }
-    if (i + 1u < p.h)  { lv = lv + s[(gbase + (i + 1u) * p.w + j) * p.c + cc] - center; }
-    if (j > 0u)        { lv = lv + s[(gbase + i * p.w + (j - 1u)) * p.c + cc] - center; }
-    if (j + 1u < p.w)  { lv = lv + s[(gbase + i * p.w + (j + 1u)) * p.c + cc] - center; }
+    if (z > 0u)        { lv = lv + s[(gbase + ((z - 1u) * p.h + i) * p.w + j) * p.c + cc] - center; }
+    if (z + 1u < p.d)  { lv = lv + s[(gbase + ((z + 1u) * p.h + i) * p.w + j) * p.c + cc] - center; }
+    if (i > 0u)        { lv = lv + s[(gbase + (z * p.h + (i - 1u)) * p.w + j) * p.c + cc] - center; }
+    if (i + 1u < p.h)  { lv = lv + s[(gbase + (z * p.h + (i + 1u)) * p.w + j) * p.c + cc] - center; }
+    if (j > 0u)        { lv = lv + s[(gbase + (z * p.h + i) * p.w + (j - 1u)) * p.c + cc] - center; }
+    if (j + 1u < p.w)  { lv = lv + s[(gbase + (z * p.h + i) * p.w + (j + 1u)) * p.c + cc] - center; }
     lap[idx] = lv;
-    let t = s[cell * p.c + CH_T];
-    let z = a[cc] + b[cc] * t;
-    let sig = 1.0 / (1.0 + exp(-z));
+    let t = s[cell * p.c + p.cht];
+    let zg = a[cc] + b[cc] * t;
+    let sig = 1.0 / (1.0 + exp(-zg));
     delta[idx] = k0[cc] * sig * lv;
 }
 ";
@@ -141,7 +159,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 //   DS   → d_s = ∇²(gbuf) + (channel==T ? Σ_ch cT : 0)
 
 const DIFF_BWD_PRE_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, nb:u32, _1:u32, _2:u32, _3:u32, _4:u32 };
+struct P { h:u32, w:u32, c:u32, nb:u32, d:u32, cht:u32, _3:u32, _4:u32 };
 @group(0) @binding(0) var<storage, read>       dd:   array<f32>;  // d_delta [nb*cells*c]
 @group(0) @binding(1) var<storage, read>       lap:  array<f32>;
 @group(0) @binding(2) var<storage, read>       s:    array<f32>;
@@ -149,20 +167,19 @@ struct P { h:u32, w:u32, c:u32, nb:u32, _1:u32, _2:u32, _3:u32, _4:u32 };
 @group(0) @binding(4) var<storage, read_write> gbuf: array<f32>;
 @group(0) @binding(5) var<storage, read_write> cT:   array<f32>;
 var<push_constant> p: P;
-const CH_T: u32 = 4u;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.c) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.c) { return; }
     let cc = idx % p.c;
     let cell = idx / p.c;
     let k0 = gate[cc];
     let a = gate[p.c + cc];
     let b = gate[2u * p.c + cc];
-    let t = s[cell * p.c + CH_T];
-    let z = a + b * t;
-    let sig = 1.0 / (1.0 + exp(-z));
+    let t = s[cell * p.c + p.cht];
+    let zg = a + b * t;
+    let sig = 1.0 / (1.0 + exp(-zg));
     let sigp = sig * (1.0 - sig);
     let ddv = dd[idx];
     let lapv = lap[idx];
@@ -172,7 +189,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
 const DIFF_BWD_PARAM_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, nb:u32, _1:u32, _2:u32, _3:u32, _4:u32 };
+struct P { h:u32, w:u32, c:u32, nb:u32, d:u32, cht:u32, _3:u32, _4:u32 };
 @group(0) @binding(0) var<storage, read>       dd:   array<f32>;
 @group(0) @binding(1) var<storage, read>       lap:  array<f32>;
 @group(0) @binding(2) var<storage, read>       s:    array<f32>;
@@ -181,7 +198,6 @@ struct P { h:u32, w:u32, c:u32, nb:u32, _1:u32, _2:u32, _3:u32, _4:u32 };
 @group(0) @binding(5) var<storage, read_write> da:   array<f32>;
 @group(0) @binding(6) var<storage, read_write> db:   array<f32>;
 var<push_constant> p: P;
-const CH_T: u32 = 4u;
 // One workgroup per channel; 256 threads cooperatively reduce the nb*h*w
 // batch×grid dim (shared-mem tree, 3 accumulators k0/a/b). The naive version
 // ran c (=8) threads each over all ~25k cells — a top backward cost.
@@ -193,7 +209,7 @@ var<workgroup> sbv: array<f32, 256>;
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let ch = wid.x;
     let tid = lid.x;
-    let cells = p.nb * p.h * p.w;
+    let cells = p.nb * p.d * p.h * p.w;
     var sk0 = 0.0;
     var sa = 0.0;
     var sb = 0.0;
@@ -204,9 +220,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         var cell = tid;
         loop {
             if (cell >= cells) { break; }
-            let t = s[cell * p.c + CH_T];
-            let z = a + b * t;
-            let sig = 1.0 / (1.0 + exp(-z));
+            let t = s[cell * p.c + p.cht];
+            let zg = a + b * t;
+            let sig = 1.0 / (1.0 + exp(-zg));
             let sigp = sig * (1.0 - sig);
             let dl = dd[cell * p.c + ch] * lap[cell * p.c + ch];
             sk0 = sk0 + dl * sig;
@@ -239,32 +255,35 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 ";
 
 const DIFF_BWD_DS_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, nb:u32, _1:u32, _2:u32, _3:u32, _4:u32 };
+struct P { h:u32, w:u32, c:u32, nb:u32, d:u32, cht:u32, _3:u32, _4:u32 };
 @group(0) @binding(0) var<storage, read>       gbuf: array<f32>;
 @group(0) @binding(1) var<storage, read>       cT:   array<f32>;
 @group(0) @binding(2) var<storage, read_write> ds:   array<f32>;
 var<push_constant> p: P;
-const CH_T: u32 = 4u;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.c) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.c) { return; }
     let cc = idx % p.c;
     let cell = idx / p.c;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let i = row % p.h;
     let j = cell % p.w;
-    let gbase = g * p.h * p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;
+    let g = r2 / p.d;
+    let gbase = g * p.d * p.h * p.w;
     let center = gbuf[idx];
     var lg = 0.0;
-    if (i > 0u)       { lg = lg + gbuf[(gbase + (i - 1u) * p.w + j) * p.c + cc] - center; }
-    if (i + 1u < p.h) { lg = lg + gbuf[(gbase + (i + 1u) * p.w + j) * p.c + cc] - center; }
-    if (j > 0u)       { lg = lg + gbuf[(gbase + i * p.w + (j - 1u)) * p.c + cc] - center; }
-    if (j + 1u < p.w) { lg = lg + gbuf[(gbase + i * p.w + (j + 1u)) * p.c + cc] - center; }
+    if (z > 0u)       { lg = lg + gbuf[(gbase + ((z - 1u) * p.h + i) * p.w + j) * p.c + cc] - center; }
+    if (z + 1u < p.d) { lg = lg + gbuf[(gbase + ((z + 1u) * p.h + i) * p.w + j) * p.c + cc] - center; }
+    if (i > 0u)       { lg = lg + gbuf[(gbase + (z * p.h + (i - 1u)) * p.w + j) * p.c + cc] - center; }
+    if (i + 1u < p.h) { lg = lg + gbuf[(gbase + (z * p.h + (i + 1u)) * p.w + j) * p.c + cc] - center; }
+    if (j > 0u)       { lg = lg + gbuf[(gbase + (z * p.h + i) * p.w + (j - 1u)) * p.c + cc] - center; }
+    if (j + 1u < p.w) { lg = lg + gbuf[(gbase + (z * p.h + i) * p.w + (j + 1u)) * p.c + cc] - center; }
     var v = lg;
-    if (cc == CH_T) {
+    if (cc == p.cht) {
         for (var ch2: u32 = 0u; ch2 < p.c; ch2 = ch2 + 1u) {
             v = v + cT[cell * p.c + ch2];
         }
@@ -467,36 +486,42 @@ struct PoolParams {
     c: u32,
     pool: u32,
     nb: u32,
-    _p1: u32,
+    d: u32,
     _p2: u32,
     _p3: u32,
 }
 
 const AVGPOOL_FWD_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, pool:u32, nb:u32, _1:u32, _2:u32, _3:u32 };
+struct P { h:u32, w:u32, c:u32, pool:u32, nb:u32, d:u32, _2:u32, _3:u32 };
 @group(0) @binding(0) var<storage, read>       s:      array<f32>;  // [nb*cells*c]
-@group(0) @binding(1) var<storage, read_write> pooled: array<f32>;  // [nb*ph*pw*c]
+@group(0) @binding(1) var<storage, read_write> pooled: array<f32>;  // [nb*pd*ph*pw*c]
 var<push_constant> p: P;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pd = p.d / p.pool;
     let ph = p.h / p.pool;
     let pw = p.w / p.pool;
     let idx = gid.x;
-    if (idx >= p.nb * ph * pw * p.c) { return; }
+    if (idx >= p.nb * pd * ph * pw * p.c) { return; }
     let ch = idx % p.c;
     let pcell = idx / p.c;
-    let g = pcell / (ph * pw);
-    let lpcell = pcell % (ph * pw);
-    let bi = lpcell / pw;
-    let bj = lpcell % pw;
-    let gbase = g * p.h * p.w;
-    let inv = 1.0 / f32(p.pool * p.pool);
+    let blocks = pd * ph * pw;
+    let g = pcell / blocks;
+    let lp = pcell % blocks;
+    let bj = lp % pw;
+    let r1 = lp / pw;
+    let bi = r1 % ph;
+    let bd = r1 / ph;
+    let gbase = g * p.d * p.h * p.w;
+    let inv = 1.0 / f32(p.pool * p.pool * p.pool);
     var acc = 0.0;
-    for (var di: u32 = 0u; di < p.pool; di = di + 1u) {
-        for (var dj: u32 = 0u; dj < p.pool; dj = dj + 1u) {
-            let cell = gbase + (bi * p.pool + di) * p.w + (bj * p.pool + dj);
-            acc = acc + s[cell * p.c + ch];
+    for (var dz: u32 = 0u; dz < p.pool; dz = dz + 1u) {
+        for (var di: u32 = 0u; di < p.pool; di = di + 1u) {
+            for (var dj: u32 = 0u; dj < p.pool; dj = dj + 1u) {
+                let cell = gbase + ((bd * p.pool + dz) * p.h + (bi * p.pool + di)) * p.w + (bj * p.pool + dj);
+                acc = acc + s[cell * p.c + ch];
+            }
         }
     }
     pooled[idx] = acc * inv;
@@ -504,27 +529,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
 const AVGPOOL_BWD_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, pool:u32, nb:u32, _1:u32, _2:u32, _3:u32 };
-@group(0) @binding(0) var<storage, read>       d_pooled: array<f32>;  // [nb*ph*pw*c]
+struct P { h:u32, w:u32, c:u32, pool:u32, nb:u32, d:u32, _2:u32, _3:u32 };
+@group(0) @binding(0) var<storage, read>       d_pooled: array<f32>;  // [nb*pd*ph*pw*c]
 @group(0) @binding(1) var<storage, read_write> d_s:      array<f32>;  // [nb*cells*c]
 var<push_constant> p: P;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.c) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.c) { return; }
     let ch = idx % p.c;
     let cell = idx / p.c;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let i = row % p.h;
     let j = cell % p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;
+    let g = r2 / p.d;
+    let pd = p.d / p.pool;
     let ph = p.h / p.pool;
     let pw = p.w / p.pool;
+    let bd = z / p.pool;
     let bi = i / p.pool;
     let bj = j / p.pool;
-    let inv = 1.0 / f32(p.pool * p.pool);
-    d_s[idx] = d_pooled[(g * ph * pw + bi * pw + bj) * p.c + ch] * inv;
+    let inv = 1.0 / f32(p.pool * p.pool * p.pool);
+    let blocks = pd * ph * pw;
+    d_s[idx] = d_pooled[(g * blocks + (bd * ph + bi) * pw + bj) * p.c + ch] * inv;
 }
 ";
 
@@ -544,8 +574,8 @@ macro_rules! stencil_kernel {
     };
 }
 
-stencil_kernel!(ThermoFluxDivKernel, FLUX_FWD_WGSL, &[true, true, false]);
-stencil_kernel!(ThermoFluxDivBackwardKernel, FLUX_BWD_WGSL, &[true, false, false]);
+stencil_kernel!(ThermoFluxDivKernel, FLUX_FWD_WGSL, &[true, true, true, false]);
+stencil_kernel!(ThermoFluxDivBackwardKernel, FLUX_BWD_WGSL, &[true, false, false, false]);
 stencil_kernel!(ThermoDiffusionForwardKernel, DIFF_FWD_WGSL, &[true, true, true, true, false, false]);
 stencil_kernel!(ThermoDiffusionBwdPreKernel, DIFF_BWD_PRE_WGSL, &[true, true, true, true, false, false]);
 stencil_kernel!(ThermoDiffusionBwdParamKernel, DIFF_BWD_PARAM_WGSL, &[true, true, true, true, false, false, false]);
@@ -562,12 +592,14 @@ impl ThermoFluxDivKernel {
         encoder: &mut wgpu::CommandEncoder,
         fx: &GpuBuffer,
         fy: &GpuBuffer,
+        fz: &GpuBuffer,
         div: &GpuBuffer,
         h: u32,
         w: u32,
         nc: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, fx, fy, div, h, w, nc, 1);
+        self.dispatch_b(ctx, encoder, fx, fy, fz, div, h, w, nc, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -577,14 +609,16 @@ impl ThermoFluxDivKernel {
         encoder: &mut wgpu::CommandEncoder,
         fx: &GpuBuffer,
         fy: &GpuBuffer,
+        fz: &GpuBuffer,
         div: &GpuBuffer,
         h: u32,
         w: u32,
         nc: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = StencilParams::new_b(h, w, nc, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[fx, fy, div], bytemuck::bytes_of(&p), (nb * h * w * nc).div_ceil(WG));
+        let p = StencilParams::new_b(h, w, nc, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[fx, fy, fz, div], bytemuck::bytes_of(&p), (nb * d * h * w * nc).div_ceil(WG));
     }
 }
 
@@ -596,11 +630,13 @@ impl ThermoFluxDivBackwardKernel {
         d_div: &GpuBuffer,
         d_fx: &GpuBuffer,
         d_fy: &GpuBuffer,
+        d_fz: &GpuBuffer,
         h: u32,
         w: u32,
         nc: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, d_div, d_fx, d_fy, h, w, nc, 1);
+        self.dispatch_b(ctx, encoder, d_div, d_fx, d_fy, d_fz, h, w, nc, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -611,13 +647,15 @@ impl ThermoFluxDivBackwardKernel {
         d_div: &GpuBuffer,
         d_fx: &GpuBuffer,
         d_fy: &GpuBuffer,
+        d_fz: &GpuBuffer,
         h: u32,
         w: u32,
         nc: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = StencilParams::new_b(h, w, nc, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[d_div, d_fx, d_fy], bytemuck::bytes_of(&p), (nb * h * w * nc).div_ceil(WG));
+        let p = StencilParams::new_b(h, w, nc, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[d_div, d_fx, d_fy, d_fz], bytemuck::bytes_of(&p), (nb * d * h * w * nc).div_ceil(WG));
     }
 }
 
@@ -635,8 +673,9 @@ impl ThermoDiffusionForwardKernel {
         h: u32,
         w: u32,
         c: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, s, k0, a, b, delta, lap, h, w, c, 1);
+        self.dispatch_b(ctx, encoder, s, k0, a, b, delta, lap, h, w, c, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -654,9 +693,10 @@ impl ThermoDiffusionForwardKernel {
         w: u32,
         c: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = StencilParams::new_b(h, w, c, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, k0, a, b, delta, lap], bytemuck::bytes_of(&p), (nb * h * w * c).div_ceil(WG));
+        let p = StencilParams::new_b(h, w, c, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, k0, a, b, delta, lap], bytemuck::bytes_of(&p), (nb * d * h * w * c).div_ceil(WG));
     }
 }
 
@@ -674,8 +714,9 @@ impl ThermoDiffusionBwdPreKernel {
         h: u32,
         w: u32,
         c: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, d_delta, lap, s, gate, gbuf, c_t, h, w, c, 1);
+        self.dispatch_b(ctx, encoder, d_delta, lap, s, gate, gbuf, c_t, h, w, c, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -693,9 +734,10 @@ impl ThermoDiffusionBwdPreKernel {
         w: u32,
         c: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = StencilParams::new_b(h, w, c, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[d_delta, lap, s, gate, gbuf, c_t], bytemuck::bytes_of(&p), (nb * h * w * c).div_ceil(WG));
+        let p = StencilParams::new_b(h, w, c, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[d_delta, lap, s, gate, gbuf, c_t], bytemuck::bytes_of(&p), (nb * d * h * w * c).div_ceil(WG));
     }
 }
 
@@ -714,8 +756,9 @@ impl ThermoDiffusionBwdParamKernel {
         h: u32,
         w: u32,
         c: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, d_delta, lap, s, gate, d_k0, d_a, d_b, h, w, c, 1);
+        self.dispatch_b(ctx, encoder, d_delta, lap, s, gate, d_k0, d_a, d_b, h, w, c, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -734,8 +777,9 @@ impl ThermoDiffusionBwdParamKernel {
         w: u32,
         c: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = StencilParams::new_b(h, w, c, nb);
+        let p = StencilParams::new_b(h, w, c, nb, d);
         dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[d_delta, lap, s, gate, d_k0, d_a, d_b], bytemuck::bytes_of(&p), c); // one workgroup per channel
     }
 }
@@ -751,8 +795,9 @@ impl ThermoDiffusionBwdDsKernel {
         h: u32,
         w: u32,
         c: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, gbuf, c_t, d_s, h, w, c, 1);
+        self.dispatch_b(ctx, encoder, gbuf, c_t, d_s, h, w, c, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -767,9 +812,10 @@ impl ThermoDiffusionBwdDsKernel {
         w: u32,
         c: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = StencilParams::new_b(h, w, c, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[gbuf, c_t, d_s], bytemuck::bytes_of(&p), (nb * h * w * c).div_ceil(WG));
+        let p = StencilParams::new_b(h, w, c, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[gbuf, c_t, d_s], bytemuck::bytes_of(&p), (nb * d * h * w * c).div_ceil(WG));
     }
 }
 
@@ -821,8 +867,9 @@ impl ThermoAvgPoolKernel {
         w: u32,
         c: u32,
         pool: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, s, pooled, h, w, c, pool, 1);
+        self.dispatch_b(ctx, encoder, s, pooled, h, w, c, pool, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -837,9 +884,10 @@ impl ThermoAvgPoolKernel {
         c: u32,
         pool: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = PoolParams { h, w, c, pool, nb, _p1: 0, _p2: 0, _p3: 0 };
-        let groups = (nb * (h / pool) * (w / pool) * c).div_ceil(WG);
+        let p = PoolParams { h, w, c, pool, nb, d, _p2: 0, _p3: 0 };
+        let groups = (nb * (d / pool) * (h / pool) * (w / pool) * c).div_ceil(WG);
         dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, pooled], bytemuck::bytes_of(&p), groups);
     }
 }
@@ -855,8 +903,9 @@ impl ThermoAvgPoolBackwardKernel {
         w: u32,
         c: u32,
         pool: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, d_pooled, d_s, h, w, c, pool, 1);
+        self.dispatch_b(ctx, encoder, d_pooled, d_s, h, w, c, pool, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -871,9 +920,10 @@ impl ThermoAvgPoolBackwardKernel {
         c: u32,
         pool: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = PoolParams { h, w, c, pool, nb, _p1: 0, _p2: 0, _p3: 0 };
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[d_pooled, d_s], bytemuck::bytes_of(&p), (nb * h * w * c).div_ceil(WG));
+        let p = PoolParams { h, w, c, pool, nb, d, _p2: 0, _p3: 0 };
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[d_pooled, d_s], bytemuck::bytes_of(&p), (nb * d * h * w * c).div_ceil(WG));
     }
 }
 

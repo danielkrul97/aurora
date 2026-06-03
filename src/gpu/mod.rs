@@ -58,7 +58,7 @@ pub use thermo_model::ThermoGpu;
 pub use thermo_conv::{
     ThermoConv1x1Kernel, ThermoConv3x3Dw1Kernel, ThermoConv3x3Dw1SplitKKernel,
     ThermoConv3x3DsKernel, ThermoConv3x3GeluCacheKernel, ThermoConv3x3GeluKernel,
-    ThermoConv3x3Kernel, ThermoConvBwdHiddenKernel,
+    ThermoConv3x3Kernel, ThermoConvBwdHiddenKernel, ThermoIm2colDw1Kernel,
 };
 pub use thermo_stencil::{
     ThermoAvgPoolBackwardKernel, ThermoAvgPoolKernel, ThermoDiffusionBwdDsKernel,

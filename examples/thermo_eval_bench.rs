@@ -19,7 +19,7 @@ use rayon::prelude::*;
 
 fn cfg() -> ThermoConfig {
     ThermoConfig {
-        vocab: 256, h: 16, w: 16, c: 8, conv_hidden: 24,
+        vocab: 256, d: 1, h: 16, w: 16, c: 8, conv_hidden: 24,
         conserved: vec![CH_RHO, CH_E], k_steps: 4, pool: 1, dt: 0.1,
         t_init: 1.0, anneal_tmax: 1.0, anneal_alpha: 1.0,
         readout_moments: true, readout_spectral: false, readout_modes: 4,

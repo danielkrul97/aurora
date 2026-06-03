@@ -19,7 +19,7 @@ use crate::checkpoint::{read_f32_vec, read_u32, read_u64, write_f32_slice, write
 use crate::thermo::field::ThermoConfig;
 use crate::thermo::model::ThermoLM;
 
-const MAGIC: &[u8; 8] = b"THERMO01";
+const MAGIC: &[u8; 8] = b"THERMO02";
 
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
@@ -35,6 +35,7 @@ pub fn save<P: AsRef<Path>>(path: P, model: &ThermoLM, epoch: u32, step: u64) ->
 
     w.write_all(MAGIC)?;
     write_u32(&mut w, c.vocab as u32)?;
+    write_u32(&mut w, c.d as u32)?;
     write_u32(&mut w, c.h as u32)?;
     write_u32(&mut w, c.w as u32)?;
     write_u32(&mut w, c.c as u32)?;
@@ -73,9 +74,10 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad checkpoint magic — expected THERMO01"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad checkpoint magic — expected THERMO02"));
     }
     let vocab = read_u32(&mut r)? as usize;
+    let d = read_u32(&mut r)? as usize;
     let h = read_u32(&mut r)? as usize;
     let w = read_u32(&mut r)? as usize;
     let c = read_u32(&mut r)? as usize;
@@ -97,6 +99,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
 
     let cfg = ThermoConfig {
         vocab,
+        d,
         h,
         w,
         c,

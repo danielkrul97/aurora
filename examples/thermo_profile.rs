@@ -71,6 +71,7 @@ fn bench(name: &str, iters: u64, mut f: impl FnMut()) {
 fn main() {
     let cfg = ThermoConfig {
         vocab: 256,
+        d: 4,
         h: 16,
         w: 16,
         c: 8,
@@ -158,7 +159,8 @@ fn main() {
     let cells = cfg.cells();
     let fx = vec![0.05_f32; cells * nc];
     let fy = vec![0.03_f32; cells * nc];
-    let div = flux_div_forward(&fx, &fy, &cfg);
+    let fz = vec![0.04_f32; cells * nc];
+    let div = flux_div_forward(&fx, &fy, &fz, &cfg);
     let (_logits, ro_cache) = readout_forward(&field, &model.readout, &cfg);
 
     let mut cg = ConvGrads::zeros(&cfg);
@@ -196,7 +198,7 @@ fn main() {
         let _ = diffusion_backward(&model.step.diffusion, &diff_cache, &d_delta, &mut dg, &cfg);
     });
     bench("flux_div_forward", 5000, || {
-        let _ = flux_div_forward(&fx, &fy, &cfg);
+        let _ = flux_div_forward(&fx, &fy, &fz, &cfg);
     });
     bench("flux_div_backward", 5000, || {
         let _ = flux_div_backward(&d_div, &cfg);

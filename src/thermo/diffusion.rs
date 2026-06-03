@@ -5,16 +5,17 @@
 //!
 //! Adds `κ_c(T)·∇²s` to every channel, where the conductivity
 //! `κ_c(T) = k0_c · sigmoid(a_c + b_c·T)` grows with the local temperature
-//! channel `T`. The 5-point Laplacian uses zero-flux (Neumann) boundaries
+//! channel `T`. The 7-point Laplacian uses zero-flux (Neumann) boundaries
 //! — a missing neighbour contributes nothing — so `Σ ∇²s = 0` and
 //! diffusion conserves each channel total, consistent with the flux-form
 //! transport. Diffusion is a contracting operator, which keeps the
-//! unrolled-rollout gradients tame.
+//! unrolled-rollout gradients tame. (`D=1` ⇒ the depth neighbours vanish
+//! and it reduces to the 2D 5-point stencil.)
 //!
 //! `s` enters the output twice: through `∇²` (self-adjoint stencil) and
 //! through `κ(T)` via the `T` channel. The backward handles both.
 
-use crate::thermo::field::{idx, ThermoConfig, CH_T};
+use crate::thermo::field::{idx3, ThermoConfig, CH_T};
 
 #[derive(Clone, Debug)]
 pub struct DiffusionWeights {
@@ -72,29 +73,37 @@ fn sigmoid(z: f32) -> f32 {
     1.0 / (1.0 + (-z).exp())
 }
 
-/// Accumulate the zero-flux 5-point Laplacian `Σ_neighbours (s[nb]-s[c])` of
+/// Accumulate the zero-flux 7-point Laplacian `Σ_neighbours (s[nb]-s[c])` of
 /// every channel into `dst`. Self-adjoint, so the backward reuses it on the
 /// gated source `gbuf`.
 fn laplacian_into(dst: &mut [f32], s: &[f32], cfg: &ThermoConfig) {
-    let (h, w, c) = (cfg.h, cfg.w, cfg.c);
-    for i in 0..h {
-        for j in 0..w {
-            for ch in 0..c {
-                let center = s[idx(i, j, ch, cfg)];
-                let mut acc = 0.0_f32;
-                if i > 0 {
-                    acc += s[idx(i - 1, j, ch, cfg)] - center;
+    let (d, h, w, c) = (cfg.d, cfg.h, cfg.w, cfg.c);
+    for z in 0..d {
+        for i in 0..h {
+            for j in 0..w {
+                for ch in 0..c {
+                    let center = s[idx3(z, i, j, ch, cfg)];
+                    let mut acc = 0.0_f32;
+                    if z > 0 {
+                        acc += s[idx3(z - 1, i, j, ch, cfg)] - center;
+                    }
+                    if z + 1 < d {
+                        acc += s[idx3(z + 1, i, j, ch, cfg)] - center;
+                    }
+                    if i > 0 {
+                        acc += s[idx3(z, i - 1, j, ch, cfg)] - center;
+                    }
+                    if i + 1 < h {
+                        acc += s[idx3(z, i + 1, j, ch, cfg)] - center;
+                    }
+                    if j > 0 {
+                        acc += s[idx3(z, i, j - 1, ch, cfg)] - center;
+                    }
+                    if j + 1 < w {
+                        acc += s[idx3(z, i, j + 1, ch, cfg)] - center;
+                    }
+                    dst[idx3(z, i, j, ch, cfg)] += acc;
                 }
-                if i + 1 < h {
-                    acc += s[idx(i + 1, j, ch, cfg)] - center;
-                }
-                if j > 0 {
-                    acc += s[idx(i, j - 1, ch, cfg)] - center;
-                }
-                if j + 1 < w {
-                    acc += s[idx(i, j + 1, ch, cfg)] - center;
-                }
-                dst[idx(i, j, ch, cfg)] += acc;
             }
         }
     }
@@ -133,11 +142,11 @@ pub fn diffusion_backward(
     g: &mut DiffusionGrads,
     cfg: &ThermoConfig,
 ) -> Vec<f32> {
-    let (h, ww, c) = (cfg.h, cfg.w, cfg.c);
-    let mut d_s = vec![0.0_f32; h * ww * c];
+    let c = cfg.c;
+    let mut d_s = vec![0.0_f32; cfg.field_len()];
     // gbuf = κ·d_delta, the per-cell source for the self-adjoint Laplacian
     // backward path.
-    let mut gbuf = vec![0.0_f32; h * ww * c];
+    let mut gbuf = vec![0.0_f32; cfg.field_len()];
 
     for cell in 0..cfg.cells() {
         let t = cache.tvals[cell];

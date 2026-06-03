@@ -10,24 +10,26 @@
     clippy::cast_sign_loss
 )]
 
-//! Local operator `N_θ = Conv1x1(GELU(Conv3x3(s)))`.
+//! Local operator `N_θ = Conv1x1(GELU(Conv3x3x3(s)))`.
 //!
-//! The 3×3 stage enforces locality (a finite speed of sound: information
+//! The 3×3×3 stage enforces locality (a finite speed of sound: information
 //! travels at most one cell per sub-step); the 1×1 stage mixes channels.
 //! Weights are shared across space → translation invariance is free.
 //! Boundary uses zero padding ("nothing beyond the wall"). Output has
-//! `c_out = c + n_conserved` channels, decoded downstream into free
-//! residual deltas and conserved-channel edge fluxes.
+//! `c_out = c + 2·n_conserved` channels, decoded downstream into free
+//! residual deltas and conserved-channel edge fluxes. `D=1` degenerates to
+//! the 2D 3×3 operator (the depth taps fall outside the grid).
 //!
 //! ## Vectorization
 //!
-//! The stored weight layout (`w1[((co·c+ci)·3+ki)·3+kj]`, `w2[co·c_h+ci]`)
-//! is the on-disk / GPU contract and is left untouched. Internally each call
-//! repacks the small weight tensors into a layout whose innermost loop is a
-//! contiguous element-wise multiply-add (an axpy) over the output channel,
-//! never a horizontal sum reduction — that is the shape LLVM auto-vectorizes
-//! in safe Rust without `fast-math`. The repack is `O(weights)` (~1.7k
-//! floats), negligible against the `O(cells·c_h·c·9)` kernel it feeds.
+//! The stored weight layout (`w1[(((co·c+ci)·3+ki)·3+kj)·3+kl]`,
+//! `w2[co·c_h+ci]`) is the on-disk / GPU contract and is left untouched.
+//! Internally each call repacks the small weight tensors into a layout
+//! whose innermost loop is a contiguous element-wise multiply-add (an axpy)
+//! over the output channel, never a horizontal sum reduction — that is the
+//! shape LLVM auto-vectorizes in safe Rust without `fast-math`. The repack
+//! is `O(weights)`, negligible against the `O(cells·c_h·c·27)` kernel it
+//! feeds.
 
 use rand::Rng;
 
@@ -35,7 +37,7 @@ use crate::thermo::field::ThermoConfig;
 
 #[derive(Clone, Debug)]
 pub struct ConvWeights {
-    /// `[c_h * c * 3 * 3]`, index `((co*c + ci)*3 + ki)*3 + kj`.
+    /// `[c_h * c * 3 * 3 * 3]`, index `(((co*c + ci)*3 + ki)*3 + kj)*3 + kl`.
     pub w1: Vec<f32>,
     /// `[c_h]`
     pub b1: Vec<f32>,
@@ -51,7 +53,7 @@ pub struct ConvWeights {
 impl ConvWeights {
     pub fn new<R: Rng>(cfg: &ThermoConfig, rng: &mut R) -> Self {
         let (c, c_h, c_out) = (cfg.c, cfg.conv_hidden, cfg.c_out());
-        let fan1_in = c * 9;
+        let fan1_in = c * 27;
         let b1_bound = (6.0_f32 / (fan1_in + c_h) as f32).sqrt();
         // Gentle-start scaling on the operator's output projection so the
         // residual update `s + Δt·N_θ(s)` stays near-identity at init and
@@ -60,7 +62,7 @@ impl ConvWeights {
         let b2_bound = (6.0_f32 / (c_h + c_out) as f32).sqrt() * resid_scale;
         let unif = |bound: f32, rng: &mut R| (rng.random::<f32>() * 2.0 - 1.0) * bound;
         Self {
-            w1: (0..c_h * c * 9).map(|_| unif(b1_bound, rng)).collect(),
+            w1: (0..c_h * c * 27).map(|_| unif(b1_bound, rng)).collect(),
             b1: vec![0.0; c_h],
             w2: (0..c_out * c_h).map(|_| unif(b2_bound, rng)).collect(),
             b2: vec![0.0; c_out],
@@ -83,7 +85,7 @@ impl ConvGrads {
     pub fn zeros(cfg: &ThermoConfig) -> Self {
         let (c, c_h, c_out) = (cfg.c, cfg.conv_hidden, cfg.c_out());
         Self {
-            d_w1: vec![0.0; c_h * c * 9],
+            d_w1: vec![0.0; c_h * c * 27],
             d_b1: vec![0.0; c_h],
             d_w2: vec![0.0; c_out * c_h],
             d_b2: vec![0.0; c_out],
@@ -101,11 +103,11 @@ impl ConvGrads {
 #[derive(Clone, Debug, Default)]
 pub struct ConvCache {
     pub s: Vec<f32>,
-    /// Pre-GELU hidden activations `[h*w*c_h]`. Retained for the GPU parity
+    /// Pre-GELU hidden activations `[d*h*w*c_h]`. Retained for the GPU parity
     /// harness (which re-derives the GELU backward on-device from it); the
     /// CPU backward uses the cached `gelu_deriv` instead.
     pub h_pre: Vec<f32>,
-    /// Post-GELU hidden activations `[h*w*c_h]`.
+    /// Post-GELU hidden activations `[d*h*w*c_h]`.
     pub h_post: Vec<f32>,
     /// `d(h_post)/d(h_pre)` per element, captured during the forward GELU so
     /// the backward never recomputes a `tanh`. Bit-identical to
@@ -114,8 +116,8 @@ pub struct ConvCache {
 }
 
 #[inline]
-const fn w1_idx(co: usize, ci: usize, ki: usize, kj: usize, c: usize) -> usize {
-    ((co * c + ci) * 3 + ki) * 3 + kj
+const fn w1_idx(co: usize, ci: usize, ki: usize, kj: usize, kl: usize, c: usize) -> usize {
+    (((co * c + ci) * 3 + ki) * 3 + kj) * 3 + kl
 }
 
 /// GELU and its derivative in one pass, sharing the single `tanh`. The two
@@ -133,15 +135,18 @@ fn gelu_and_deriv(x: f32) -> (f32, f32) {
 }
 
 /// Repack `w1` to `wco[(tap*c + ci)*c_h + co]` (output channel innermost) so
-/// the 3×3 forward / `d_w1` inner loop is a contiguous axpy over `co`.
+/// the 3×3×3 forward / `d_w1` inner loop is a contiguous axpy over `co`.
+/// `tap = (ki*3 + kj)*3 + kl` runs over the 27 (depth,height,width) offsets.
 fn pack_w1_co(w1: &[f32], c: usize, c_h: usize) -> Vec<f32> {
-    let mut wco = vec![0.0_f32; 9 * c * c_h];
+    let mut wco = vec![0.0_f32; 27 * c * c_h];
     for co in 0..c_h {
         for ci in 0..c {
             for ki in 0..3 {
                 for kj in 0..3 {
-                    let tap = ki * 3 + kj;
-                    wco[(tap * c + ci) * c_h + co] = w1[w1_idx(co, ci, ki, kj, c)];
+                    for kl in 0..3 {
+                        let tap = (ki * 3 + kj) * 3 + kl;
+                        wco[(tap * c + ci) * c_h + co] = w1[w1_idx(co, ci, ki, kj, kl, c)];
+                    }
                 }
             }
         }
@@ -149,16 +154,18 @@ fn pack_w1_co(w1: &[f32], c: usize, c_h: usize) -> Vec<f32> {
     wco
 }
 
-/// Repack `w1` to `wci[(co*9 + tap)*c + ci]` (input channel innermost) so the
-/// 3×3 backward `d_s` inner loop is a contiguous axpy over `ci`.
+/// Repack `w1` to `wci[(co*27 + tap)*c + ci]` (input channel innermost) so the
+/// 3×3×3 backward `d_s` inner loop is a contiguous axpy over `ci`.
 fn pack_w1_ci(w1: &[f32], c: usize, c_h: usize) -> Vec<f32> {
-    let mut wci = vec![0.0_f32; c_h * 9 * c];
+    let mut wci = vec![0.0_f32; c_h * 27 * c];
     for co in 0..c_h {
         for ci in 0..c {
             for ki in 0..3 {
                 for kj in 0..3 {
-                    let tap = ki * 3 + kj;
-                    wci[(co * 9 + tap) * c + ci] = w1[w1_idx(co, ci, ki, kj, c)];
+                    for kl in 0..3 {
+                        let tap = (ki * 3 + kj) * 3 + kl;
+                        wci[(co * 27 + tap) * c + ci] = w1[w1_idx(co, ci, ki, kj, kl, c)];
+                    }
                 }
             }
         }
@@ -178,36 +185,49 @@ fn pack_w2_t(w2: &[f32], c_h: usize, c_out: usize) -> Vec<f32> {
     w2t
 }
 
-/// Forward. `s` is `[h*w*c]`; returns `raw [h*w*c_out]` and the cache.
+/// Forward. `s` is `[d*h*w*c]`; returns `raw [d*h*w*c_out]` and the cache.
 pub fn conv_forward(w: &ConvWeights, s: &[f32], cfg: &ThermoConfig) -> (Vec<f32>, ConvCache) {
-    let (h, ww, c, c_h, c_out) = (cfg.h, cfg.w, w.c, w.c_h, w.c_out);
-    debug_assert_eq!(s.len(), h * ww * c);
+    let (d, h, ww, c, c_h, c_out) = (cfg.d, cfg.h, cfg.w, w.c, w.c_h, w.c_out);
+    let cells = d * h * ww;
+    debug_assert_eq!(s.len(), cells * c);
 
-    // Conv3x3 → h_pre. Output-stationary: accumulate a full c_h vector per
-    // cell, inner loop an axpy over co.
+    // Conv3x3x3 → h_pre. Output-stationary: accumulate a full c_h vector per
+    // cell, inner loop an axpy over co. Kernel offsets (ki,kj,kl) map to the
+    // (depth,height,width) axes.
     let wco = pack_w1_co(&w.w1, c, c_h);
-    let mut h_pre = vec![0.0_f32; h * ww * c_h];
-    for i in 0..h {
-        for j in 0..ww {
-            let acc = &mut h_pre[(i * ww + j) * c_h..(i * ww + j + 1) * c_h];
-            acc.copy_from_slice(&w.b1);
-            for ki in 0..3 {
-                let ii = i as isize + ki as isize - 1;
-                if ii < 0 || ii >= h as isize {
-                    continue;
-                }
-                for kj in 0..3 {
-                    let jj = j as isize + kj as isize - 1;
-                    if jj < 0 || jj >= ww as isize {
+    let mut h_pre = vec![0.0_f32; cells * c_h];
+    for z in 0..d {
+        for i in 0..h {
+            for j in 0..ww {
+                let cell = (z * h + i) * ww + j;
+                let acc = &mut h_pre[cell * c_h..(cell + 1) * c_h];
+                acc.copy_from_slice(&w.b1);
+                for ki in 0..3 {
+                    let zz = z as isize + ki as isize - 1;
+                    if zz < 0 || zz >= d as isize {
                         continue;
                     }
-                    let in_base = (ii as usize * ww + jj as usize) * c;
-                    let tap = ki * 3 + kj;
-                    for ci in 0..c {
-                        let sc = s[in_base + ci];
-                        let wrow = &wco[(tap * c + ci) * c_h..(tap * c + ci) * c_h + c_h];
-                        for (a, &wv) in acc.iter_mut().zip(wrow) {
-                            *a += sc * wv;
+                    for kj in 0..3 {
+                        let ii = i as isize + kj as isize - 1;
+                        if ii < 0 || ii >= h as isize {
+                            continue;
+                        }
+                        for kl in 0..3 {
+                            let jj = j as isize + kl as isize - 1;
+                            if jj < 0 || jj >= ww as isize {
+                                continue;
+                            }
+                            let in_base =
+                                ((zz as usize * h + ii as usize) * ww + jj as usize) * c;
+                            let tap = (ki * 3 + kj) * 3 + kl;
+                            for ci in 0..c {
+                                let sc = s[in_base + ci];
+                                let wrow =
+                                    &wco[(tap * c + ci) * c_h..(tap * c + ci) * c_h + c_h];
+                                for (a, &wv) in acc.iter_mut().zip(wrow) {
+                                    *a += sc * wv;
+                                }
+                            }
                         }
                     }
                 }
@@ -216,8 +236,8 @@ pub fn conv_forward(w: &ConvWeights, s: &[f32], cfg: &ThermoConfig) -> (Vec<f32>
     }
 
     // GELU → h_post, capturing the derivative for the backward (one tanh).
-    let mut h_post = vec![0.0_f32; h * ww * c_h];
-    let mut gelu_deriv = vec![0.0_f32; h * ww * c_h];
+    let mut h_post = vec![0.0_f32; cells * c_h];
+    let mut gelu_deriv = vec![0.0_f32; cells * c_h];
     for k in 0..h_pre.len() {
         let (post, deriv) = gelu_and_deriv(h_pre[k]);
         h_post[k] = post;
@@ -226,8 +246,8 @@ pub fn conv_forward(w: &ConvWeights, s: &[f32], cfg: &ThermoConfig) -> (Vec<f32>
 
     // Conv1x1 (per-cell linear) → raw. Inner loop an axpy over co via w2t.
     let w2t = pack_w2_t(&w.w2, c_h, c_out);
-    let mut raw = vec![0.0_f32; h * ww * c_out];
-    for cell in 0..h * ww {
+    let mut raw = vec![0.0_f32; cells * c_out];
+    for cell in 0..cells {
         let out = &mut raw[cell * c_out..(cell + 1) * c_out];
         out.copy_from_slice(&w.b2);
         let hp = &h_post[cell * c_h..(cell + 1) * c_h];
@@ -251,7 +271,7 @@ pub fn conv_forward(w: &ConvWeights, s: &[f32], cfg: &ThermoConfig) -> (Vec<f32>
     )
 }
 
-/// Backward. `d_raw` is `[h*w*c_out]`; returns `d_s [h*w*c]` and
+/// Backward. `d_raw` is `[d*h*w*c_out]`; returns `d_s [d*h*w*c]` and
 /// accumulates weight gradients into `g`.
 pub fn conv_backward(
     w: &ConvWeights,
@@ -260,13 +280,14 @@ pub fn conv_backward(
     g: &mut ConvGrads,
     cfg: &ThermoConfig,
 ) -> Vec<f32> {
-    let (h, ww, c, c_h, c_out) = (cfg.h, cfg.w, w.c, w.c_h, w.c_out);
-    debug_assert_eq!(d_raw.len(), h * ww * c_out);
+    let (d, h, ww, c, c_h, c_out) = (cfg.d, cfg.h, cfg.w, w.c, w.c_h, w.c_out);
+    let cells = d * h * ww;
+    debug_assert_eq!(d_raw.len(), cells * c_out);
 
     // Conv1x1 backward → d_h_post. Inner loops are axpy over ci against the
     // stored `w2[co][ci]` (ci already contiguous), so they vectorize as-is.
-    let mut d_h_post = vec![0.0_f32; h * ww * c_h];
-    for cell in 0..h * ww {
+    let mut d_h_post = vec![0.0_f32; cells * c_h];
+    for cell in 0..cells {
         let dr = &d_raw[cell * c_out..(cell + 1) * c_out];
         let hp = &cache.h_post[cell * c_h..(cell + 1) * c_h];
         let dhp = &mut d_h_post[cell * c_h..(cell + 1) * c_h];
@@ -283,50 +304,61 @@ pub fn conv_backward(
     }
 
     // GELU backward via the cached derivative — no tanh recompute.
-    let mut d_h_pre = vec![0.0_f32; h * ww * c_h];
+    let mut d_h_pre = vec![0.0_f32; cells * c_h];
     for k in 0..d_h_pre.len() {
         d_h_pre[k] = d_h_post[k] * cache.gelu_deriv[k];
     }
 
-    // Conv3x3 backward → d_s, d_w1, d_b1. `d_s` uses the ci-innermost pack
+    // Conv3x3x3 backward → d_s, d_w1, d_b1. `d_s` uses the ci-innermost pack
     // (axpy over ci); `d_w1` accumulates into a co-innermost pack (axpy over
     // co) that is scattered back to the canonical layout once at the end.
     let wci = pack_w1_ci(&w.w1, c, c_h);
-    let mut d_wco = vec![0.0_f32; 9 * c * c_h];
-    let mut d_s = vec![0.0_f32; h * ww * c];
-    for i in 0..h {
-        for j in 0..ww {
-            let dhp = &d_h_pre[(i * ww + j) * c_h..(i * ww + j + 1) * c_h];
-            for (b, &dv) in g.d_b1.iter_mut().zip(dhp) {
-                *b += dv;
-            }
-            for ki in 0..3 {
-                let ii = i as isize + ki as isize - 1;
-                if ii < 0 || ii >= h as isize {
-                    continue;
+    let mut d_wco = vec![0.0_f32; 27 * c * c_h];
+    let mut d_s = vec![0.0_f32; cells * c];
+    for z in 0..d {
+        for i in 0..h {
+            for j in 0..ww {
+                let cell = (z * h + i) * ww + j;
+                let dhp = &d_h_pre[cell * c_h..(cell + 1) * c_h];
+                for (b, &dv) in g.d_b1.iter_mut().zip(dhp) {
+                    *b += dv;
                 }
-                for kj in 0..3 {
-                    let jj = j as isize + kj as isize - 1;
-                    if jj < 0 || jj >= ww as isize {
+                for ki in 0..3 {
+                    let zz = z as isize + ki as isize - 1;
+                    if zz < 0 || zz >= d as isize {
                         continue;
                     }
-                    let in_base = (ii as usize * ww + jj as usize) * c;
-                    let tap = ki * 3 + kj;
-                    // d_s[in_base + ci] += Σ_co dhp[co]·w1[co][ci][tap]
-                    let dsrow = &mut d_s[in_base..in_base + c];
-                    for co in 0..c_h {
-                        let gco = dhp[co];
-                        let wrow = &wci[(co * 9 + tap) * c..(co * 9 + tap) * c + c];
-                        for (ds, &wv) in dsrow.iter_mut().zip(wrow) {
-                            *ds += gco * wv;
+                    for kj in 0..3 {
+                        let ii = i as isize + kj as isize - 1;
+                        if ii < 0 || ii >= h as isize {
+                            continue;
                         }
-                    }
-                    // d_w1[co][ci][tap] += dhp[co]·s[in_base + ci]
-                    for ci in 0..c {
-                        let sc = cache.s[in_base + ci];
-                        let dwrow = &mut d_wco[(tap * c + ci) * c_h..(tap * c + ci) * c_h + c_h];
-                        for (dw, &dv) in dwrow.iter_mut().zip(dhp) {
-                            *dw += sc * dv;
+                        for kl in 0..3 {
+                            let jj = j as isize + kl as isize - 1;
+                            if jj < 0 || jj >= ww as isize {
+                                continue;
+                            }
+                            let in_base =
+                                ((zz as usize * h + ii as usize) * ww + jj as usize) * c;
+                            let tap = (ki * 3 + kj) * 3 + kl;
+                            // d_s[in_base + ci] += Σ_co dhp[co]·w1[co][ci][tap]
+                            let dsrow = &mut d_s[in_base..in_base + c];
+                            for co in 0..c_h {
+                                let gco = dhp[co];
+                                let wrow = &wci[(co * 27 + tap) * c..(co * 27 + tap) * c + c];
+                                for (ds, &wv) in dsrow.iter_mut().zip(wrow) {
+                                    *ds += gco * wv;
+                                }
+                            }
+                            // d_w1[co][ci][tap] += dhp[co]·s[in_base + ci]
+                            for ci in 0..c {
+                                let sc = cache.s[in_base + ci];
+                                let dwrow = &mut d_wco
+                                    [(tap * c + ci) * c_h..(tap * c + ci) * c_h + c_h];
+                                for (dw, &dv) in dwrow.iter_mut().zip(dhp) {
+                                    *dw += sc * dv;
+                                }
+                            }
                         }
                     }
                 }
@@ -339,8 +371,11 @@ pub fn conv_backward(
         for ci in 0..c {
             for ki in 0..3 {
                 for kj in 0..3 {
-                    let tap = ki * 3 + kj;
-                    g.d_w1[w1_idx(co, ci, ki, kj, c)] += d_wco[(tap * c + ci) * c_h + co];
+                    for kl in 0..3 {
+                        let tap = (ki * 3 + kj) * 3 + kl;
+                        g.d_w1[w1_idx(co, ci, ki, kj, kl, c)] +=
+                            d_wco[(tap * c + ci) * c_h + co];
+                    }
                 }
             }
         }

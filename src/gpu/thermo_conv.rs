@@ -1,7 +1,9 @@
 //! GPU kernels for the thermodynamic-LM local operator
-//! `N_θ = Conv1x1(GELU(Conv3x3(s)))` (2D). Mirrors the CPU
-//! `crate::thermo::conv` forward; parity-tested in
-//! `tests/thermo_gpu_parity.rs`. One thread per output element.
+//! `N_θ = Conv1x1(GELU(Conv3x3x3(s)))` (3D; `D=1` = the 2D case). Mirrors
+//! the CPU `crate::thermo::conv` forward; parity-tested in
+//! `tests/thermo_gpu_parity.rs`. One thread per output element. Kernel
+//! offsets (ki,kj,kl) map to the (depth,height,width) axes, exactly as the
+//! CPU pack; `tap = (ki*3+kj)*3+kl`, `widx = (co*c+ci)*27 + tap`.
 
 use std::sync::Arc;
 
@@ -14,11 +16,11 @@ const WG: u32 = 64;
 // ───── conv3x3 + GELU ───────────────────────────────────────────────────
 
 const CONV3X3_GELU_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, _p1:u32, _p2:u32, _p3:u32 };
-@group(0) @binding(0) var<storage, read>       s:  array<f32>;   // [nb*h*w*c]
-@group(0) @binding(1) var<storage, read>       w1: array<f32>;   // [ch*c*9]
+struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, d:u32, _p2:u32, _p3:u32 };
+@group(0) @binding(0) var<storage, read>       s:  array<f32>;   // [nb*d*h*w*c]
+@group(0) @binding(1) var<storage, read>       w1: array<f32>;   // [ch*c*27]
 @group(0) @binding(2) var<storage, read>       b1: array<f32>;   // [ch]
-@group(0) @binding(3) var<storage, read_write> hp: array<f32>;   // [nb*h*w*ch] (post-GELU)
+@group(0) @binding(3) var<storage, read_write> hp: array<f32>;   // [nb*d*h*w*ch] (post-GELU)
 var<push_constant> p: P;
 
 fn gelu(x: f32) -> f32 {
@@ -30,25 +32,32 @@ fn gelu(x: f32) -> f32 {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    let total = p.nb * p.h * p.w * p.ch;
+    let total = p.nb * p.d * p.h * p.w * p.ch;
     if (idx >= total) { return; }
     let co = idx % p.ch;
     let cell = idx / p.ch;
-    let row = cell / p.w;
-    let g = row / p.h;            // batch grid index
-    let i = row % p.h;            // local row within grid
     let j = cell % p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;            // depth within grid
+    let g = r2 / p.d;            // batch grid index
     var acc = b1[co];
     for (var ki: u32 = 0u; ki < 3u; ki = ki + 1u) {
-        let ii = i32(i) + i32(ki) - 1;
-        if (ii < 0 || ii >= i32(p.h)) { continue; }
+        let zz = i32(z) + i32(ki) - 1;
+        if (zz < 0 || zz >= i32(p.d)) { continue; }
         for (var kj: u32 = 0u; kj < 3u; kj = kj + 1u) {
-            let jj = i32(j) + i32(kj) - 1;
-            if (jj < 0 || jj >= i32(p.w)) { continue; }
-            let in_base = ((g * p.h + u32(ii)) * p.w + u32(jj)) * p.c;
-            for (var ci: u32 = 0u; ci < p.c; ci = ci + 1u) {
-                let widx = ((co * p.c + ci) * 3u + ki) * 3u + kj;
-                acc = acc + w1[widx] * s[in_base + ci];
+            let ii = i32(i) + i32(kj) - 1;
+            if (ii < 0 || ii >= i32(p.h)) { continue; }
+            for (var kl: u32 = 0u; kl < 3u; kl = kl + 1u) {
+                let jj = i32(j) + i32(kl) - 1;
+                if (jj < 0 || jj >= i32(p.w)) { continue; }
+                let in_base = (((g * p.d + u32(zz)) * p.h + u32(ii)) * p.w + u32(jj)) * p.c;
+                let tap = (ki * 3u + kj) * 3u + kl;
+                for (var ci: u32 = 0u; ci < p.c; ci = ci + 1u) {
+                    let widx = (co * p.c + ci) * 27u + tap;
+                    acc = acc + w1[widx] * s[in_base + ci];
+                }
             }
         }
     }
@@ -64,14 +73,14 @@ struct Conv3Params {
     c: u32,
     ch: u32,
     nb: u32,
-    _p1: u32,
+    d: u32,
     _p2: u32,
     _p3: u32,
 }
 
 impl Conv3Params {
-    fn new(h: u32, w: u32, c: u32, ch: u32, nb: u32) -> Self {
-        Self { h, w, c, ch, nb, _p1: 0, _p2: 0, _p3: 0 }
+    fn new(h: u32, w: u32, c: u32, ch: u32, nb: u32, d: u32) -> Self {
+        Self { h, w, c, ch, nb, d, _p2: 0, _p3: 0 }
     }
 }
 
@@ -99,8 +108,9 @@ impl ThermoConv3x3GeluKernel {
         w: u32,
         c: u32,
         ch: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, s, w1, b1, hp, h, w, c, ch, 1);
+        self.dispatch_b(ctx, encoder, s, w1, b1, hp, h, w, c, ch, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -117,16 +127,17 @@ impl ThermoConv3x3GeluKernel {
         c: u32,
         ch: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = Conv3Params::new(h, w, c, ch, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, w1, b1, hp], bytemuck::bytes_of(&p), (nb * h * w * ch).div_ceil(WG));
+        let p = Conv3Params::new(h, w, c, ch, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, w1, b1, hp], bytemuck::bytes_of(&p), (nb * d * h * w * ch).div_ceil(WG));
     }
 }
 
 // ───── conv3x3 (no GELU; outputs pre-activation for the bwd cache) ──────
 
 const CONV3X3_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, _p1:u32, _p2:u32, _p3:u32 };
+struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, d:u32, _p2:u32, _p3:u32 };
 @group(0) @binding(0) var<storage, read>       s:  array<f32>;
 @group(0) @binding(1) var<storage, read>       w1: array<f32>;
 @group(0) @binding(2) var<storage, read>       b1: array<f32>;
@@ -136,24 +147,31 @@ var<push_constant> p: P;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.ch) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.ch) { return; }
     let co = idx % p.ch;
     let cell = idx / p.ch;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let i = row % p.h;
     let j = cell % p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;
+    let g = r2 / p.d;
     var acc = b1[co];
     for (var ki: u32 = 0u; ki < 3u; ki = ki + 1u) {
-        let ii = i32(i) + i32(ki) - 1;
-        if (ii < 0 || ii >= i32(p.h)) { continue; }
+        let zz = i32(z) + i32(ki) - 1;
+        if (zz < 0 || zz >= i32(p.d)) { continue; }
         for (var kj: u32 = 0u; kj < 3u; kj = kj + 1u) {
-            let jj = i32(j) + i32(kj) - 1;
-            if (jj < 0 || jj >= i32(p.w)) { continue; }
-            let in_base = ((g * p.h + u32(ii)) * p.w + u32(jj)) * p.c;
-            for (var ci: u32 = 0u; ci < p.c; ci = ci + 1u) {
-                let widx = ((co * p.c + ci) * 3u + ki) * 3u + kj;
-                acc = acc + w1[widx] * s[in_base + ci];
+            let ii = i32(i) + i32(kj) - 1;
+            if (ii < 0 || ii >= i32(p.h)) { continue; }
+            for (var kl: u32 = 0u; kl < 3u; kl = kl + 1u) {
+                let jj = i32(j) + i32(kl) - 1;
+                if (jj < 0 || jj >= i32(p.w)) { continue; }
+                let in_base = (((g * p.d + u32(zz)) * p.h + u32(ii)) * p.w + u32(jj)) * p.c;
+                let tap = (ki * 3u + kj) * 3u + kl;
+                for (var ci: u32 = 0u; ci < p.c; ci = ci + 1u) {
+                    let widx = (co * p.c + ci) * 27u + tap;
+                    acc = acc + w1[widx] * s[in_base + ci];
+                }
             }
         }
     }
@@ -185,8 +203,9 @@ impl ThermoConv3x3Kernel {
         w: u32,
         c: u32,
         ch: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, s, w1, b1, hp, h, w, c, ch, 1);
+        self.dispatch_b(ctx, encoder, s, w1, b1, hp, h, w, c, ch, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -203,9 +222,10 @@ impl ThermoConv3x3Kernel {
         c: u32,
         ch: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = Conv3Params::new(h, w, c, ch, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, w1, b1, hp], bytemuck::bytes_of(&p), (nb * h * w * ch).div_ceil(WG));
+        let p = Conv3Params::new(h, w, c, ch, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, w1, b1, hp], bytemuck::bytes_of(&p), (nb * d * h * w * ch).div_ceil(WG));
     }
 }
 
@@ -298,34 +318,41 @@ impl ThermoConv1x1Kernel {
 // ───── conv3x3 backward: d_s (gather, atomics-free) ─────────────────────
 
 const CONV3X3_DS_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, _p1:u32, _p2:u32, _p3:u32 };
-@group(0) @binding(0) var<storage, read>       dhp: array<f32>;  // [nb*h*w*ch] (d_h_pre)
-@group(0) @binding(1) var<storage, read>       w1:  array<f32>;  // [ch*c*9]
-@group(0) @binding(2) var<storage, read_write> ds:  array<f32>;  // [nb*h*w*c]
+struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, d:u32, _p2:u32, _p3:u32 };
+@group(0) @binding(0) var<storage, read>       dhp: array<f32>;  // [nb*d*h*w*ch] (d_h_pre)
+@group(0) @binding(1) var<storage, read>       w1:  array<f32>;  // [ch*c*27]
+@group(0) @binding(2) var<storage, read_write> ds:  array<f32>;  // [nb*d*h*w*c]
 var<push_constant> p: P;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.c) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.c) { return; }
     let ci = idx % p.c;
     let cell = idx / p.c;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let yi = row % p.h;
     let yj = cell % p.w;
+    let r1 = cell / p.w;
+    let yi = r1 % p.h;
+    let r2 = r1 / p.h;
+    let yz = r2 % p.d;
+    let g = r2 / p.d;
     var acc = 0.0;
-    // s[yi,yj,ci] feeds h_pre[i,j,co] with i = yi-ki+1, j = yj-kj+1.
+    // s[yz,yi,yj,ci] feeds h_pre[z,i,j,co] with z=yz-ki+1, i=yi-kj+1, j=yj-kl+1.
     for (var ki: u32 = 0u; ki < 3u; ki = ki + 1u) {
-        let i = i32(yi) - i32(ki) + 1;
-        if (i < 0 || i >= i32(p.h)) { continue; }
+        let zc = i32(yz) - i32(ki) + 1;
+        if (zc < 0 || zc >= i32(p.d)) { continue; }
         for (var kj: u32 = 0u; kj < 3u; kj = kj + 1u) {
-            let j = i32(yj) - i32(kj) + 1;
-            if (j < 0 || j >= i32(p.w)) { continue; }
-            let obase = ((g * p.h + u32(i)) * p.w + u32(j)) * p.ch;
-            for (var co: u32 = 0u; co < p.ch; co = co + 1u) {
-                let widx = ((co * p.c + ci) * 3u + ki) * 3u + kj;
-                acc = acc + dhp[obase + co] * w1[widx];
+            let i = i32(yi) - i32(kj) + 1;
+            if (i < 0 || i >= i32(p.h)) { continue; }
+            for (var kl: u32 = 0u; kl < 3u; kl = kl + 1u) {
+                let j = i32(yj) - i32(kl) + 1;
+                if (j < 0 || j >= i32(p.w)) { continue; }
+                let obase = (((g * p.d + u32(zc)) * p.h + u32(i)) * p.w + u32(j)) * p.ch;
+                let tap = (ki * 3u + kj) * 3u + kl;
+                for (var co: u32 = 0u; co < p.ch; co = co + 1u) {
+                    let widx = (co * p.c + ci) * 27u + tap;
+                    acc = acc + dhp[obase + co] * w1[widx];
+                }
             }
         }
     }
@@ -356,8 +383,9 @@ impl ThermoConv3x3DsKernel {
         w: u32,
         c: u32,
         ch: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, dhp, w1, ds, h, w, c, ch, 1);
+        self.dispatch_b(ctx, encoder, dhp, w1, ds, h, w, c, ch, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -373,43 +401,50 @@ impl ThermoConv3x3DsKernel {
         c: u32,
         ch: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = Conv3Params::new(h, w, c, ch, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[dhp, w1, ds], bytemuck::bytes_of(&p), (nb * h * w * c).div_ceil(WG));
+        let p = Conv3Params::new(h, w, c, ch, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[dhp, w1, ds], bytemuck::bytes_of(&p), (nb * d * h * w * c).div_ceil(WG));
     }
 }
 
 // ───── conv3x3 backward: d_w1 (one thread per weight) ───────────────────
 
 const CONV3X3_DW1_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, _p1:u32, _p2:u32, _p3:u32 };
-@group(0) @binding(0) var<storage, read>       dhp: array<f32>;  // [nb*h*w*ch]
-@group(0) @binding(1) var<storage, read>       s:   array<f32>;  // [nb*h*w*c]
-@group(0) @binding(2) var<storage, read_write> dw1: array<f32>;  // [ch*c*9]
+struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, d:u32, _p2:u32, _p3:u32 };
+@group(0) @binding(0) var<storage, read>       dhp: array<f32>;  // [nb*d*h*w*ch]
+@group(0) @binding(1) var<storage, read>       s:   array<f32>;  // [nb*d*h*w*c]
+@group(0) @binding(2) var<storage, read_write> dw1: array<f32>;  // [ch*c*27]
 var<push_constant> p: P;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let widx = gid.x;
-    if (widx >= p.ch * p.c * 9u) { return; }
-    let kj = widx % 3u;
+    if (widx >= p.ch * p.c * 27u) { return; }
+    let kl = widx % 3u;
     let r1 = widx / 3u;
-    let ki = r1 % 3u;
+    let kj = r1 % 3u;
     let r2 = r1 / 3u;
-    let ci = r2 % p.c;
-    let co = r2 / p.c;
-    let cells = p.h * p.w;
+    let ki = r2 % 3u;
+    let r3 = r2 / 3u;
+    let ci = r3 % p.c;
+    let co = r3 / p.c;
+    let cells = p.d * p.h * p.w;
     var acc = 0.0;
     for (var g: u32 = 0u; g < p.nb; g = g + 1u) {
-        for (var i: u32 = 0u; i < p.h; i = i + 1u) {
-            let ii = i32(i) + i32(ki) - 1;
-            if (ii < 0 || ii >= i32(p.h)) { continue; }
-            for (var j: u32 = 0u; j < p.w; j = j + 1u) {
-                let jj = i32(j) + i32(kj) - 1;
-                if (jj < 0 || jj >= i32(p.w)) { continue; }
-                let o = (g * cells + i * p.w + j) * p.ch + co;
-                let in_idx = (g * cells + u32(ii) * p.w + u32(jj)) * p.c + ci;
-                acc = acc + dhp[o] * s[in_idx];
+        for (var zc: u32 = 0u; zc < p.d; zc = zc + 1u) {
+            let zz = i32(zc) + i32(ki) - 1;
+            if (zz < 0 || zz >= i32(p.d)) { continue; }
+            for (var i: u32 = 0u; i < p.h; i = i + 1u) {
+                let ii = i32(i) + i32(kj) - 1;
+                if (ii < 0 || ii >= i32(p.h)) { continue; }
+                for (var j: u32 = 0u; j < p.w; j = j + 1u) {
+                    let jj = i32(j) + i32(kl) - 1;
+                    if (jj < 0 || jj >= i32(p.w)) { continue; }
+                    let o = (g * cells + (zc * p.h + i) * p.w + j) * p.ch + co;
+                    let in_idx = (g * cells + (u32(zz) * p.h + u32(ii)) * p.w + u32(jj)) * p.c + ci;
+                    acc = acc + dhp[o] * s[in_idx];
+                }
             }
         }
     }
@@ -440,8 +475,9 @@ impl ThermoConv3x3Dw1Kernel {
         w: u32,
         c: u32,
         ch: u32,
+        d: u32,
     ) {
-        self.dispatch_b(ctx, encoder, dhp, s, dw1, h, w, c, ch, 1);
+        self.dispatch_b(ctx, encoder, dhp, s, dw1, h, w, c, ch, 1, d);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -457,9 +493,10 @@ impl ThermoConv3x3Dw1Kernel {
         c: u32,
         ch: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = Conv3Params::new(h, w, c, ch, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[dhp, s, dw1], bytemuck::bytes_of(&p), (ch * c * 9).div_ceil(WG));
+        let p = Conv3Params::new(h, w, c, ch, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[dhp, s, dw1], bytemuck::bytes_of(&p), (ch * c * 27).div_ceil(WG));
     }
 }
 
@@ -472,36 +509,42 @@ impl ThermoConv3x3Dw1Kernel {
 // into `d_w1`. Same math, `nb×` the parallelism.
 
 const CONV3X3_DW1_SPLITK_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, _p1:u32, _p2:u32, _p3:u32 };
-@group(0) @binding(0) var<storage, read>       dhp:      array<f32>;  // [nb*h*w*ch]
-@group(0) @binding(1) var<storage, read>       s:        array<f32>;  // [nb*h*w*c]
-@group(0) @binding(2) var<storage, read_write> partials: array<f32>;  // [nb, ch*c*9]
+struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, d:u32, _p2:u32, _p3:u32 };
+@group(0) @binding(0) var<storage, read>       dhp:      array<f32>;  // [nb*d*h*w*ch]
+@group(0) @binding(1) var<storage, read>       s:        array<f32>;  // [nb*d*h*w*c]
+@group(0) @binding(2) var<storage, read_write> partials: array<f32>;  // [nb, ch*c*27]
 var<push_constant> p: P;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let nw = p.ch * p.c * 9u;
+    let nw = p.ch * p.c * 27u;
     let idx = gid.x;
     if (idx >= p.nb * nw) { return; }
     let g = idx / nw;             // batch grid = K-slice
     let widx = idx % nw;
-    let kj = widx % 3u;
+    let kl = widx % 3u;
     let r1 = widx / 3u;
-    let ki = r1 % 3u;
+    let kj = r1 % 3u;
     let r2 = r1 / 3u;
-    let ci = r2 % p.c;
-    let co = r2 / p.c;
-    let cells = p.h * p.w;
+    let ki = r2 % 3u;
+    let r3 = r2 / 3u;
+    let ci = r3 % p.c;
+    let co = r3 / p.c;
+    let cells = p.d * p.h * p.w;
     var acc = 0.0;
-    for (var i: u32 = 0u; i < p.h; i = i + 1u) {
-        let ii = i32(i) + i32(ki) - 1;
-        if (ii < 0 || ii >= i32(p.h)) { continue; }
-        for (var j: u32 = 0u; j < p.w; j = j + 1u) {
-            let jj = i32(j) + i32(kj) - 1;
-            if (jj < 0 || jj >= i32(p.w)) { continue; }
-            let o = (g * cells + i * p.w + j) * p.ch + co;
-            let in_idx = (g * cells + u32(ii) * p.w + u32(jj)) * p.c + ci;
-            acc = acc + dhp[o] * s[in_idx];
+    for (var zc: u32 = 0u; zc < p.d; zc = zc + 1u) {
+        let zz = i32(zc) + i32(ki) - 1;
+        if (zz < 0 || zz >= i32(p.d)) { continue; }
+        for (var i: u32 = 0u; i < p.h; i = i + 1u) {
+            let ii = i32(i) + i32(kj) - 1;
+            if (ii < 0 || ii >= i32(p.h)) { continue; }
+            for (var j: u32 = 0u; j < p.w; j = j + 1u) {
+                let jj = i32(j) + i32(kl) - 1;
+                if (jj < 0 || jj >= i32(p.w)) { continue; }
+                let o = (g * cells + (zc * p.h + i) * p.w + j) * p.ch + co;
+                let in_idx = (g * cells + (u32(zz) * p.h + u32(ii)) * p.w + u32(jj)) * p.c + ci;
+                acc = acc + dhp[o] * s[in_idx];
+            }
         }
     }
     partials[idx] = acc;
@@ -536,9 +579,91 @@ impl ThermoConv3x3Dw1SplitKKernel {
         c: u32,
         ch: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = Conv3Params::new(h, w, c, ch, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[dhp, s, partials], bytemuck::bytes_of(&p), (nb * ch * c * 9).div_ceil(WG));
+        let p = Conv3Params::new(h, w, c, ch, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[dhp, s, partials], bytemuck::bytes_of(&p), (nb * ch * c * 27).div_ceil(WG));
+    }
+}
+
+// ───── im2col for the d_w1 backward (patch matrix → reuse the GEMM path) ─
+//
+// Materializes `patch[t, ci*27+tap] = s[neighbour(cell,tap), ci]` (0 outside
+// the grid), `t = g*cells + cell`, shape `[nb*cells, c*27]`. Then
+// `d_w1[co, ci*27+tap] = Σ_t dhp[t,co]·patch[t,·]` is an outer-product
+// reduction — the SAME op as `d_w2`, run via `OuterProductSplitK` +
+// `RowReduceAdd` (which clocks ~40× faster than the conv-style split-K
+// d_w1, whose scattered s-reads over a serial cell loop were the cost).
+// The patch column order `ci*27+tap` makes the GEMM output land directly in
+// the canonical `w1[(co*c+ci)*27+tap]` layout.
+
+const IM2COL_DW1_WGSL: &str = "
+struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, d:u32, _p2:u32, _p3:u32 };
+@group(0) @binding(0) var<storage, read>       s:   array<f32>;  // [nb*cells*c]
+@group(0) @binding(1) var<storage, read_write> pat: array<f32>;  // [nb*cells*(c*27)]
+var<push_constant> p: P;
+
+// One thread per (t, ci); the 27 taps loop inside (contiguous writes), so the
+// grid stays well under the 65535 workgroup-per-dim limit.
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let cells = p.d * p.h * p.w;
+    if (idx >= p.nb * cells * p.c) { return; }
+    let ci = idx % p.c;
+    let t = idx / p.c;
+    let cell = t % cells;
+    let g = t / cells;
+    let j = cell % p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let z = r1 / p.h;
+    let base = (t * p.c + ci) * 27u;
+    for (var tap: u32 = 0u; tap < 27u; tap = tap + 1u) {
+        let ki = tap / 9u;
+        let kj = (tap / 3u) % 3u;
+        let kl = tap % 3u;
+        let zz = i32(z) + i32(ki) - 1;
+        let ii = i32(i) + i32(kj) - 1;
+        let jj = i32(j) + i32(kl) - 1;
+        var v = 0.0;
+        if (zz >= 0 && zz < i32(p.d) && ii >= 0 && ii < i32(p.h) && jj >= 0 && jj < i32(p.w)) {
+            let nbr = (u32(zz) * p.h + u32(ii)) * p.w + u32(jj);
+            v = s[(g * cells + nbr) * p.c + ci];
+        }
+        pat[base + tap] = v;
+    }
+}
+";
+
+pub struct ThermoIm2colDw1Kernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bgl: Arc<wgpu::BindGroupLayout>,
+}
+
+impl ThermoIm2colDw1Kernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let (pipeline, bgl) = build(ctx, "thermo_im2col_dw1", IM2COL_DW1_WGSL, &[true, false]);
+        Self { pipeline, bgl }
+    }
+
+    /// Build the `[nb*cells, c*27]` patch matrix from `s`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_b(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        s: &GpuBuffer,
+        patch: &GpuBuffer,
+        h: u32,
+        w: u32,
+        c: u32,
+        nb: u32,
+        d: u32,
+    ) {
+        let p = Conv3Params::new(h, w, c, 0, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, patch], bytemuck::bytes_of(&p), (nb * d * h * w * c).div_ceil(WG));
     }
 }
 
@@ -549,12 +674,12 @@ impl ThermoConv3x3Dw1SplitKKernel {
 // pre-activation (for the bwd gelu') and the post-GELU (for conv1x1).
 
 const CONV3X3_GELU2_WGSL: &str = "
-struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, _p1:u32, _p2:u32, _p3:u32 };
-@group(0) @binding(0) var<storage, read>       s:     array<f32>;  // [nb*h*w*c]
-@group(0) @binding(1) var<storage, read>       w1:    array<f32>;  // [ch*c*9]
+struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, d:u32, _p2:u32, _p3:u32 };
+@group(0) @binding(0) var<storage, read>       s:     array<f32>;  // [nb*d*h*w*c]
+@group(0) @binding(1) var<storage, read>       w1:    array<f32>;  // [ch*c*27]
 @group(0) @binding(2) var<storage, read>       b1:    array<f32>;  // [ch]
-@group(0) @binding(3) var<storage, read_write> hpre:  array<f32>;  // [nb*h*w*ch]
-@group(0) @binding(4) var<storage, read_write> hpost: array<f32>;  // [nb*h*w*ch]
+@group(0) @binding(3) var<storage, read_write> hpre:  array<f32>;  // [nb*d*h*w*ch]
+@group(0) @binding(4) var<storage, read_write> hpost: array<f32>;  // [nb*d*h*w*ch]
 var<push_constant> p: P;
 
 fn gelu(x: f32) -> f32 {
@@ -566,24 +691,31 @@ fn gelu(x: f32) -> f32 {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= p.nb * p.h * p.w * p.ch) { return; }
+    if (idx >= p.nb * p.d * p.h * p.w * p.ch) { return; }
     let co = idx % p.ch;
     let cell = idx / p.ch;
-    let row = cell / p.w;
-    let g = row / p.h;
-    let i = row % p.h;
     let j = cell % p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let r2 = r1 / p.h;
+    let z = r2 % p.d;
+    let g = r2 / p.d;
     var acc = b1[co];
     for (var ki: u32 = 0u; ki < 3u; ki = ki + 1u) {
-        let ii = i32(i) + i32(ki) - 1;
-        if (ii < 0 || ii >= i32(p.h)) { continue; }
+        let zz = i32(z) + i32(ki) - 1;
+        if (zz < 0 || zz >= i32(p.d)) { continue; }
         for (var kj: u32 = 0u; kj < 3u; kj = kj + 1u) {
-            let jj = i32(j) + i32(kj) - 1;
-            if (jj < 0 || jj >= i32(p.w)) { continue; }
-            let in_base = ((g * p.h + u32(ii)) * p.w + u32(jj)) * p.c;
-            for (var ci: u32 = 0u; ci < p.c; ci = ci + 1u) {
-                let widx = ((co * p.c + ci) * 3u + ki) * 3u + kj;
-                acc = acc + w1[widx] * s[in_base + ci];
+            let ii = i32(i) + i32(kj) - 1;
+            if (ii < 0 || ii >= i32(p.h)) { continue; }
+            for (var kl: u32 = 0u; kl < 3u; kl = kl + 1u) {
+                let jj = i32(j) + i32(kl) - 1;
+                if (jj < 0 || jj >= i32(p.w)) { continue; }
+                let in_base = (((g * p.d + u32(zz)) * p.h + u32(ii)) * p.w + u32(jj)) * p.c;
+                let tap = (ki * 3u + kj) * 3u + kl;
+                for (var ci: u32 = 0u; ci < p.c; ci = ci + 1u) {
+                    let widx = (co * p.c + ci) * 27u + tap;
+                    acc = acc + w1[widx] * s[in_base + ci];
+                }
             }
         }
     }
@@ -619,9 +751,10 @@ impl ThermoConv3x3GeluCacheKernel {
         c: u32,
         ch: u32,
         nb: u32,
+        d: u32,
     ) {
-        let p = Conv3Params::new(h, w, c, ch, nb);
-        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, w1, b1, hpre, hpost], bytemuck::bytes_of(&p), (nb * h * w * ch).div_ceil(WG));
+        let p = Conv3Params::new(h, w, c, ch, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, w1, b1, hpre, hpost], bytemuck::bytes_of(&p), (nb * d * h * w * ch).div_ceil(WG));
     }
 }
 
@@ -690,6 +823,63 @@ impl ThermoConvBwdHiddenKernel {
     }
 }
 
+// ───── bias-add + GELU epilogue (for the im2col + GEMM forward conv) ─────
+//
+// The im2col + `GemmTransposeB` path computes `hpre = patch @ w1ᵀ` without the
+// bias; this folds `+b1` (broadcast over cells) and the GELU into one pass,
+// writing the bias-corrected hpre (for the bwd) and hpost (for conv1x1).
+
+const BIAS_GELU_WGSL: &str = "
+struct P { cells:u32, ch:u32, _p0:u32, _p1:u32, _p2:u32, _p3:u32, _p4:u32, _p5:u32 };
+@group(0) @binding(0) var<storage, read_write> hpre:  array<f32>;  // in: no-bias, out: +bias
+@group(0) @binding(1) var<storage, read>       b1:    array<f32>;  // [ch]
+@group(0) @binding(2) var<storage, read_write> hpost: array<f32>;  // [cells*ch]
+var<push_constant> p: P;
+
+fn gelu(x: f32) -> f32 {
+    let k = 0.7978845608028654;
+    let inner = k * (x + 0.044715 * x * x * x);
+    return 0.5 * x * (1.0 + tanh(inner));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= p.cells * p.ch) { return; }
+    let co = idx % p.ch;
+    let v = hpre[idx] + b1[co];
+    hpre[idx] = v;
+    hpost[idx] = gelu(v);
+}
+";
+
+pub struct ThermoBiasGeluKernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bgl: Arc<wgpu::BindGroupLayout>,
+}
+
+impl ThermoBiasGeluKernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let (pipeline, bgl) = build(ctx, "thermo_bias_gelu", BIAS_GELU_WGSL, &[false, true, false]);
+        Self { pipeline, bgl }
+    }
+
+    pub fn dispatch_into(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        hpre: &GpuBuffer,
+        b1: &GpuBuffer,
+        hpost: &GpuBuffer,
+        cells: u32,
+        ch: u32,
+    ) {
+        let p = Conv1Params { cells, ch, cout: 0, _p0: 0, _p1: 0, _p2: 0, _p3: 0, _p4: 0 };
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[hpre, b1, hpost], bytemuck::bytes_of(&p), (cells * ch).div_ceil(WG));
+    }
+}
+
 // ───── shared pipeline builder ──────────────────────────────────────────
 
 /// Dispatch a kernel binding `buffers` in order with raw push-constant
@@ -752,7 +942,10 @@ pub(crate) fn build(
         bind_group_layouts: &[&bgl],
         push_constant_ranges: &[wgpu::PushConstantRange {
             stages: wgpu::ShaderStages::COMPUTE,
-            range: 0..32,
+            // 48 bytes (12 words): most thermo kernels use ≤32, but the fused
+            // 3D transport-forward params need 9 words. The device limit is
+            // ≥128 (see GpuContext), so the slack is free.
+            range: 0..48,
         }],
     });
     let pipeline = ctx.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

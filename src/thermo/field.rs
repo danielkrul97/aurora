@@ -1,11 +1,11 @@
 #![allow(clippy::cast_precision_loss, clippy::must_use_candidate)]
 
 //! Field layout, configuration, and initialization for the thermodynamic
-//! LM. The state is an `H×W×C` grid stored row-major, **channel-last**:
-//! a cell `(i,j)` owns a contiguous `[C]` feature vector at offset
-//! `(i*W + j)*C`. This mirrors the transformer's `[T*D]` per-token row
-//! layout, so the moment readout and per-cell projections reuse the same
-//! `LinearProj` machinery.
+//! LM. The state is a `D×H×W×C` grid stored row-major, **channel-last**:
+//! a cell `(d,i,j)` owns a contiguous `[C]` feature vector at offset
+//! `((d*H + i)*W + j)*C`. This mirrors the transformer's `[T*D]` per-token
+//! row layout, so the moment readout and per-cell projections reuse the
+//! same `LinearProj` machinery. `D=1` degenerates to the original 2D grid.
 
 /// Physical channel indices. Channels `[0, N_PHYS)` carry macroscopic
 /// quantities; channels `[N_PHYS, c)` are free hidden state that gives the
@@ -13,13 +13,16 @@
 pub const CH_RHO: usize = 0;
 pub const CH_UX: usize = 1;
 pub const CH_UY: usize = 2;
-pub const CH_E: usize = 3;
-pub const CH_T: usize = 4;
-pub const N_PHYS: usize = 5;
+pub const CH_UZ: usize = 3;
+pub const CH_E: usize = 4;
+pub const CH_T: usize = 5;
+pub const N_PHYS: usize = 6;
 
 #[derive(Clone, Debug)]
 pub struct ThermoConfig {
     pub vocab: usize,
+    /// Grid depth. `d = 1` degenerates to the original 2D `H×W` grid.
+    pub d: usize,
     pub h: usize,
     pub w: usize,
     /// Total field channels (physical + hidden). Must be `>= N_PHYS`.
@@ -60,6 +63,7 @@ impl ThermoConfig {
     pub fn toy(vocab: usize) -> Self {
         Self {
             vocab,
+            d: 3,
             h: 4,
             w: 4,
             c: 6,
@@ -82,6 +86,7 @@ impl ThermoConfig {
     pub fn nano(vocab: usize) -> Self {
         Self {
             vocab,
+            d: 1,
             h: 32,
             w: 32,
             c: 8,
@@ -102,12 +107,12 @@ impl ThermoConfig {
 
     #[inline]
     pub fn cells(&self) -> usize {
-        self.h * self.w
+        self.d * self.h * self.w
     }
 
     #[inline]
     pub fn field_len(&self) -> usize {
-        self.h * self.w * self.c
+        self.d * self.h * self.w * self.c
     }
 
     #[inline]
@@ -116,23 +121,23 @@ impl ThermoConfig {
     }
 
     /// Output-channel count of the local operator: one free delta per
-    /// non-conserved channel, plus `Fx` and `Fy` per conserved channel.
-    /// `(c - n_cons) + 2·n_cons = c + n_cons`.
+    /// non-conserved channel, plus `Fx`, `Fy`, `Fz` per conserved channel.
+    /// `(c - n_cons) + 3·n_cons = c + 2·n_cons`.
     #[inline]
     pub fn c_out(&self) -> usize {
-        self.c + self.conserved.len()
+        self.c + 2 * self.conserved.len()
     }
 
     /// Pooled (moment) feature dimension.
     #[inline]
     pub fn pooled_dim(&self) -> usize {
-        (self.h / self.pool) * (self.w / self.pool) * self.c
+        (self.d / self.pool) * (self.h / self.pool) * (self.w / self.pool) * self.c
     }
 
-    /// Spectral feature dimension: `readout_modes²` modes per channel.
+    /// Spectral feature dimension: `readout_modes³` modes per channel.
     #[inline]
     pub fn spectral_dim(&self) -> usize {
-        self.readout_modes * self.readout_modes * self.c
+        self.readout_modes * self.readout_modes * self.readout_modes * self.c
     }
 
     /// Total readout input dimension (moments + spectral, per flags).
@@ -170,10 +175,10 @@ pub fn free_channels_for(cfg: &ThermoConfig) -> Vec<usize> {
     (0..cfg.c).filter(|ch| !cfg.conserved.contains(ch)).collect()
 }
 
-/// Flat index of channel `c` at cell `(i,j)`, channel-last row-major.
+/// Flat index of channel `c` at cell `(z,i,j)`, channel-last row-major.
 #[inline]
-pub fn idx(i: usize, j: usize, c: usize, cfg: &ThermoConfig) -> usize {
-    (i * cfg.w + j) * cfg.c + c
+pub fn idx3(z: usize, i: usize, j: usize, c: usize, cfg: &ThermoConfig) -> usize {
+    ((z * cfg.h + i) * cfg.w + j) * cfg.c + c
 }
 
 /// Warm uniform initial field: unit density, `t_init` temperature, the
@@ -181,10 +186,12 @@ pub fn idx(i: usize, j: usize, c: usize, cfg: &ThermoConfig) -> usize {
 /// by token injection + dynamics.
 pub fn init_field(cfg: &ThermoConfig) -> Vec<f32> {
     let mut f = vec![0.0_f32; cfg.field_len()];
-    for i in 0..cfg.h {
-        for j in 0..cfg.w {
-            f[idx(i, j, CH_RHO, cfg)] = 1.0;
-            f[idx(i, j, CH_T, cfg)] = cfg.t_init;
+    for z in 0..cfg.d {
+        for i in 0..cfg.h {
+            for j in 0..cfg.w {
+                f[idx3(z, i, j, CH_RHO, cfg)] = 1.0;
+                f[idx3(z, i, j, CH_T, cfg)] = cfg.t_init;
+            }
         }
     }
     f

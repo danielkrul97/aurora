@@ -15,6 +15,7 @@ use rand::SeedableRng;
 fn small_cfg() -> ThermoConfig {
     ThermoConfig {
         vocab: 6,
+        d: 2,
         h: 8,
         w: 8,
         c: 6,
@@ -33,10 +34,9 @@ fn small_cfg() -> ThermoConfig {
     }
 }
 
-#[test]
-fn thermo_overfits_small_window() {
+/// Overfit a fixed window for 400 steps; returns (first_loss, last_loss).
+fn overfit_window(cfg: &ThermoConfig) -> (f32, f32) {
     let mut rng = StdRng::seed_from_u64(0x5A1D);
-    let cfg = small_cfg();
     let mut model = ThermoLM::new(cfg.clone(), &mut rng);
 
     // Fixed window; predict the next token (teacher forced).
@@ -49,7 +49,7 @@ fn thermo_overfits_small_window() {
         weight_decay: 0.0,
         ..AdamWConfig::default()
     };
-    let mut grads = ThermoGrads::zeros(&cfg);
+    let mut grads = ThermoGrads::zeros(cfg);
     let mut first = 0.0_f32;
     let mut last = 0.0_f32;
     for step in 0..400 {
@@ -67,8 +67,26 @@ fn thermo_overfits_small_window() {
         }
     }
     println!("first {first:.4}  last {last:.4}");
+    (first, last)
+}
+
+#[test]
+fn thermo_overfits_small_window() {
+    let (first, last) = overfit_window(&small_cfg());
     assert!(last.is_finite(), "loss went non-finite");
     assert!(last < first - 0.3, "no learning: {first:.4} -> {last:.4}");
+}
+
+#[test]
+fn thermo_overfits_2d_degenerate() {
+    // D=1 must reproduce 2D-style dynamics and still learn. pool=1 because
+    // the moment pool factor must divide every axis (1 % 2 ≠ 0).
+    let mut cfg = small_cfg();
+    cfg.d = 1;
+    cfg.pool = 1;
+    let (first, last) = overfit_window(&cfg);
+    assert!(last.is_finite(), "loss went non-finite");
+    assert!(last < first - 0.3, "no learning (D=1): {first:.4} -> {last:.4}");
 }
 
 #[test]
