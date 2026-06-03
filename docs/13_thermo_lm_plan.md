@@ -1087,3 +1087,41 @@ spatial (vír, strom) = mrtvé (globální readout je zahladí) → **temporal
 (spacetime) = velká výhra, 2.78** → selektivita (SSM) = na nano nezabere.
 **Šampion = statický spacetime.** Reálné páky dál: scale (data/kroky/params),
 ne další exotická geometrie.
+
+---
+
+## 23. Spacetime GPU port (IMPLEMENTOVÁNO, parity GREEN, enwik8_10m na GPU)
+
+Spacetime byl CPU-only; doportováno na GPU (`src/gpu/spacetime_gpu.rs`,
+`StLmGpu`). Protože model je paralelní (žádná per-timestep rekurence), je port
+jednodušší než `ThermoGpu`: jedno pole `[B·L·c]`, K reziduálních conv kroků,
+time-local readout = GEMM, caches jen K+1/K (ne L·K).
+
+**Nové kernely (4):** kauzální dilatovaná conv1d (gelu-cache / d_s / d_w1
+direct), embed-inject, axpy. **Reuse:** ThermoConv1x1, ConvBwdHidden,
+Gemm/GemmTransposeB, OuterProductAccum, RowReduceAdd, BiasRowAdd, SoftmaxCE,
+EmbedScatterReduce, AdamW, celý Muon (`muon_one` verbatim — matrix-generic),
+GradNorm. `--gpu` v `examples/spacetime_train.rs`.
+
+**Parity GREEN** (`tests/thermo_spacetime_gpu.rs`): fwd logity vs CPU `< 5e-3`;
+bwd všech 7 grad tenzorů + loss vs CPU `< 2e-2`. Celé jádro (fwd+bwd+optim)
+ověřeno proti CPU `StLM`.
+
+**Výsledek na enwik8_10m (GTX 1650, c128 K6 seq64 B32, 1500 kroků):
+val bpb 2.7345 vs bigram 3.9405 (−1.21), za 259 s (~4.3 min)** — z CPU hodin na
+minuty. train 2.33 ≪ val 2.75 (podtrénováno, prostor je). Sanity na tiny.txt:
+trajektorie sedí na CPU (GPU 200 kroků 2.99 ≈ CPU).
+
+**Dva reálné fixy z velkého configu (c256/conv512/seq128/K8):**
+1. `d_w2` redukce dispatchla `c·ch=131072` workgroups > limit 65535 (grid model
+   to nikdy netrefil, tam je `c·ch` malé) → přepnuto na output-tiled
+   `OuterProductAccum`.
+2. **`d_w1` direct kernel je memory-bound pro velké `ch·c`** (strided uncoalesced
+   čtení `s`; GPU util ~13 % → ~3 s/krok). Fast path = **im2col + tiled GEMM**
+   (přesně jako grid §18). Odložené; lean config (`ch·c` skromné) jede plnou
+   rychlostí (0.17 s/krok). To je hlavní zbývající GPU optimalizace, jestli se
+   bude škálovat spacetime výš.
+
+**Závěr:** šampion linie (statický spacetime) teď běží **na GPU na cílovém
+korpusu (enwik8) při parity**, řádově rychleji. Další: im2col `d_w1` (odemkne
+velké configy) + scale (delší trénink / víc dat / params).
