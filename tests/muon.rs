@@ -267,6 +267,7 @@ fn muon_hybrid_step_does_not_nan() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 32,
+        rope: false,
     };
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -316,6 +317,7 @@ fn muon_converges_on_copy_task() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
 

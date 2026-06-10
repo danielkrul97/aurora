@@ -190,21 +190,36 @@ impl LinearGrads {
     }
 }
 
+/// Position-block size for the CPU linear kernels. Each weight row is
+/// streamed from memory once per block of positions instead of once per
+/// position — the weight matrix is the dominant memory traffic (e.g.
+/// d×d_ff = 2.3 MB ≫ L2 per-core slice), so this cuts DRAM reads ~8×.
+/// Per-(position, output) dot products are computed in the same order
+/// as the unblocked loop, so results are bit-exact.
+const LINEAR_BLOCK_T: usize = 8;
+
 /// Forward `y = x @ Wᵀ`. `x: [T * d_in]`, output `y: [T * d_out]`.
 pub fn linear_forward(proj: &LinearProj, x: &[f32]) -> Vec<f32> {
-    let t = x.len() / proj.d_in;
-    let mut y = vec![0.0_f32; t * proj.d_out];
-    for i in 0..t {
-        let xr = &x[i * proj.d_in..(i + 1) * proj.d_in];
-        let yr = &mut y[i * proj.d_out..(i + 1) * proj.d_out];
-        for o in 0..proj.d_out {
-            let row = &proj.w[o * proj.d_in..(o + 1) * proj.d_in];
-            let mut acc = 0.0_f32;
-            for k in 0..proj.d_in {
-                acc += row[k] * xr[k];
+    let d_in = proj.d_in;
+    let d_out = proj.d_out;
+    let t = x.len() / d_in;
+    let mut y = vec![0.0_f32; t * d_out];
+    let mut t0 = 0;
+    while t0 < t {
+        let tb = LINEAR_BLOCK_T.min(t - t0);
+        for o in 0..d_out {
+            let row = &proj.w[o * d_in..(o + 1) * d_in];
+            for tt in 0..tb {
+                let i = t0 + tt;
+                let xr = &x[i * d_in..(i + 1) * d_in];
+                let mut acc = 0.0_f32;
+                for k in 0..d_in {
+                    acc += row[k] * xr[k];
+                }
+                y[i * d_out + o] = acc;
             }
-            yr[o] = acc;
         }
+        t0 += tb;
     }
     y
 }
@@ -219,23 +234,78 @@ pub fn linear_backward(
     if grads.d_w.len() != proj.w.len() {
         grads.d_w = vec![0.0; proj.w.len()];
     }
-    let t = x.len() / proj.d_in;
+    let d_in = proj.d_in;
+    let d_out = proj.d_out;
+    let t = x.len() / d_in;
     let mut dx = vec![0.0_f32; x.len()];
-    for i in 0..t {
-        let xr = &x[i * proj.d_in..(i + 1) * proj.d_in];
-        let dyr = &dy[i * proj.d_out..(i + 1) * proj.d_out];
-        let dxr = &mut dx[i * proj.d_in..(i + 1) * proj.d_in];
-        for o in 0..proj.d_out {
-            let g = dyr[o];
-            let row = &proj.w[o * proj.d_in..(o + 1) * proj.d_in];
-            let drow = &mut grads.d_w[o * proj.d_in..(o + 1) * proj.d_in];
-            for k in 0..proj.d_in {
-                drow[k] += g * xr[k];
-                dxr[k] += g * row[k];
+    let mut t0 = 0;
+    while t0 < t {
+        let tb = LINEAR_BLOCK_T.min(t - t0);
+        for o in 0..d_out {
+            let row = &proj.w[o * d_in..(o + 1) * d_in];
+            let drow = &mut grads.d_w[o * d_in..(o + 1) * d_in];
+            for tt in 0..tb {
+                let i = t0 + tt;
+                let g = dy[i * d_out + o];
+                let xr = &x[i * d_in..(i + 1) * d_in];
+                let dxr = &mut dx[i * d_in..(i + 1) * d_in];
+                for k in 0..d_in {
+                    drow[k] += g * xr[k];
+                    dxr[k] += g * row[k];
+                }
+            }
+        }
+        t0 += tb;
+    }
+    dx
+}
+
+// --- Rotary position embedding (RoPE) -----------------------------------
+
+pub const ROPE_BASE: f32 = 10000.0;
+
+/// Rotate adjacent pairs of Q/K features by position-dependent angles
+/// (RoFormer-style interleaved layout). `x: [T * n_head * d_head]`
+/// full-width rows; rotation is applied per head, in place.
+///
+/// `pos_offset` is the absolute position of row 0 (non-zero during
+/// KV-cached decoding). `inverse` applies the transposed rotation —
+/// because each rotation is orthogonal, that is exactly the backward
+/// map for gradients: `dx = R(θ)ᵀ dy`.
+pub fn rope_rotate(
+    x: &mut [f32],
+    n_head: usize,
+    d_head: usize,
+    pos_offset: usize,
+    inverse: bool,
+) {
+    debug_assert_eq!(d_head % 2, 0, "RoPE requires even d_head");
+    let d = n_head * d_head;
+    let t = x.len() / d;
+    let half = d_head / 2;
+    // freq_i = BASE^(-2i/d_head) via multiplicative recurrence — one powf
+    // per call instead of one per (position, head, pair). The angle is
+    // identical across heads, so sin/cos is hoisted out of the head loop.
+    let freq_step = ROPE_BASE.powf(-2.0 / d_head as f32);
+    for ti in 0..t {
+        let pos = (pos_offset + ti) as f32;
+        let mut freq = 1.0_f32;
+        for i in 0..half {
+            let mut theta = pos * freq;
+            freq *= freq_step;
+            if inverse {
+                theta = -theta;
+            }
+            let (sin, cos) = theta.sin_cos();
+            for h in 0..n_head {
+                let off = ti * d + h * d_head + 2 * i;
+                let x0 = x[off];
+                let x1 = x[off + 1];
+                x[off] = x0 * cos - x1 * sin;
+                x[off + 1] = x0 * sin + x1 * cos;
             }
         }
     }
-    dx
 }
 
 // --- Scaled dot-product attention ---------------------------------------

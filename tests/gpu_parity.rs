@@ -392,6 +392,7 @@ fn token_pos_embed_forward_matches_cpu() {
         d as u32,
         vocab as u32,
         seq_max as u32,
+        true,
     );
     ctx.queue.submit(Some(enc.finish()));
     let gpu_y = out_gpu.download(&ctx);
@@ -578,6 +579,7 @@ fn full_transformer_forward_matches_cpu() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
@@ -601,6 +603,64 @@ fn full_transformer_forward_matches_cpu() {
 }
 
 #[test]
+fn full_transformer_rope_forward_and_grads_match_cpu() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x80BE);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        rope: true,
+    };
+    let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..8u32).map(|i| (i * 5 + 3) % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let (cpu_logits, cpu_cache) = cpu_model.forward(&tokens);
+    let mut cpu_grads = ModelGrads::zeros(&cfg);
+    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &cpu_logits, &targets, &mut cpu_grads);
+
+    gpu_model.zero_grad();
+    let gpu_loss = gpu_model.train_step(&tokens, &targets);
+
+    let loss_diff = (cpu_loss - gpu_loss).abs();
+    assert!(
+        loss_diff < 5e-2,
+        "rope loss CPU {cpu_loss} vs GPU {gpu_loss}, diff {loss_diff}"
+    );
+
+    // Backward parity through the rotation: q/k projection grads.
+    for li in 0..cfg.n_layer {
+        let gpu_g_w_q = gpu_model.p.blocks[li].g_w_q.download(&gpu_model.ctx);
+        let gpu_g_w_k = gpu_model.p.blocks[li].g_w_k.download(&gpu_model.ctx);
+        let err_q = max_rel_err(&cpu_grads.blocks[li].d_mha.d_w_q.d_w, &gpu_g_w_q);
+        let err_k = max_rel_err(&cpu_grads.blocks[li].d_mha.d_w_k.d_w, &gpu_g_w_k);
+        assert!(err_q < 5e-2, "rope g_w_q layer {li} err {err_q}");
+        assert!(err_k < 5e-2, "rope g_w_k layer {li} err {err_k}");
+    }
+    let gpu_g_w_tok = gpu_model.p.g_w_tok.download(&gpu_model.ctx);
+    let err_tok = max_rel_err(&cpu_grads.embed.d_w_tok, &gpu_g_w_tok);
+    assert!(err_tok < 5e-2, "rope g_w_tok err {err_tok}");
+
+    // RoPE replaces the learned positional table — its gradient must be
+    // exactly zero on both backends.
+    let gpu_g_w_pos = gpu_model.p.g_w_pos.download(&gpu_model.ctx);
+    assert!(gpu_g_w_pos.iter().all(|&g| g == 0.0), "GPU g_w_pos nonzero under rope");
+    assert!(
+        cpu_grads.embed.d_w_pos.iter().all(|&g| g == 0.0),
+        "CPU d_w_pos nonzero under rope"
+    );
+}
+
+#[test]
 fn full_transformer_training_step_matches_cpu_direction() {
     // We verify: after 1 GPU train step, params change in the same
     // direction as 1 CPU train step (loss decreases for both).
@@ -617,6 +677,7 @@ fn full_transformer_training_step_matches_cpu_direction() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
@@ -734,6 +795,7 @@ fn evaluate_gpu_matches_cpu_evaluate() {
         n_head: 4,
         d_ff: 64,
         seq_len_max: 32,
+        rope: false,
     };
     let cpu = DecoderTransformer::new(cfg.clone(), &mut rng);
     let gpu = DecoderTransformerGpu::from_cpu(&cpu, ctx, 1);
@@ -802,6 +864,7 @@ fn train_step_loss_matches_cpu_baseline() {
         n_head: 2,
         d_ff: 32,
         seq_len_max: 16,
+        rope: false,
     };
     let cpu = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut gpu = DecoderTransformerGpu::from_cpu(&cpu, ctx, 1);
@@ -843,6 +906,7 @@ fn train_step_batch_matches_sequential() {
         n_head: 2,
         d_ff: 32,
         seq_len_max: 16,
+        rope: false,
     };
     let cpu = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -934,6 +998,7 @@ fn muon_hybrid_step_matches_cpu() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
@@ -1011,6 +1076,7 @@ fn gpu_muon_hybrid_drops_loss_on_overfit() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);

@@ -6,17 +6,18 @@
     clippy::too_many_lines
 )]
 
-//! AURORA03 checkpoint format for the decoder-only transformer.
+//! AURORA04 checkpoint format for the decoder-only transformer.
 //!
 //! Binary layout (little-endian):
 //! ```text
-//! magic       : [u8; 8] = b"AURORA03"
+//! magic       : [u8; 8] = b"AURORA04"
 //! vocab       : u32
 //! d_model     : u32
 //! n_layer     : u32
 //! n_head      : u32
 //! d_ff        : u32
 //! seq_len_max : u32
+//! flags       : u32   (bit 0 = rope; w_pos is stored either way)
 //! epoch       : u32
 //! step        : u64
 //!
@@ -49,7 +50,9 @@ use rand::SeedableRng;
 
 use crate::transformer::{DecoderTransformer, TransformerConfig};
 
-const MAGIC: &[u8; 8] = b"AURORA03";
+const MAGIC: &[u8; 8] = b"AURORA04";
+
+const FLAG_ROPE: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
@@ -75,6 +78,7 @@ pub fn save<P: AsRef<Path>>(
     write_u32(&mut w, model.config.n_head as u32)?;
     write_u32(&mut w, model.config.d_ff as u32)?;
     write_u32(&mut w, model.config.seq_len_max as u32)?;
+    write_u32(&mut w, if model.config.rope { FLAG_ROPE } else { 0 })?;
     write_u32(&mut w, epoch)?;
     write_u64(&mut w, step)?;
 
@@ -107,7 +111,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     if &magic != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bad checkpoint magic — expected AURORA03",
+            "bad checkpoint magic — expected AURORA04",
         ));
     }
     let vocab = read_u32(&mut r)? as usize;
@@ -116,6 +120,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     let n_head = read_u32(&mut r)? as usize;
     let d_ff = read_u32(&mut r)? as usize;
     let seq_len_max = read_u32(&mut r)? as usize;
+    let flags = read_u32(&mut r)?;
     let epoch = read_u32(&mut r)?;
     let step = read_u64(&mut r)?;
 
@@ -126,6 +131,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
         n_head,
         d_ff,
         seq_len_max,
+        rope: flags & FLAG_ROPE != 0,
     };
 
     let mut rng = StdRng::seed_from_u64(0);

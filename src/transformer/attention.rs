@@ -17,7 +17,7 @@
 use rand::Rng;
 
 use crate::attention::{
-    linear_backward, linear_forward, scaled_dot_product_attention,
+    linear_backward, linear_forward, rope_rotate, scaled_dot_product_attention,
     scaled_dot_product_attention_backward, AttentionCache, LinearGrads, LinearProj,
 };
 
@@ -30,6 +30,10 @@ pub struct MhaWeights {
     pub n_head: usize,
     pub d_head: usize,
     pub d_model: usize,
+    /// Apply rotary position embedding to Q/K after projection. The
+    /// cached q/k (and any KV history built from them) hold the
+    /// already-rotated values.
+    pub rope: bool,
 }
 
 impl MhaWeights {
@@ -47,6 +51,7 @@ impl MhaWeights {
             n_head,
             d_head,
             d_model,
+            rope: false,
         }
     }
 }
@@ -96,16 +101,22 @@ pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
     debug_assert_eq!(x.len() % d, 0);
     let t = x.len() / d;
 
-    let q = linear_forward(&w.w_q, x);
-    let k = linear_forward(&w.w_k, x);
+    let mut q = linear_forward(&w.w_q, x);
+    let mut k = linear_forward(&w.w_k, x);
     let v = linear_forward(&w.w_v, x);
+    if w.rope {
+        rope_rotate(&mut q, n_head, d_head, 0, false);
+        rope_rotate(&mut k, n_head, d_head, 0, false);
+    }
 
     let mut heads_out = vec![0.0_f32; t * d];
     let mut attn_caches = Vec::with_capacity(n_head);
+    // Per-head scratch reused across heads (every element is overwritten
+    // by the gather loop below).
+    let mut q_h = vec![0.0_f32; t * d_head];
+    let mut k_h = vec![0.0_f32; t * d_head];
+    let mut v_h = vec![0.0_f32; t * d_head];
     for h in 0..n_head {
-        let mut q_h = vec![0.0_f32; t * d_head];
-        let mut k_h = vec![0.0_f32; t * d_head];
-        let mut v_h = vec![0.0_f32; t * d_head];
         for ti in 0..t {
             let src_off = ti * d + h * d_head;
             let dst_off = ti * d_head;
@@ -155,11 +166,11 @@ pub fn causal_mha_backward(
     let mut d_q = vec![0.0_f32; t * d];
     let mut d_k = vec![0.0_f32; t * d];
     let mut d_v = vec![0.0_f32; t * d];
+    let mut q_h = vec![0.0_f32; t * d_head];
+    let mut k_h = vec![0.0_f32; t * d_head];
+    let mut v_h = vec![0.0_f32; t * d_head];
+    let mut d_out_h = vec![0.0_f32; t * d_head];
     for h in 0..n_head {
-        let mut q_h = vec![0.0_f32; t * d_head];
-        let mut k_h = vec![0.0_f32; t * d_head];
-        let mut v_h = vec![0.0_f32; t * d_head];
-        let mut d_out_h = vec![0.0_f32; t * d_head];
         for ti in 0..t {
             let src_off = ti * d + h * d_head;
             let dst_off = ti * d_head;
@@ -186,6 +197,13 @@ pub fn causal_mha_backward(
             d_v[dst_off..dst_off + d_head]
                 .copy_from_slice(&dv_h[src_off..src_off + d_head]);
         }
+    }
+
+    // d_q/d_k are gradients w.r.t. the rotated q/k; map them back
+    // through the (orthogonal) rotation before the projection backward.
+    if w.rope {
+        rope_rotate(&mut d_q, n_head, d_head, 0, true);
+        rope_rotate(&mut d_k, n_head, d_head, 0, true);
     }
 
     let dx_q = linear_backward(&w.w_q, &cache.x, &d_q, &mut grads.d_w_q);

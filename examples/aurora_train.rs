@@ -37,7 +37,6 @@ use aurora::checkpoint;
 use aurora::gpu::{DecoderTransformerGpu, GpuContext};
 use aurora::optimizer::{AdamWConfig, MuonConfig};
 use aurora::text_io::{bits_per_byte, load_corpus, sample_token};
-use aurora::transformer::loss::softmax;
 #[cfg(feature = "viz")]
 use aurora::transformer::ForwardCache;
 use aurora::transformer::{
@@ -75,6 +74,8 @@ struct Cli {
     viz: bool,
     muon_lr: f32,
     muon_momentum: f32,
+    muon_wd: f32,
+    rope: bool,
 }
 
 impl Cli {
@@ -103,6 +104,8 @@ impl Cli {
         let mut viz: bool = false;
         let mut muon_lr: f32 = 0.02;
         let mut muon_momentum: f32 = 0.95;
+        let mut muon_wd: f32 = 0.0;
+        let mut rope: bool = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -215,6 +218,14 @@ impl Cli {
                     muon_momentum = val(i, arg)?.parse().map_err(|e| format!("--muon-momentum: {e}"))?;
                     i += 2;
                 }
+                "--muon-wd" => {
+                    muon_wd = val(i, arg)?.parse().map_err(|e| format!("--muon-wd: {e}"))?;
+                    i += 2;
+                }
+                "--rope" => {
+                    rope = true;
+                    i += 1;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
@@ -259,6 +270,8 @@ impl Cli {
             viz,
             muon_lr,
             muon_momentum,
+            muon_wd,
+            rope,
         })
     }
 }
@@ -335,6 +348,7 @@ fn main() -> ExitCode {
                 && ckpt.model.config.n_layer == cli.n_layer
                 && ckpt.model.config.n_head == cli.n_head
                 && ckpt.model.config.d_ff == cli.d_ff
+                && ckpt.model.config.rope == cli.rope
             {
                 println!(
                     "resuming from {} (epoch {}, step {})",
@@ -355,6 +369,7 @@ fn main() -> ExitCode {
                     n_head: cli.n_head,
                     d_ff: cli.d_ff,
                     seq_len_max: cli.seq_len,
+                    rope: cli.rope,
                 };
                 (DecoderTransformer::new(cfg, &mut rng), 0, 0u64)
             }
@@ -368,6 +383,7 @@ fn main() -> ExitCode {
                 n_head: cli.n_head,
                 d_ff: cli.d_ff,
                 seq_len_max: cli.seq_len,
+                rope: cli.rope,
             };
             (DecoderTransformer::new(cfg, &mut rng), 0, 0u64)
         }
@@ -633,13 +649,14 @@ fn run_training_loop(mut ctx: TrainCtx) {
             let muon_cfg = MuonConfig {
                 lr: muon_lr_t,
                 momentum: ctx.cli.muon_momentum,
-                weight_decay: 0.0,
+                weight_decay: ctx.cli.muon_wd,
                 ..MuonConfig::default()
             };
 
             // The pre-clip grad norm is only displayed on report steps
             // (and every step under viz). On other steps we skip the
             // GPU→host readback that fetching it would force.
+            #[cfg(feature = "gpu")]
             let want_grad_norm = (chunk_idx + 1).is_multiple_of(report_every) || ctx.cli.viz;
 
             // Build the batch: one window per stream.
@@ -824,6 +841,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
         }
 
         let train_bpb = bits_per_byte(total_nats, (total_tokens as f32 * ctx.comp) as usize);
+        let eval_start = Instant::now();
         #[cfg(feature = "gpu")]
         let val_bpb = if let Some(gpu) = ctx.gpu_backend.as_ref() {
             evaluate_gpu(gpu, val_toks, ctx.cli.seq_len, ctx.comp)
@@ -832,15 +850,16 @@ fn run_training_loop(mut ctx: TrainCtx) {
         };
         #[cfg(not(feature = "gpu"))]
         let val_bpb = evaluate(&ctx.model, val_toks, ctx.cli.seq_len, ctx.comp);
+        let eval_s = eval_start.elapsed().as_secs_f64();
         if val_bpb < best_val {
             best_val = val_bpb;
         }
         let epoch_elapsed = epoch_start.elapsed().as_secs_f64();
         println!(
-            "  done   train bpb {train_bpb:.3}  val bpb {val_bpb:.3}  {epoch_elapsed:.1}s"
+            "  done   train bpb {train_bpb:.3}  val bpb {val_bpb:.3}  {epoch_elapsed:.1}s (eval {eval_s:.1}s)"
         );
         if let Some(m) = metrics.as_mut() {
-            m.epoch_done(epoch, train_bpb, val_bpb, epoch_elapsed);
+            m.epoch_done(epoch, train_bpb, val_bpb, epoch_elapsed, eval_s);
         }
 
         if let Err(e) = checkpoint::save(&ctx.cli.checkpoint, &ctx.model, epoch + 1, ctx.step) {
@@ -1042,36 +1061,59 @@ fn load_or_train_bpe(
     }
 }
 
+/// Window starts for overlapping-window eval (stride = seq_len/2).
+/// Window `wi` scores positions `scored_from(wi)..seq_len`, so every
+/// scored token sees at least seq_len/2 context. Non-overlapping
+/// windows score early positions with near-zero context and inflate
+/// BPB by ~0.05–0.15.
+fn eval_windows(val_len: usize, seq_len: usize) -> (Vec<usize>, usize) {
+    let stride = (seq_len / 2).max(1);
+    let mut starts = Vec::new();
+    let mut p = 0;
+    while p + seq_len + 1 < val_len {
+        starts.push(p);
+        p += stride;
+    }
+    (starts, seq_len - stride)
+}
+
 /// Compute val BPB by sliding a window of length `seq_len` over `val_toks`.
+/// Windows are scored in parallel (forward is `&self`); per-row scoring
+/// uses logsumexp directly — no per-position softmax allocation.
 fn evaluate(model: &DecoderTransformer, val_toks: &[u32], seq_len: usize, comp: f32) -> f32 {
+    use rayon::prelude::*;
     if val_toks.len() <= seq_len + 1 {
         return f32::INFINITY;
     }
-    let stride = seq_len;
-    let mut total_nats = 0.0_f32;
-    let mut total_tokens = 0_usize;
-    let mut p = 0;
-    while p + seq_len + 1 < val_toks.len() {
-        let input = &val_toks[p..p + seq_len];
-        let target = &val_toks[p + 1..p + seq_len + 1];
-        let (logits, _) = model.forward(input);
-        let v = model.config.vocab;
-        for ti in 0..seq_len {
-            let row = &logits[ti * v..(ti + 1) * v];
-            let probs = softmax(row);
-            let p_t = probs[target[ti] as usize].max(1e-12);
-            total_nats += -p_t.ln();
-            total_tokens += 1;
-        }
-        p += stride;
-    }
+    let (starts, scored_tail) = eval_windows(val_toks.len(), seq_len);
+    let v = model.config.vocab;
+    let (total_nats, total_tokens) = starts
+        .par_iter()
+        .enumerate()
+        .map(|(wi, &p)| {
+            let scored_from = if wi == 0 { 0 } else { scored_tail };
+            let input = &val_toks[p..p + seq_len];
+            let target = &val_toks[p + 1..p + seq_len + 1];
+            let (logits, _) = model.forward(input);
+            let mut nats = 0.0_f32;
+            for ti in scored_from..seq_len {
+                let row = &logits[ti * v..(ti + 1) * v];
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+                let logp =
+                    (row[target[ti] as usize] - max - sum.ln()).max(-27.631_021);
+                nats += -logp;
+            }
+            (nats, seq_len - scored_from)
+        })
+        .reduce(|| (0.0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
     bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize)
 }
 
-/// GPU equivalent of `evaluate`. Sliding window is identical (stride =
-/// seq_len), but each window runs forward + softmax_ce on the GPU and
-/// only T floats per window are read back. Avoids the per-epoch
-/// `to_cpu()` round-trip on the eval critical path.
+/// GPU equivalent of `evaluate`. Same overlapping-window scoring, but
+/// windows run in batches of `gpu.max_batch` — one command encoder /
+/// submit / readback per batch instead of per window, so the host↔device
+/// round-trip (a full device stall) is paid B× less often.
 #[cfg(feature = "gpu")]
 fn evaluate_gpu(
     gpu: &DecoderTransformerGpu,
@@ -1082,16 +1124,22 @@ fn evaluate_gpu(
     if val_toks.len() <= seq_len + 1 {
         return f32::INFINITY;
     }
-    let stride = seq_len;
+    let (starts, scored_tail) = eval_windows(val_toks.len(), seq_len);
     let mut total_nats = 0.0_f32;
     let mut total_tokens = 0_usize;
-    let mut p = 0;
-    while p + seq_len + 1 < val_toks.len() {
-        let input = &val_toks[p..p + seq_len];
-        let target = &val_toks[p + 1..p + seq_len + 1];
-        total_nats += gpu.eval_step(input, target);
-        total_tokens += seq_len;
-        p += stride;
+    for (ci, chunk) in starts.chunks(gpu.max_batch).enumerate() {
+        let inputs: Vec<&[u32]> =
+            chunk.iter().map(|&p| &val_toks[p..p + seq_len]).collect();
+        let tgts: Vec<&[u32]> =
+            chunk.iter().map(|&p| &val_toks[p + 1..p + seq_len + 1]).collect();
+        let nlls = gpu.eval_step_batch(&inputs, &tgts);
+        for wi in 0..chunk.len() {
+            let scored_from = if ci == 0 && wi == 0 { 0 } else { scored_tail };
+            total_nats += nlls[wi * seq_len + scored_from..(wi + 1) * seq_len]
+                .iter()
+                .sum::<f32>();
+            total_tokens += seq_len - scored_from;
+        }
     }
     bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize)
 }
@@ -1141,18 +1189,20 @@ fn print_header(
     println!(" tokens       : {n_tokens} (BPE vocab {actual_vocab}, encode {encode_s:.1}s)");
     println!(" train / val  : {n_train} / {n_val}");
     println!(
-        " model        : d={} L={} h={} dff={} ctx={}",
-        cli.d_model, cli.n_layer, cli.n_head, cli.d_ff, cli.seq_len
+        " model        : d={} L={} h={} dff={} ctx={} pos={}",
+        cli.d_model, cli.n_layer, cli.n_head, cli.d_ff, cli.seq_len,
+        if cli.rope { "rope" } else { "learned" }
     );
     println!(
-        " optim        : muon hybrid | matrix lr {:.2e}, momentum {} | embed/LN adamw lr {:.2e} → {:.2e}",
+        " optim        : muon hybrid | matrix lr {:.2e}, momentum {}, wd {} | embed/LN adamw lr {:.2e} → {:.2e}",
         cli.muon_lr,
         cli.muon_momentum,
+        cli.muon_wd,
         cli.lr,
         cli.min_lr,
     );
     println!(
-        "              : warmup {} step, wd {}, clip {}",
+        "              : warmup {} step, adamw wd {}, clip {}",
         cli.warmup_steps, cli.weight_decay, cli.grad_clip
     );
     println!(" epochs       : {} (from {start_epoch}) batch {}", cli.epochs, cli.batch_size);
@@ -1205,12 +1255,12 @@ impl MetricsWriter {
         params: usize,
     ) {
         let line = format!(
-            "{{\"event\":\"run\",\"corpus\":\"{}\",\"corpus_bytes\":{corpus_bytes},\"tokens\":{n_tokens},\"vocab\":{actual_vocab},\"d_model\":{},\"n_layer\":{},\"n_head\":{},\"d_ff\":{},\"seq_len\":{},\"batch_size\":{},\"epochs\":{},\"start_epoch\":{start_epoch},\"lr\":{:.6e},\"min_lr\":{:.6e},\"warmup_steps\":{},\"weight_decay\":{},\"grad_clip\":{},\"seed\":{},\"backend\":\"{backend}\",\"params\":{params},\"optimizer\":\"muon\",\"muon_lr\":{:.6e},\"muon_momentum\":{}}}\n",
+            "{{\"event\":\"run\",\"corpus\":\"{}\",\"corpus_bytes\":{corpus_bytes},\"tokens\":{n_tokens},\"vocab\":{actual_vocab},\"d_model\":{},\"n_layer\":{},\"n_head\":{},\"d_ff\":{},\"seq_len\":{},\"batch_size\":{},\"epochs\":{},\"start_epoch\":{start_epoch},\"lr\":{:.6e},\"min_lr\":{:.6e},\"warmup_steps\":{},\"weight_decay\":{},\"grad_clip\":{},\"seed\":{},\"backend\":\"{backend}\",\"params\":{params},\"optimizer\":\"muon\",\"muon_lr\":{:.6e},\"muon_momentum\":{},\"muon_wd\":{},\"rope\":{}}}\n",
             cli.corpus.display(),
             cli.d_model, cli.n_layer, cli.n_head, cli.d_ff, cli.seq_len,
             cli.batch_size, cli.epochs, cli.lr, cli.min_lr, cli.warmup_steps,
             cli.weight_decay, cli.grad_clip, cli.seed,
-            cli.muon_lr, cli.muon_momentum,
+            cli.muon_lr, cli.muon_momentum, cli.muon_wd, cli.rope,
         );
         let _ = self.inner.write_all(line.as_bytes());
         self.flush();
@@ -1225,10 +1275,10 @@ impl MetricsWriter {
         self.flush();
     }
 
-    fn epoch_done(&mut self, epoch: u32, train_bpb: f32, val_bpb: f32, elapsed_s: f64) {
+    fn epoch_done(&mut self, epoch: u32, train_bpb: f32, val_bpb: f32, elapsed_s: f64, eval_s: f64) {
         let line = format!(
-            "{{\"event\":\"epoch_done\",\"epoch\":{epoch},\"train_bpb\":{},\"val_bpb\":{},\"elapsed_s\":{:.3}}}\n",
-            json_f32(train_bpb), json_f32(val_bpb), elapsed_s
+            "{{\"event\":\"epoch_done\",\"epoch\":{epoch},\"train_bpb\":{},\"val_bpb\":{},\"elapsed_s\":{:.3},\"eval_s\":{:.3}}}\n",
+            json_f32(train_bpb), json_f32(val_bpb), elapsed_s, eval_s
         );
         let _ = self.inner.write_all(line.as_bytes());
         self.flush();

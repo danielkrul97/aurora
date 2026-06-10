@@ -19,8 +19,8 @@ use super::{
     GpuContext, GradNormFinalizeKernel, GradNormSqReduceKernel, LayerNormBackwardKernel,
     LayerNormForwardKernel, MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel,
     MuonLoadStoreKernel, MuonMomentumKernel, MuonStepXKernel, OuterProductAccumKernel,
-    RowReduceAddKernel, ScaleByBufferKernel, SoftmaxCrossEntropyKernel, TokenPosEmbedKernel,
-    VectorAddKernel, ZeroBufferKernel,
+    RopeKernel, RowReduceAddKernel, ScaleByBufferKernel, SoftmaxCrossEntropyKernel,
+    TokenPosEmbedKernel, VectorAddKernel, ZeroBufferKernel,
 };
 use crate::optimizer::{bias_correction, AdamWConfig, MuonConfig};
 use crate::transformer::{DecoderTransformer, TransformerConfig};
@@ -31,6 +31,10 @@ pub struct DecoderTransformerGpu {
     pub ctx: GpuContext,
     pub config: TransformerConfig,
     pub step: u64,
+    /// Capacity of the shared B·T token/target/loss buffers — the max
+    /// number of sequences `train_step_batch` / `eval_step_batch` can
+    /// take per call.
+    pub max_batch: usize,
 
     // Kernels (cheap to keep around — pipelines are Arc<>).
     pub gemm: GemmKernel,
@@ -61,6 +65,7 @@ pub struct DecoderTransformerGpu {
     pub single_embed: SingleTokenEmbedKernel,
     pub mha_kv: MhaKvCacheKernel,
     pub softmax_ce: SoftmaxCrossEntropyKernel,
+    pub rope: RopeKernel,
 
     // Pure-GPU clip_grads scratch:
     //   gn_partials_flat — concatenated per-tensor partial sums of squares
@@ -118,6 +123,8 @@ pub(crate) struct LayerForwardOps {
     pub gemm_q: wgpu::BindGroup,
     pub gemm_k: wgpu::BindGroup,
     pub gemm_v: wgpu::BindGroup,
+    pub rope_q: wgpu::BindGroup,
+    pub rope_k: wgpu::BindGroup,
     pub mha: wgpu::BindGroup,
     pub gemm_o: wgpu::BindGroup,
     pub vadd_post_attn: wgpu::BindGroup,
@@ -135,6 +142,10 @@ pub(crate) struct BackwardOps {
     pub layers: Vec<LayerBackwardOps>,
     pub embed_bwd: wgpu::BindGroup,
     pub embed_scatter_reduce: wgpu::BindGroup,
+    /// dq/dk are shared backward scratch, so one inverse-rope bind each
+    /// serves every layer.
+    pub rope_dq: wgpu::BindGroup,
+    pub rope_dk: wgpu::BindGroup,
 }
 
 pub(crate) struct LayerBackwardOps {
@@ -456,6 +467,7 @@ fn build_forward_ops(
     mha_fwd: &CausalMhaForwardKernel,
     gelu_fwd: &GeluKernel,
     vadd: &VectorAddKernel,
+    rope: &RopeKernel,
 ) -> ForwardOps {
     let embed = embed_fwd.build_bind(ctx, &a.tok_buf, &p.w_tok, &p.w_pos, &a.h0);
     let layers: Vec<LayerForwardOps> = (0..cfg.n_layer)
@@ -471,6 +483,8 @@ fn build_forward_ops(
                 gemm_q: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_q, &lc.q),
                 gemm_k: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_k, &lc.k),
                 gemm_v: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_v, &lc.v),
+                rope_q: rope.build_bind(ctx, &lc.q),
+                rope_k: rope.build_bind(ctx, &lc.k),
                 mha: mha_fwd.build_bind(ctx, &lc.q, &lc.k, &lc.v, &lc.heads_out, &lc.head_probs),
                 gemm_o: gemm_t.build_bind(ctx, &lc.heads_out, &blk.w_o, &a.mha_out),
                 vadd_post_attn: vadd.build_bind(ctx, x, &a.mha_out, &a.post_attn),
@@ -508,6 +522,7 @@ fn build_backward_ops(
     embed_bwd_k: &EmbedScatterAddKernel,
     embed_scatter_reduce: &EmbedScatterReduceKernel,
     zerob: &ZeroBufferKernel,
+    rope: &RopeKernel,
 ) -> BackwardOps {
     let gemm_d_h_final = gemm.build_bind(ctx, &a.d_logits_buf, &p.w_tok, &a.d_h_final);
     let outer_g_w_tok = outer_accum.build_bind(ctx, &a.h_final, &a.d_logits_buf, &p.g_w_tok);
@@ -577,6 +592,8 @@ fn build_backward_ops(
         layers,
         embed_bwd,
         embed_scatter_reduce,
+        rope_dq: rope.build_bind(ctx, &a.dq),
+        rope_dk: rope.build_bind(ctx, &a.dk),
     }
 }
 
@@ -702,7 +719,10 @@ fn build_muon_ops(
             rows,
             cols,
             n: rows * cols,
-            apply_wd: false,
+            // All Muon-managed tensors are matrices; decoupled WD applies
+            // to every one. With weight_decay == 0 the shader add is a
+            // no-op, so the trainer's --muon-wd flag fully controls it.
+            apply_wd: true,
             momentum_bind: momentum.build_bind(ctx, grad, m, &scratch.update),
             apply_bind: apply.build_bind(ctx, param, &scratch.update),
         });
@@ -847,6 +867,7 @@ impl DecoderTransformerGpu {
         let single_embed = SingleTokenEmbedKernel::new(&ctx);
         let mha_kv = MhaKvCacheKernel::new(&ctx);
         let softmax_ce = SoftmaxCrossEntropyKernel::new(&ctx);
+        let rope = RopeKernel::new(&ctx);
 
         let grad_ops =
             build_grad_ops(&ctx, &p, &cfg, &zerob, &adamw, &gn_sq, &scaleb_buf,
@@ -862,12 +883,12 @@ impl DecoderTransformerGpu {
         let acts = Activations::new(&ctx, &cfg, max_batch);
         let fwd_ops = build_forward_ops(
             &ctx, &p, &acts, &cfg,
-            &embed_fwd, &ln_fwd, &gemm_t, &mha_fwd, &gelu_fwd, &vadd,
+            &embed_fwd, &ln_fwd, &gemm_t, &mha_fwd, &gelu_fwd, &vadd, &rope,
         );
         let bwd_ops = build_backward_ops(
             &ctx, &p, &acts, &cfg,
             &gemm, &ln_bwd, &mha_bwd, &gelu_bwd, &vadd, &outer_accum,
-            &embed_bwd, &embed_scatter_reduce, &zerob,
+            &embed_bwd, &embed_scatter_reduce, &zerob, &rope,
         );
 
         Self {
@@ -899,11 +920,13 @@ impl DecoderTransformerGpu {
             single_embed,
             mha_kv,
             softmax_ce,
+            rope,
             gn_partials_flat,
             gn_result,
             ctx,
             config: cfg,
             step: cpu.step,
+            max_batch: max_batch.max(1),
             p,
             grad_ops,
             gn_finalize_bind,
@@ -1071,7 +1094,7 @@ impl DecoderTransformerGpu {
             pass.set_pipeline(&self.embed_fwd.pipeline);
             self.embed_fwd.dispatch_with_bind(
                 &mut pass, &self.fwd_ops.embed,
-                t_u, d_u, v as u32, cfg.seq_len_max as u32, tok_offset,
+                t_u, d_u, v as u32, cfg.seq_len_max as u32, tok_offset, !cfg.rope,
             );
         }
 
@@ -1095,6 +1118,19 @@ impl DecoderTransformerGpu {
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_q, t_u, d_u, d_u);
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_k, t_u, d_u, d_u);
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_v, t_u, d_u, d_u);
+            }
+            // RoPE — in-place rotation of q and k (disjoint buffers, one pass).
+            if cfg.rope {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rope qk"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.rope.pipeline);
+                self.rope.dispatch_with_bind(
+                    &mut pass, &fop.rope_q, t_u, n_head as u32, d_head as u32, 0, false,
+                );
+                self.rope.dispatch_with_bind(
+                    &mut pass, &fop.rope_k, t_u, n_head as u32, d_head as u32, 0, false,
+                );
             }
             // mha
             {
@@ -1344,7 +1380,7 @@ impl DecoderTransformerGpu {
             pass.set_pipeline(&self.embed_bwd.pipeline);
             self.embed_bwd.dispatch_with_bind(
                 &mut pass, &self.bwd_ops.embed_bwd,
-                t_u, d_u, v as u32, cfg.seq_len_max as u32, tok_offset,
+                t_u, d_u, v as u32, cfg.seq_len_max as u32, tok_offset, !cfg.rope,
             );
         }
         {
@@ -1367,6 +1403,68 @@ impl DecoderTransformerGpu {
     /// `&self` (no mutation): safe to call any number of times between
     /// train steps without disturbing optimizer / gradient state.
     pub fn eval_step(&self, tokens: &[u32], targets: &[u32]) -> f32 {
+        self.eval_step_per_token(tokens, targets).iter().sum()
+    }
+
+    /// Batched eval: forward + softmax_ce for up to `max_batch` windows
+    /// in a single command encoder / submit / readback, mirroring
+    /// `train_step_batch`. Each window reuses the shared activation
+    /// arena (wgpu hazard tracking serializes them); per-token NLLs land
+    /// at window offsets in `loss_seq_buf`. Returns B·T nats — caller
+    /// slices per window. ~B× fewer device round-trips than calling
+    /// `eval_step_per_token` per window.
+    pub fn eval_step_batch(&self, inputs: &[&[u32]], targets: &[&[u32]]) -> Vec<f32> {
+        let b = inputs.len();
+        debug_assert_eq!(targets.len(), b);
+        debug_assert!(b <= self.max_batch, "eval batch {b} > capacity {}", self.max_batch);
+        if b == 0 {
+            return Vec::new();
+        }
+        let t = inputs[0].len();
+        let v = self.config.vocab;
+
+        let mut tok_flat: Vec<u32> = Vec::with_capacity(b * t);
+        let mut tgt_flat: Vec<u32> = Vec::with_capacity(b * t);
+        for i in 0..b {
+            debug_assert_eq!(inputs[i].len(), t);
+            debug_assert_eq!(targets[i].len(), t);
+            tok_flat.extend_from_slice(inputs[i]);
+            tgt_flat.extend_from_slice(targets[i]);
+        }
+        self.acts.tok_buf.upload_u32_prefix(&self.ctx, &tok_flat);
+        self.acts.targets_buf.upload_u32_prefix(&self.ctx, &tgt_flat);
+
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("eval batch"),
+            });
+        for bi in 0..b {
+            let off = (bi * t) as u32;
+            self.encode_forward(&mut enc, t, off);
+            self.softmax_ce.dispatch_into(
+                &self.ctx,
+                &mut enc,
+                &self.acts.logits_buf,
+                &self.acts.d_logits_buf,
+                &self.acts.loss_seq_buf,
+                &self.acts.targets_buf,
+                v as u32,
+                t as u32,
+                1,
+                1.0,
+                off,
+            );
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+
+        self.acts.loss_seq_buf.download_prefix(&self.ctx, b * t)
+    }
+
+    /// Per-position NLL (nats) for one window. Lets callers score only
+    /// a suffix of the window, as overlapping-window eval requires.
+    pub fn eval_step_per_token(&self, tokens: &[u32], targets: &[u32]) -> Vec<f32> {
         let cfg = self.config.clone();
         let t = tokens.len();
         let v = cfg.vocab;
@@ -1402,8 +1500,7 @@ impl DecoderTransformerGpu {
         );
         self.ctx.queue.submit(Some(enc.finish()));
 
-        let loss_per_t = self.acts.loss_seq_buf.download_prefix(&self.ctx, t);
-        loss_per_t.iter().sum()
+        self.acts.loss_seq_buf.download_prefix(&self.ctx, t)
     }
 
     fn block_backward(
@@ -1489,6 +1586,21 @@ impl DecoderTransformerGpu {
             enc, &bop.mha_bwd_dscores, &bop.mha_bwd_dq, &bop.mha_bwd_dkv,
             t_u, n_head as u32, d_head as u32,
         );
+
+        // dq/dk are gradients w.r.t. the rotated q/k — apply the inverse
+        // rotation before they feed the projection backward below.
+        if self.config.rope {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rope bwd dqk"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.rope.pipeline);
+            self.rope.dispatch_with_bind(
+                &mut pass, &self.bwd_ops.rope_dq, t_u, n_head as u32, d_head as u32, 0, true,
+            );
+            self.rope.dispatch_with_bind(
+                &mut pass, &self.bwd_ops.rope_dk, t_u, n_head as u32, d_head as u32, 0, true,
+            );
+        }
 
         // dx_q, dx_k, dx_v — all read distinct dq/dk/dv, write disjoint
         // dx_q/k/v. Safe in one pass.
@@ -1959,7 +2071,7 @@ impl DecoderTransformerGpu {
             });
         self.single_embed.dispatch_into(
             &self.ctx, &mut enc, &self.p.w_tok, &self.p.w_pos, &h_cur,
-            d as u32, v_dim as u32, cfg.seq_len_max as u32, new_token, pos as u32,
+            d as u32, v_dim as u32, cfg.seq_len_max as u32, new_token, pos as u32, !cfg.rope,
         );
 
         let mha_scratch = GpuBuffer::empty(&self.ctx, "step_scratch", n_head * cache.max_len);
@@ -1985,6 +2097,10 @@ impl DecoderTransformerGpu {
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_q, &q_new, 1, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_k, &k_new, 1, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_v, &v_new, 1, d as u32, d as u32);
+            if cfg.rope {
+                self.rope.dispatch_into(&self.ctx, &mut enc, &q_new, 1, n_head as u32, d_head as u32, pos as u32, false);
+                self.rope.dispatch_into(&self.ctx, &mut enc, &k_new, 1, n_head as u32, d_head as u32, pos as u32, false);
+            }
             let row_bytes = (d * std::mem::size_of::<f32>()) as u64;
             let dst_offset = (pos * d * std::mem::size_of::<f32>()) as u64;
             enc.copy_buffer_to_buffer(&k_new.inner, 0, &kv.k_history.inner, dst_offset, row_bytes);
@@ -2065,7 +2181,7 @@ impl DecoderTransformerGpu {
             });
         self.embed_fwd.dispatch_into(
             &self.ctx, &mut enc, &tok_buf, &self.p.w_tok, &self.p.w_pos, &h0,
-            t as u32, d as u32, v as u32, cfg.seq_len_max as u32,
+            t as u32, d as u32, v as u32, cfg.seq_len_max as u32, !cfg.rope,
         );
         self.ctx.queue.submit(Some(enc.finish()));
 
@@ -2094,6 +2210,10 @@ impl DecoderTransformerGpu {
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_q, &q, t as u32, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_k, &k, t as u32, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_v, &val, t as u32, d as u32, d as u32);
+            if cfg.rope {
+                self.rope.dispatch_into(&self.ctx, &mut enc, &q, t as u32, n_head as u32, d_head as u32, 0, false);
+                self.rope.dispatch_into(&self.ctx, &mut enc, &k, t as u32, n_head as u32, d_head as u32, 0, false);
+            }
 
             // Heads_out via single MHA dispatch — n_head heads collapsed into wg.y.
             let heads_out = GpuBuffer::empty(&self.ctx, "heads", t * d);

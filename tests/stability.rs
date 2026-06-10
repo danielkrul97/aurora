@@ -22,6 +22,7 @@ fn tiny_model(seed: u64) -> (DecoderTransformer, TransformerConfig) {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 32,
+        rope: false,
     };
     let mut rng = StdRng::seed_from_u64(seed);
     (DecoderTransformer::new(cfg.clone(), &mut rng), cfg)

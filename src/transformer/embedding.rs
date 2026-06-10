@@ -24,6 +24,10 @@ pub struct EmbedWeights {
     pub vocab: usize,
     pub d_model: usize,
     pub seq_len_max: usize,
+    /// False when RoPE supplies position information — w_pos stays
+    /// allocated (checkpoint layout unchanged) but is never added and
+    /// receives no gradient.
+    pub use_pos: bool,
 }
 
 impl EmbedWeights {
@@ -43,6 +47,7 @@ impl EmbedWeights {
             vocab,
             d_model,
             seq_len_max,
+            use_pos: true,
         }
     }
 }
@@ -85,9 +90,13 @@ pub fn embed_forward(w: &EmbedWeights, tokens: &[u32]) -> (Vec<f32>, EmbedCache)
         debug_assert!(tok < w.vocab, "token {tok} out of vocab");
         let dst = &mut out[ti * d..(ti + 1) * d];
         let tok_row = &w.w_tok[tok * d..(tok + 1) * d];
-        let pos_row = &w.w_pos[ti * d..(ti + 1) * d];
-        for c in 0..d {
-            dst[c] = tok_row[c] + pos_row[c];
+        if w.use_pos {
+            let pos_row = &w.w_pos[ti * d..(ti + 1) * d];
+            for c in 0..d {
+                dst[c] = tok_row[c] + pos_row[c];
+            }
+        } else {
+            dst.copy_from_slice(tok_row);
         }
     }
     (
@@ -111,29 +120,42 @@ pub fn embed_backward(w: &EmbedWeights, cache: &EmbedCache, dy: &[f32], grads: &
         for c in 0..d {
             tok_row[c] += dy_row[c];
         }
-        let pos_row = &mut grads.d_w_pos[ti * d..(ti + 1) * d];
-        for c in 0..d {
-            pos_row[c] += dy_row[c];
+        if w.use_pos {
+            let pos_row = &mut grads.d_w_pos[ti * d..(ti + 1) * d];
+            for c in 0..d {
+                pos_row[c] += dy_row[c];
+            }
         }
     }
 }
+
+/// Position-block size: each `w_tok` row is streamed once per block of
+/// positions instead of once per position (`w_tok` is the largest matrix
+/// in the model — vocab × d_model ≫ cache). Dot products are computed in
+/// the unblocked order, so results are bit-exact.
+const HEAD_BLOCK_T: usize = 8;
 
 /// Forward: `logits[t, v] = sum_c h[t, c] * w_tok[v, c]`. Tied LM head.
 #[must_use]
 pub fn tied_lm_head_forward(h: &[f32], w_tok: &[f32], vocab: usize, d_model: usize) -> Vec<f32> {
     let t = h.len() / d_model;
     let mut logits = vec![0.0_f32; t * vocab];
-    for ti in 0..t {
-        let hr = &h[ti * d_model..(ti + 1) * d_model];
-        let lr = &mut logits[ti * vocab..(ti + 1) * vocab];
+    let mut t0 = 0;
+    while t0 < t {
+        let tb = HEAD_BLOCK_T.min(t - t0);
         for v in 0..vocab {
             let wr = &w_tok[v * d_model..(v + 1) * d_model];
-            let mut acc = 0.0_f32;
-            for c in 0..d_model {
-                acc += hr[c] * wr[c];
+            for tt in 0..tb {
+                let ti = t0 + tt;
+                let hr = &h[ti * d_model..(ti + 1) * d_model];
+                let mut acc = 0.0_f32;
+                for c in 0..d_model {
+                    acc += hr[c] * wr[c];
+                }
+                logits[ti * vocab + v] = acc;
             }
-            lr[v] = acc;
         }
+        t0 += tb;
     }
     logits
 }
@@ -153,19 +175,24 @@ pub fn tied_lm_head_backward(
     let t = h.len() / d_model;
     let mut d_h = vec![0.0_f32; h.len()];
     assert_eq!(grads.d_w_tok.len(), vocab * d_model);
-    for ti in 0..t {
-        let hr = &h[ti * d_model..(ti + 1) * d_model];
-        let dlr = &d_logits[ti * vocab..(ti + 1) * vocab];
-        let dhr = &mut d_h[ti * d_model..(ti + 1) * d_model];
+    let mut t0 = 0;
+    while t0 < t {
+        let tb = HEAD_BLOCK_T.min(t - t0);
         for v in 0..vocab {
-            let g = dlr[v];
             let wr = &w_tok[v * d_model..(v + 1) * d_model];
             let dwr = &mut grads.d_w_tok[v * d_model..(v + 1) * d_model];
-            for c in 0..d_model {
-                dwr[c] += g * hr[c];
-                dhr[c] += g * wr[c];
+            for tt in 0..tb {
+                let ti = t0 + tt;
+                let g = d_logits[ti * vocab + v];
+                let hr = &h[ti * d_model..(ti + 1) * d_model];
+                let dhr = &mut d_h[ti * d_model..(ti + 1) * d_model];
+                for c in 0..d_model {
+                    dwr[c] += g * hr[c];
+                    dhr[c] += g * wr[c];
+                }
             }
         }
+        t0 += tb;
     }
     d_h
 }

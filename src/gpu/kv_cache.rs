@@ -100,7 +100,7 @@ struct P {
     seq_max: u32,
     tok: u32,
     pos: u32,
-    _p0: u32,
+    use_pos: u32,
     _p1: u32,
     _p2: u32,
 };
@@ -114,7 +114,11 @@ var<push_constant> p: P;
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c >= p.d) { return; }
-    out[c] = w_tok[p.tok * p.d + c] + w_pos[p.pos * p.d + c];
+    var v = w_tok[p.tok * p.d + c];
+    if (p.use_pos != 0u) {
+        v = v + w_pos[p.pos * p.d + c];
+    }
+    out[c] = v;
 }
 ";
 
@@ -126,7 +130,7 @@ struct SingleEmbedParams {
     seq_max: u32,
     tok: u32,
     pos: u32,
-    _p0: u32,
+    use_pos: u32,
     _p1: u32,
     _p2: u32,
 }
@@ -194,6 +198,7 @@ impl SingleTokenEmbedKernel {
         seq_max: u32,
         tok: u32,
         pos: u32,
+        use_pos: bool,
     ) {
         let p = SingleEmbedParams {
             d,
@@ -201,7 +206,7 @@ impl SingleTokenEmbedKernel {
             seq_max,
             tok,
             pos,
-            _p0: 0,
+            use_pos: u32::from(use_pos),
             _p1: 0,
             _p2: 0,
         };

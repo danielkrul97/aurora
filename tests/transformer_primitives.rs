@@ -92,6 +92,90 @@ fn mha_causal_backward_matches_numerical() {
 }
 
 #[test]
+fn mha_rope_backward_matches_numerical() {
+    let mut rng = StdRng::seed_from_u64(0x80BE);
+    let d_model = 8;
+    let n_head = 2;
+    let t = 4;
+
+    let mut w = MhaWeights::new(d_model, n_head, &mut rng);
+    w.rope = true;
+    let x = random_vec(t * d_model, &mut rng);
+    let upstream = random_vec(t * d_model, &mut rng);
+
+    let (_y, cache) = causal_mha_forward(&w, &x);
+    let mut grads = MhaGrads::zeros(d_model);
+    let dx = causal_mha_backward(&w, &cache, &upstream, &mut grads);
+
+    for i in 0..x.len() {
+        let mut xp = x.clone();
+        let mut xm = x.clone();
+        xp[i] += EPS;
+        xm[i] -= EPS;
+        let (yp, _) = causal_mha_forward(&w, &xp);
+        let (ym, _) = causal_mha_forward(&w, &xm);
+        let g = (dot(&yp, &upstream) - dot(&ym, &upstream)) / (2.0 * EPS);
+        let err = rel_err(dx[i], g);
+        assert!(err < TOL, "rope dx[{i}]: analytic {} vs numeric {} (err {err})", dx[i], g);
+    }
+
+    for i in [0, 5, 17, 31] {
+        let mut wp = w.clone();
+        let mut wm = w.clone();
+        wp.w_q.w[i] += EPS;
+        wm.w_q.w[i] -= EPS;
+        let (yp, _) = causal_mha_forward(&wp, &x);
+        let (ym, _) = causal_mha_forward(&wm, &x);
+        let g = (dot(&yp, &upstream) - dot(&ym, &upstream)) / (2.0 * EPS);
+        let err = rel_err(grads.d_w_q.d_w[i], g);
+        assert!(err < TOL, "rope dW_q[{i}]: analytic {} vs numeric {} (err {err})", grads.d_w_q.d_w[i], g);
+    }
+
+    for i in [0, 5, 17, 31] {
+        let mut wp = w.clone();
+        let mut wm = w.clone();
+        wp.w_k.w[i] += EPS;
+        wm.w_k.w[i] -= EPS;
+        let (yp, _) = causal_mha_forward(&wp, &x);
+        let (ym, _) = causal_mha_forward(&wm, &x);
+        let g = (dot(&yp, &upstream) - dot(&ym, &upstream)) / (2.0 * EPS);
+        let err = rel_err(grads.d_w_k.d_w[i], g);
+        assert!(err < TOL, "rope dW_k[{i}]: analytic {} vs numeric {} (err {err})", grads.d_w_k.d_w[i], g);
+    }
+}
+
+#[test]
+fn rope_relative_shift_invariance() {
+    // RoPE's defining property: attention scores depend only on the
+    // relative offset, so shifting the absolute window start must not
+    // change q·k for a fixed pair of (unrotated) vectors.
+    use aurora::attention::rope_rotate;
+    let mut rng = StdRng::seed_from_u64(7);
+    let n_head = 2;
+    let d_head = 4;
+    let d = n_head * d_head;
+    let q0 = random_vec(d, &mut rng);
+    let k0 = random_vec(d, &mut rng);
+
+    let score = |offset: usize| -> f32 {
+        // q at position offset+3, k at position offset+1.
+        let mut q = q0.clone();
+        let mut k = k0.clone();
+        rope_rotate(&mut q, n_head, d_head, offset + 3, false);
+        rope_rotate(&mut k, n_head, d_head, offset + 1, false);
+        dot(&q, &k)
+    };
+    let s0 = score(0);
+    for offset in [1, 10, 100] {
+        let s = score(offset);
+        assert!(
+            (s - s0).abs() < 1e-4,
+            "rope score not shift-invariant: offset {offset} gives {s} vs {s0}"
+        );
+    }
+}
+
+#[test]
 fn mha_causal_mask_blocks_future() {
     // Verify that swapping out a future token (j > i) does not change
     // output at position i. This is a structural check, not a gradient

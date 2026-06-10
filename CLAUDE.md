@@ -19,7 +19,8 @@ v overnight runu (nano-GPT scale ~10M params, GTX 1650).
   implementace v `src/viz/`). CLI flags: `--d-model --n-layer --n-head
   --d-ff --seq-len --batch-size --epochs --lr --warmup-steps
   --weight-decay --grad-clip --checkpoint --bpe --metrics --seed
-  --sample-len --sample-temp --gpu --viz`. Spouštěj přes
+  --sample-len --sample-temp --gpu --viz --rope --muon-lr
+  --muon-momentum --muon-wd`. Spouštěj přes
   `scripts/overnight.sh` nebo přímo `cargo run --release
   [--features gpu,viz] --example aurora_train -- ...`.
 - **Anti-regrese před commitem:**
@@ -41,16 +42,17 @@ v overnight runu (nano-GPT scale ~10M params, GTX 1650).
 - **JSONL metriky** chodí default do `logs/<ckpt_stem>_<unix_ts>.jsonl`.
   Schema: `run` / `step` / `epoch_done` / `checkpoint` events. Per-event
   flush — `tail -f` má sub-second lag.
-- **Checkpoint format `AURORA03`** (`src/checkpoint.rs`). Žádný backward
-  compat se staršími SNN formáty (AURORA01/02 jsou pryč). Bumpy magic na
-  AURORA04 při schema change.
+- **Checkpoint format `AURORA04`** (`src/checkpoint.rs`) — přidal `flags`
+  u32 (bit 0 = rope). Žádný backward compat se staršími formáty
+  (AURORA01–03 jsou pryč). Bumpy magic na AURORA05 při schema change.
 - **Korpusy** se stahují přes `scripts/get_corpus.sh <variant>` do
   `data/`. `data/` a `logs/` jsou v gitignore.
-- **GPU performance limitace:** Sprint 60A udělal gradient akumulaci
-  pure-GPU, Sprint 60B udělal tiled MHA backward. Per-step latence je
-  stále převážně v `clip_grads` (per-tensor partials download) a v
-  jednotlivých dispatch overhead. Sprint 61+ může fuzí přes encoder
-  reduce dál; KV cache je zatím CPU-only (GPU port = Sprint 61).
+- **GPU performance stav (po Sprint 64):** GEMM i MHA kernely jsou tiled,
+  trénink běží 1 submit/batch, norm readback jen na report stepy, eval
+  batchovaný přes `eval_step_batch` (kapacita = `max_batch`). Per-step je
+  compute-bound (GTX 1650) — další zrychlení = menší práce (f16, flash
+  attention), ne dispatch. CPU eval je rayon-paralelní; CPU linear/tied-head
+  smyčky jsou pozičně blokované (bit-exact, neměnit pořadí akumulace).
 - **Live viz** (`--features viz --viz`) je čistě additivní — kompiluje
   Bevy 0.18 jako optional dep, default build/CI nezasahuje. Viz thread
   čte `Arc<Mutex<TrainingSnapshot>>` přes `try_lock`, trénink píše

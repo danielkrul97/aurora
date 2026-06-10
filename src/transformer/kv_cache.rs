@@ -101,9 +101,12 @@ pub fn generate_step(
     let tok = new_token as usize;
     let mut h = vec![0.0_f32; d];
     let tok_row = &model.embed.w_tok[tok * d..(tok + 1) * d];
-    let pos_row = &model.embed.w_pos[t_new_pos * d..(t_new_pos + 1) * d];
-    for c in 0..d {
-        h[c] = tok_row[c] + pos_row[c];
+    h.copy_from_slice(tok_row);
+    if model.embed.use_pos {
+        let pos_row = &model.embed.w_pos[t_new_pos * d..(t_new_pos + 1) * d];
+        for c in 0..d {
+            h[c] += pos_row[c];
+        }
     }
 
     // 2. Run through each block with single-query attention against history.
@@ -136,9 +139,13 @@ fn block_step(
     // PreLN
     let (ln1_out, _) = crate::attention::layer_norm_forward(&blk.ln1, h_in);
     // Project new q/k/v (single token, so each is length D)
-    let q_new = linear_forward(&blk.mha.w_q, &ln1_out);
-    let k_new = linear_forward(&blk.mha.w_k, &ln1_out);
+    let mut q_new = linear_forward(&blk.mha.w_q, &ln1_out);
+    let mut k_new = linear_forward(&blk.mha.w_k, &ln1_out);
     let v_new = linear_forward(&blk.mha.w_v, &ln1_out);
+    if blk.mha.rope {
+        crate::attention::rope_rotate(&mut q_new, n_head, d_head, t_new_pos, false);
+        crate::attention::rope_rotate(&mut k_new, n_head, d_head, t_new_pos, false);
+    }
 
     // Append to history (k and v)
     kv.k_history.extend_from_slice(&k_new);

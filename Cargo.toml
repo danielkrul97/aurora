@@ -49,3 +49,7 @@ textplots = "0.8"
 
 [[example]]
 name = "aurora_train"
+
+[[example]]
+name = "gpu_perf_bench"
+required-features = ["gpu"]

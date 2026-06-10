@@ -21,6 +21,15 @@ fn rel_err(a: f32, b: f32) -> f32 {
 
 #[test]
 fn kv_cache_generate_step_matches_full_forward() {
+    kv_cache_parity_for(false);
+}
+
+#[test]
+fn kv_cache_generate_step_matches_full_forward_rope() {
+    kv_cache_parity_for(true);
+}
+
+fn kv_cache_parity_for(rope: bool) {
     let mut rng = StdRng::seed_from_u64(0xCACE);
     let cfg = TransformerConfig {
         vocab: 32,
@@ -29,6 +38,7 @@ fn kv_cache_generate_step_matches_full_forward() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 32,
+        rope,
     };
     let model = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -106,6 +116,7 @@ fn kv_cache_reset_clears_state() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut cache = KvCache::new(cfg.n_layer, cfg.d_model);
@@ -132,6 +143,7 @@ fn kv_cache_generates_deterministic_with_temperature_0() {
         n_head: 2,
         d_ff: 32,
         seq_len_max: 16,
+        rope: false,
     };
     let model = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -200,6 +212,7 @@ fn gpu_kv_cache_matches_cpu_kv_cache() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
@@ -249,6 +262,7 @@ fn gpu_kv_cache_greedy_matches_full_forward() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
@@ -284,6 +298,17 @@ fn gpu_kv_cache_greedy_matches_full_forward() {
 #[cfg(feature = "gpu")]
 #[test]
 fn gpu_kv_cache_parallel_kernel_handles_large_t_total() {
+    gpu_kv_cache_parity_for(false);
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+fn gpu_kv_cache_parallel_kernel_handles_large_t_total_rope() {
+    gpu_kv_cache_parity_for(true);
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_kv_cache_parity_for(rope: bool) {
     // Exercises the workgroup-shared max/sum reductions across the
     // stride-loop boundary (t_total > 64 threads).
     let ctx = match GpuContext::new() {
@@ -301,6 +326,7 @@ fn gpu_kv_cache_parallel_kernel_handles_large_t_total() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 96, // > 64 forces stride loops in phase 1/2
+        rope,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
@@ -317,7 +343,7 @@ fn gpu_kv_cache_parallel_kernel_handles_large_t_total() {
         let err = rel_err_max(&cpu_logits, &gpu_logits);
         assert!(
             err < 5e-2,
-            "stride-loop kernel divergence at t_total={}: err {err}",
+            "stride-loop kernel divergence (rope={rope}) at t_total={}: err {err}",
             gpu_cache.current_len
         );
     }
@@ -344,6 +370,7 @@ fn gpu_kv_cache_reset_correctness() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);

@@ -19,7 +19,6 @@ use crate::optimizer::{
 };
 use crate::transformer::block::{block_backward, block_forward, TransformerBlock, TransformerBlockCache, TransformerBlockGrads};
 use crate::transformer::embedding::{embed_backward, embed_forward, tied_lm_head_backward, tied_lm_head_forward, EmbedCache, EmbedGrads, EmbedWeights};
-use crate::transformer::loss::cross_entropy_with_grad;
 
 #[derive(Clone, Debug)]
 pub struct TransformerConfig {
@@ -29,6 +28,9 @@ pub struct TransformerConfig {
     pub n_head: usize,
     pub d_ff: usize,
     pub seq_len_max: usize,
+    /// Rotary position embedding on Q/K instead of the learned w_pos
+    /// table (which stays allocated but unused when this is on).
+    pub rope: bool,
 }
 
 impl TransformerConfig {
@@ -41,6 +43,7 @@ impl TransformerConfig {
             n_head: 6,
             d_ff: 1536,
             seq_len_max: 256,
+            rope: false,
         }
     }
 
@@ -53,6 +56,7 @@ impl TransformerConfig {
             n_head: 2,
             d_ff: 128,
             seq_len_max: 64,
+            rope: false,
         }
     }
 }
@@ -111,16 +115,19 @@ pub struct BlockMuon {
 
 impl DecoderTransformer {
     pub fn new<R: Rng>(config: TransformerConfig, rng: &mut R) -> Self {
-        let embed = EmbedWeights::new(config.vocab, config.d_model, config.seq_len_max, rng);
+        let mut embed = EmbedWeights::new(config.vocab, config.d_model, config.seq_len_max, rng);
+        embed.use_pos = !config.rope;
         let blocks: Vec<TransformerBlock> = (0..config.n_layer)
             .map(|_| {
-                TransformerBlock::new(
+                let mut blk = TransformerBlock::new(
                     config.d_model,
                     config.n_head,
                     config.d_ff,
                     config.n_layer,
                     rng,
-                )
+                );
+                blk.mha.rope = config.rope;
+                blk
             })
             .collect();
         let final_ln = LayerNorm::new(config.d_model);
@@ -457,14 +464,28 @@ impl DecoderTransformer {
         let mut total_loss = 0.0_f32;
         let mut d_logits = vec![0.0_f32; t * v];
 
+        // Softmax + CE gradient computed in place into d_logits (no
+        // per-row scratch), with the 1/T loss scale fused into the
+        // normalization pass.
+        let inv_t = 1.0_f32 / t as f32;
         for ti in 0..t {
             let row = &logits[ti * v..(ti + 1) * v];
-            let (loss, mut grad) = cross_entropy_with_grad(row, targets[ti] as usize);
-            total_loss += loss;
+            let drow = &mut d_logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0_f32;
             for c in 0..v {
-                d_logits[ti * v + c] = grad[c] / t as f32;
+                let e = (row[c] - max).exp();
+                drow[c] = e;
+                sum += e;
             }
-            grad.clear();
+            let inv_sum = 1.0 / sum;
+            let tgt = targets[ti] as usize;
+            let p_target = (drow[tgt] * inv_sum).max(1e-12);
+            total_loss += -p_target.ln();
+            drow[tgt] -= sum;
+            for c in 0..v {
+                drow[c] *= inv_sum * inv_t;
+            }
         }
 
         // Tied LM head backward.

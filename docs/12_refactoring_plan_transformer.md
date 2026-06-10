@@ -512,13 +512,137 @@ Očekávaný model size: ~10M params. 16 × 256 = 4096 tokenů per batch, ~30K s
 
 ---
 
+## Sprint 63 — Sliding-window eval + Muon WD + RoPE
+
+**Cíl:** odblokovat tři páky pro cestu k BPB < 1.5 identifikované v analýze
+(scale-dominated režim): správné měření val BPB, decoupled weight decay na
+Muon maticích a rotary position embedding místo learned pos table.
+
+**Co se změnilo:**
+
+1. **Sliding-window eval** (`examples/aurora_train.rs`): `evaluate` i
+   `evaluate_gpu` přešly z non-overlapping oken (stride = seq_len) na
+   překryvná (stride = seq_len/2) — skóruje se jen suffix okna za
+   překryvem, takže každý token má ≥ seq_len/2 kontextu. Non-overlapping
+   skórovalo začátky oken téměř bez kontextu a nafukovalo BPB o ~0.05–0.15.
+   GPU strana: nová `eval_step_per_token` vrací per-position NLL
+   (`eval_step` je nad ní tenký wrapper, parity test beze změny zelený).
+   Eval cena ~2× (dvojnásobek oken) — pořád zanedbatelné vs trénink.
+2. **Muon weight decay**: nový CLI flag `--muon-wd` (default 0.0 = beze
+   změny chování). CPU stepper WD už uměl; na GPU byl `apply_wd` u Muon
+   ops hardcoded `false` — teď `true` (s wd=0 je shader add no-op, flag
+   plně řídí trainer). Hodnota jde do header printu i JSONL `run` eventu.
+3. **RoPE** (`--rope`, default off — A/B-ovatelné):
+   - `TransformerConfig.rope: bool`; `MhaWeights.rope`; `EmbedWeights.use_pos`.
+   - CPU: `rope_rotate` v `src/attention.rs` (interleaved páry, base 10000,
+     `inverse` = transponovaná rotace pro backward). MHA forward rotuje
+     q/k po projekci (cache nese rotované hodnoty), backward aplikuje
+     inverzní rotaci na d_q/d_k před projection backward. Learned w_pos
+     se při rope nepřičítá a nedostává gradient (zůstává alokovaný —
+     checkpoint layout beze změny).
+   - GPU: nový `RopeKernel` (`src/gpu/rope.rs`, thread per pár, in-place).
+     Forward pass po QKV gemmech, backward pass po `mha_bwd` na sdílených
+     dq/dk. Embed kernely (`TokenPosEmbedKernel`, `EmbedScatterAddKernel`,
+     `SingleTokenEmbedKernel`) mají `use_pos` push constant. KV-cached
+     decoding (`generate_step_kv`, `forward_kv_only`) rotuje na absolutní
+     pozici.
+   - KV cache CPU (`block_step`) rotuje q_new/k_new na `t_new_pos`;
+     historie nese rotované K, prefill je konzistentní.
+   - **Checkpoint AURORA04**: nové pole `flags: u32` (bit 0 = rope) za
+     `seq_len_max`. Žádný backward compat s AURORA03 (per konvence).
+     Resume check v traineru porovnává i rope flag.
+
+**Testy (+6):**
+
+- `mha_rope_backward_matches_numerical` — central-difference check dx,
+  dW_q, dW_k s rope on.
+- `rope_relative_shift_invariance` — q·k závisí jen na relativním offsetu.
+- `kv_cache_generate_step_matches_full_forward_rope` (CPU) a
+  `gpu_kv_cache_parallel_kernel_handles_large_t_total_rope` (GPU).
+- `full_transformer_rope_forward_and_grads_match_cpu` — loss + g_w_q/g_w_k/
+  g_w_tok parity, g_w_pos == 0 na obou backendech.
+- `checkpoint_round_trip_preserves_rope_flag`.
+
+**Exit kritéria — splněno:** GPU sada 39/39, CPU sada 25+/25, end-to-end
+GPU run s `--rope --muon-wd 0.05` konverguje (tiny.txt, loss 4.6 → 2.0
+za ~1700 kroků). `cargo check --all-targets --features gpu` clean.
+
+**Pozn. pro overnight run:** doporučený příkaz pro plný enwik8 je
+`--gpu --rope --muon-wd 0.05..0.1` + plný korpus přes
+`scripts/get_corpus.sh enwik8`. První čísla pod novým evalem nejsou
+srovnatelná se starými (sliding-window měří ~0.05–0.15 níž — správně).
+
+---
+
+## Sprint 64 — Perf sweep (CPU hot paths + eval)
+
+**Cíl:** projít celý projekt a odstranit měřitelné performance issues.
+Inventura potvrdila, že GPU kernely (GEMM 64×64 tile + 4×4 register tile,
+tiled MHA) i trénovací smyčka (1 submit/batch, gated norm readback) jsou
+už v pořádku — zbývaly CPU hot paths a eval.
+
+**Co se změnilo (vše bit-exact nebo v rámci f32 šumu):**
+
+1. **CPU `evaluate` paralelizace** (`aurora_train.rs`): okna se skórují
+   rayon-paralelně (forward je `&self`) a per-row skóre počítá logsumexp
+   přímo — bez per-pozice softmax alokace. Eval byl jediná single-thread
+   část CPU pipeline. Měřeno: nano val ~21 s → 5.2 s; d=128 run 25 s → 3.6 s.
+2. **GPU eval batching**: nová `eval_step_batch` zrcadlí `train_step_batch`
+   (1 encoder/submit/readback na `max_batch` oken místo per okno);
+   `DecoderTransformerGpu` nově nese `pub max_batch`. Měřeno ~0.3 ms
+   ušetřeného sync overheadu na okno — na malém val ~15 % evalu, na full
+   enwik8 (~78k oken) odhad ~25 s/epochu.
+3. **CPU linear/tied-head blocking** (`attention.rs`, `embedding.rs`):
+   smyčky blokované po 8 pozicích — váhová matice (w_fc 2.3 MB, w_tok
+   6 MB ≫ L2) se streamuje 1× per blok místo per pozici. Pořadí akumulace
+   zachováno → bit-exact. Měřeno: nano CPU step 6.61 → 6.34 s (−4 %);
+   na d=128 (váhy L2-resident) neutrální — dle očekávání.
+4. **`rope_rotate`**: jeden `powf` na volání (multiplikativní rekurence
+   freq) a sin/cos hoistnuté ze smyčky přes heady (bylo `t·n_head·half`
+   powf+sincos, je `half` powf + `t·half` sincos).
+5. **`model.backward`**: softmax+CE gradient počítaný in-place do
+   `d_logits` (žádné 2 alokace per pozice), 1/T scale fúzovaný do
+   normalizační passy.
+6. **MHA fwd/bwd**: per-head scratch buffery hoistnuté před smyčku přes
+   heady (4·n_head → 4 alokace na volání).
+7. **Instrumentace**: epoch summary tiskne `(eval X.Xs)` a JSONL
+   `epoch_done` event má nové pole `eval_s`.
+8. Drobnosti: `gpu_perf_bench` má `required-features = ["gpu"]` (plain
+   `cargo test` bez GPU featury se předtím nezkompiloval).
+
+**Měření (GTX 1650 + host CPU, sekvenčně, baseline = HEAD worktree):**
+
+| Metrika | Před | Po |
+|---|---|---|
+| CPU d=128 epocha (400 KB tiny) | 197.4 s | 171.9 s (eval 3.6 s) |
+| CPU nano step (d=384 L=6 V=4096) | 6 612 ms | 6 336 ms |
+| CPU nano epocha (150 KB enwik) | 484.2 s | 447.5 s (eval 5.2 s) |
+| GPU eval (310 oken, d=128) | 0.7 s | 0.6 s |
+| GPU nano train step (bench) | 28.4 ms | 27.9 ms (no regression) |
+
+**Konvergence:** train/val bpb identické v rámci f32 šumu
+(3.031/2.981 vs 3.031/2.980 na nano). Testy 61/61 GPU + 35/35 CPU zelené.
+
+**Záměrně neřešeno:**
+
+- `generate_step_kv` GPU alokuje ~15 bufferů per token — používá se jen
+  v testech (sampling v traineru běží na CPU po `to_cpu()`), nestojí za
+  arenu.
+- BPE `encode` drží 3 vektory indexů (pro 100 MB korpus ~2 GB RAM peak);
+  rychlostně je O(N log N) v pořádku. Případný u32-index refactor až
+  kdyby RAM reálně chyběla.
+- CPU GEMM SIMD/threading uvnitř jednoho okna — rayon přes batch už
+  saturuje jádra; vnitřní paralelismus by jen přerozdělil tentýž čas.
+
+---
+
 ## Sprint 60+ — otevřená pole
 
 | Větev | Co odemyká | Effort |
 |---|---|---|
 | **Flash-attention WGSL** | Větší seq_len bez OOM, ~2× throughput | large |
 | **KV cache + inference path** | Faster sampling, opens chatbot demo | medium |
-| **RoPE + RMSNorm** | Modern positional + norm, Llama-style | medium |
+| **RMSNorm** (RoPE hotové ve Sprint 63) | Modern norm, Llama-style | small |
 | **Mixed precision (fp16 storage, fp32 compute)** | 2× VRAM headroom, blocked dokud Naga nepodpoří `f16` | large (waiting) |
 | **enwik8 full (100 MB) overnight** | Hutter Prize comparable BPB | medium (waiting) |
 | **GPT-2-small reprodukce** | n_layer=12, d_model=768 — VRAM tight, mixed precision dependency | medium-large |

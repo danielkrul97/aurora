@@ -29,6 +29,7 @@ pub mod matmul;
 pub mod muon;
 pub mod optimizer;
 pub mod reduce;
+pub mod rope;
 pub mod softmax_ce;
 pub mod transformer;
 
@@ -49,5 +50,6 @@ pub use reduce::{
     EmbedScatterReduceKernel, GradNormFinalizeKernel, GradNormSqReduceKernel,
     OuterProductAccumKernel, RowReduceAddKernel, ScaleByBufferKernel,
 };
+pub use rope::RopeKernel;
 pub use softmax_ce::SoftmaxCrossEntropyKernel;
 pub use transformer::DecoderTransformerGpu;

@@ -24,6 +24,7 @@ fn cpu_transformer_converges_on_copy_task() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -86,6 +87,7 @@ fn cpu_transformer_step_does_not_nan() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 32,
+        rope: false,
     };
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -134,6 +136,7 @@ fn cpu_transformer_argmax_sanity() {
         n_head: 1,
         d_ff: 32,
         seq_len_max: 8,
+        rope: false,
     };
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
 

@@ -45,6 +45,7 @@ fn cpu_transformer_byte_lm_converges_under_one_epoch() {
         n_head: 2,
         d_ff: 128,
         seq_len_max: 64,
+        rope: false,
     };
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut grads = ModelGrads::zeros(&cfg);
@@ -104,6 +105,7 @@ fn cpu_transformer_bpe_lm_converges_under_one_epoch() {
         n_head: 2,
         d_ff: 128,
         seq_len_max: 32,
+        rope: false,
     };
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut grads = ModelGrads::zeros(&cfg);
@@ -151,6 +153,7 @@ fn checkpoint_v3_round_trip_preserves_loss() {
         n_head: 2,
         d_ff: 64,
         seq_len_max: 16,
+        rope: false,
     };
     let model = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -190,6 +193,38 @@ fn checkpoint_v3_round_trip_preserves_loss() {
     }
 
     std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn checkpoint_round_trip_preserves_rope_flag() {
+    let mut rng = StdRng::seed_from_u64(0x99);
+    let cfg = TransformerConfig {
+        vocab: 32,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        rope: true,
+    };
+    let model = DecoderTransformer::new(cfg.clone(), &mut rng);
+
+    let tmp = std::env::temp_dir().join("aurora_ckpt_rope_roundtrip.bin");
+    checkpoint::save(&tmp, &model, 0, model.step).expect("save");
+    let loaded = checkpoint::load(&tmp).expect("load");
+    std::fs::remove_file(&tmp).ok();
+
+    assert!(loaded.model.config.rope, "rope flag lost in round trip");
+    assert!(!loaded.model.embed.use_pos, "use_pos must be off under rope");
+    assert!(loaded.model.blocks.iter().all(|b| b.mha.rope), "block rope flag lost");
+
+    // Forward parity: rotation must be active in the loaded model.
+    let tokens: Vec<u32> = (0..16u32).collect();
+    let (a, _) = model.forward(&tokens[..15]);
+    let (b, _) = loaded.model.forward(&tokens[..15]);
+    for i in 0..a.len() {
+        assert!((a[i] - b[i]).abs() < 1e-6, "logits diverge at {i}");
+    }
 }
 
 fn eval_bpb(model: &DecoderTransformer, val: &[u32], seq_len: usize, comp: f32) -> f32 {
