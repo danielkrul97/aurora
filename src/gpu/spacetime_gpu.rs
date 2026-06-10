@@ -598,10 +598,13 @@ impl StLmGpu {
         } else {
             (0..max_windows).map(|i| all[i * all.len() / max_windows]).collect()
         };
+        let n_chunks = windows.len().div_ceil(b);
+        // Copy each chunk's NLL into one buffer; sync once at the end instead
+        // of draining the pipeline per chunk (compute→copy ordering is safe).
+        let acc = GpuBuffer::empty(&self.ctx, "st eval acc", n_chunks * seq * b);
         let mut toks = vec![0u32; seq * b];
         let mut tgts = vec![0u32; seq * b];
-        let mut total = 0.0_f64;
-        for chunk in windows.chunks(b) {
+        for (ci, chunk) in windows.chunks(b).enumerate() {
             let valid = chunk.len();
             for (bi, &p) in chunk.iter().enumerate() {
                 for ti in 0..seq {
@@ -619,11 +622,17 @@ impl StLmGpu {
             self.targets_buf.upload_u32_prefix(&self.ctx, &tgts);
             let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("st eval") });
             self.sce.dispatch_into(&self.ctx, &mut enc, &self.logits, &self.d_logits, &self.loss_seq, &self.targets_buf, vocab as u32, seq as u32, b as u32, 1.0, 0);
+            enc.copy_buffer_to_buffer(&self.loss_seq.inner, 0, &acc.inner, (ci * seq * b * 4) as u64, (seq * b * 4) as u64);
             self.ctx.queue.submit(Some(enc.finish()));
-            let ls = self.loss_seq.download(&self.ctx);
+        }
+        let ls = acc.download(&self.ctx);
+        let mut total = 0.0_f64;
+        for (ci, chunk) in windows.chunks(b).enumerate() {
+            let valid = chunk.len();
+            let base = ci * seq * b;
             for bi in 0..valid {
                 for ti in 0..seq {
-                    total += f64::from(ls[bi * seq + ti]);
+                    total += f64::from(ls[base + bi * seq + ti]);
                 }
             }
         }

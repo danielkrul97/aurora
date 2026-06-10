@@ -268,11 +268,14 @@ fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wgid: vec3<u32>,
 ) {
-    let i = wgid.x;
     let head_idx = wgid.y;
-    if (i >= p.t) { return; }
-    let c = lid.x;
-    if (c >= p.d_head) { return; }
+    // Flatten (query row i, channel c) across the 64-lane workgroup so every
+    // lane is busy regardless of d_head (the old i=wgid.x / c=lid.x map left
+    // lanes >= d_head idle, and silently skipped channels for d_head > 64).
+    let item = wgid.x * 64u + lid.x;
+    if (item >= p.t * p.d_head) { return; }
+    let i = item / p.d_head;
+    let c = item % p.d_head;
     let d_model = p.d_head * p.n_head;
     let h_off = head_idx * p.d_head;
     let row_base = head_idx * p.t * p.t + i * p.t;
@@ -310,11 +313,13 @@ fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wgid: vec3<u32>,
 ) {
-    let j = wgid.x;
     let head_idx = wgid.y;
-    if (j >= p.t) { return; }
-    let c = lid.x;
-    if (c >= p.d_head) { return; }
+    // Flatten (key row j, channel c) across the 64-lane workgroup — full
+    // lane utilisation for any d_head (see dq kernel note).
+    let item = wgid.x * 64u + lid.x;
+    if (item >= p.t * p.d_head) { return; }
+    let j = item / p.d_head;
+    let c = item % p.d_head;
     let d_model = p.d_head * p.n_head;
     let h_off = head_idx * p.d_head;
     let probs_head_base = head_idx * p.t * p.t;
@@ -606,6 +611,8 @@ impl CausalMhaBackwardKernel {
             _p2: 0,
         };
         let pc = bytemuck::bytes_of(&p);
+        // dq/dkv flatten (row, channel) into t*d_head work items per head.
+        let bwd_groups = (t * d_head).div_ceil(64);
 
         // Fused pass: row_dot + d_scores in one kernel, one wg per (i, head).
         let bind0 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -632,7 +639,7 @@ impl CausalMhaBackwardKernel {
             pass.dispatch_workgroups(t, n_head, 1);
         }
 
-        // dq accumulation per (i, head)
+        // dq accumulation, one lane per (query row, channel)
         let bind1 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora mha bwd dq bind"),
             layout: &self.bgl_dq,
@@ -653,10 +660,10 @@ impl CausalMhaBackwardKernel {
             pass.set_pipeline(&self.pipeline_dq);
             pass.set_bind_group(0, &bind1, &[]);
             pass.set_push_constants(0, pc);
-            pass.dispatch_workgroups(t, n_head, 1);
+            pass.dispatch_workgroups(bwd_groups, n_head, 1);
         }
 
-        // dk + dv accumulation per (j, head)
+        // dk + dv accumulation, one lane per (key row, channel)
         let bind2 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora mha bwd dkv bind"),
             layout: &self.bgl_dkv,
@@ -680,7 +687,7 @@ impl CausalMhaBackwardKernel {
             pass.set_pipeline(&self.pipeline_dkv);
             pass.set_bind_group(0, &bind2, &[]);
             pass.set_push_constants(0, pc);
-            pass.dispatch_workgroups(t, n_head, 1);
+            pass.dispatch_workgroups(bwd_groups, n_head, 1);
         }
     }
 
@@ -767,6 +774,7 @@ impl CausalMhaBackwardKernel {
             t, d_head, n_head, _pad0: 0, scale, _p0: 0, _p1: 0, _p2: 0,
         };
         let pc = bytemuck::bytes_of(&p);
+        let bwd_groups = (t * d_head).div_ceil(64);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("aurora mha bwd dscores pass"),
@@ -785,7 +793,7 @@ impl CausalMhaBackwardKernel {
             pass.set_pipeline(&self.pipeline_dq);
             pass.set_bind_group(0, bind_dq, &[]);
             pass.set_push_constants(0, pc);
-            pass.dispatch_workgroups(t, n_head, 1);
+            pass.dispatch_workgroups(bwd_groups, n_head, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -795,7 +803,7 @@ impl CausalMhaBackwardKernel {
             pass.set_pipeline(&self.pipeline_dkv);
             pass.set_bind_group(0, bind_dkv, &[]);
             pass.set_push_constants(0, pc);
-            pass.dispatch_workgroups(t, n_head, 1);
+            pass.dispatch_workgroups(bwd_groups, n_head, 1);
         }
     }
 }

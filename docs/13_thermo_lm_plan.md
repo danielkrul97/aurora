@@ -1131,3 +1131,33 @@ trajektorie sedí na CPU (GPU 200 kroků 2.99 ≈ CPU).
 **Závěr:** šampion linie (statický spacetime) běží **na GPU na cílovém korpusu
 (enwik8) při parity, plně využívá GPU i u velkých configů** (im2col d_w1).
 `--gpu --viz` funguje. Další páka = scale (delší trénink / víc dat / params).
+
+## §24 — wgpu 23→27 + fp16-storage forward conv (mřížkový model)
+
+**wgpu 23→27 upgrade SHIPPED** (~6 compiler-driven editů: `Instance::new(&desc)`,
+`request_adapter`→`Result`, `request_device` bez trace-path argu, `DeviceDescriptor`
++`experimental_features`/`trace`, `Maintain::Wait`→`PollType::wait_indefinitely()`).
+Cargo.lock **dedupnutý na jediné wgpu 27.0.1** (předtím 23 + Bevy 27), naga 27.0.3.
+37 parity zelených, `--gpu` i `gpu,viz` běží. naga 27 žere `enable f16;` →
+odemyká fp16.
+
+**fp16 forward conv — STORAGE, ne compute.** Cesta: `GpuContext::has_f16` (zapíná
+device feature `SHADER_F16` jen kde adapter umí → naga FLOAT16 capability), nový
+`GemmTransposeBF16Kernel` (a=patch v **fp16 storage**, b=w1 f32, c=hpre f32; tiles
++ register-tile FMA v `vec4<f16>`, per-K-tile flush do f32 akumulátoru) a
+`ThermoIm2colF16Kernel` (staví patch rovnou jako fp16). Routing v
+`ThermoGpu` za `conv_f16` (default OFF, opt-in `--conv-f16`; `gtb_f16`/`im2col_f16`
+= `Some` jen s SHADER_F16). Backward zůstává f32.
+
+**Klíčové zjištění (roofline, ne hype):** první verze byla fp16 *compute* s f32
+storage → **−0.4 % (šum)**. Důvod: ten GEMM (M=6144, N=48, K=432) má aritmetickou
+intenzitu ≈21 FLOP/B vs fp32 ridge GTX 1650 ≈23 → **bandwidth-bound na čtení f32
+patche**, ne ALU-bound; zdvojení ALU je neviditelné. **fp16 STORAGE** (patch v
+fp16 → půlí dominantní DRAM read; w1 zůstává f32, je L2-resident, fp16 by nepřineslo
+nic) je ta páka → **+11.7 %** na celý train-step v conv-bound 3D regimu
+(d=4, c16, convH48, B=24: 824.9→728.4 ms/step, konzistentně 3/3 rounds),
+correctness |Δ| 2e-5. 2D (d=1) je neutrální (tiny-N GEMM, není conv-bound).
+
+**Parity:** `tests/thermo_gpu_parity.rs::conv_f16_forward_matches_f32_loose` (end-to-end
+fwd loss f16 vs f32, `< 2e-2`). Zbývá: fp16 i v backward conv (d_s/d_w1) =
+další páka; pure-fp16 GEMM (i w1) by pomohl jen okrajově.

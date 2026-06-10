@@ -67,7 +67,6 @@ impl TransformerBlockGrads {
 #[derive(Clone, Debug, Default)]
 pub struct TransformerBlockCache {
     pub x_in: Vec<f32>,
-    pub ln1_in: Vec<f32>,
     pub ln1_cache: LayerNormCache,
     pub ln1_out: Vec<f32>,
     pub mha_cache: MhaCache,
@@ -101,7 +100,6 @@ pub fn block_forward(blk: &TransformerBlock, x: &[f32]) -> (Vec<f32>, Transforme
         z,
         TransformerBlockCache {
             x_in: x.to_vec(),
-            ln1_in: x.to_vec(),
             ln1_cache,
             ln1_out,
             mha_cache,
@@ -123,8 +121,7 @@ pub fn block_backward(
     grads: &mut TransformerBlockGrads,
 ) -> Vec<f32> {
     // FFN branch: dz contributes to both `post_attn` (residual) and FFN input.
-    let d_ffn_out = dz.to_vec();
-    let d_ln2_out = ffn_backward(&blk.ffn, &cache.ffn_cache, &d_ffn_out, &mut grads.d_ffn);
+    let d_ln2_out = ffn_backward(&blk.ffn, &cache.ffn_cache, dz, &mut grads.d_ffn);
     let d_post_attn_from_ffn =
         layer_norm_backward(&blk.ln2, &cache.ln2_cache, &d_ln2_out, &mut grads.d_ln2);
 
@@ -133,9 +130,8 @@ pub fn block_backward(
         d_post_attn[i] = dz[i] + d_post_attn_from_ffn[i];
     }
 
-    // MHA branch: d_post_attn → both `x_in` (residual) and MHA output.
-    let d_mha_out = d_post_attn.clone();
-    let d_ln1_out = causal_mha_backward(&blk.mha, &cache.mha_cache, &d_mha_out, &mut grads.d_mha);
+    // MHA branch: d_post_attn → both the residual and MHA output.
+    let d_ln1_out = causal_mha_backward(&blk.mha, &cache.mha_cache, &d_post_attn, &mut grads.d_mha);
     let d_x_from_mha =
         layer_norm_backward(&blk.ln1, &cache.ln1_cache, &d_ln1_out, &mut grads.d_ln1);
 

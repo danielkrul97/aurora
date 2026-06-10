@@ -160,8 +160,9 @@ impl StLM {
                 }
             }
         }
+        let mut d_raw = vec![0.0_f32; l * c];
         for k in (0..kk).rev() {
-            let mut d_raw = d_field.clone();
+            d_raw.copy_from_slice(&d_field);
             for v in &mut d_raw {
                 *v *= dt;
             }

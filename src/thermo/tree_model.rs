@@ -175,6 +175,7 @@ impl TreeLM {
         let t = cache.t;
         let mut total_loss = 0.0_f32;
         let mut d_field = vec![0.0_f32; self.topo.n * self.tcfg.c];
+        let mut d_raw = vec![0.0_f32; self.topo.n * self.tcfg.c];
         let inv_t = 1.0 / t as f32;
         for ti in (0..t).rev() {
             let row = &cache.logits[ti * vocab..(ti + 1) * vocab];
@@ -189,7 +190,7 @@ impl TreeLM {
             }
             for kk in (0..k).rev() {
                 // field_{kk+1} = field_kk + dt·raw_kk → ∂L/∂field_kk = d_field + dt·(conv adjoint).
-                let mut d_raw = d_field.clone();
+                d_raw.copy_from_slice(&d_field);
                 for v in &mut d_raw {
                     *v *= dt;
                 }

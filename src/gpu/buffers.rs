@@ -86,6 +86,30 @@ impl GpuBuffer {
         }
     }
 
+    /// Allocate an uninitialized fp16 storage buffer of `len` half-precision
+    /// elements (`len*2` bytes). For GPU-only f16 tensors (e.g. the im2col
+    /// patch written by an `enable f16;` kernel and consumed by an f16 GEMM) —
+    /// never uploaded/downloaded from the host. `len` counts f16 elements.
+    ///
+    /// # Panics
+    /// Panics if the device cannot allocate the buffer.
+    #[must_use]
+    pub fn empty_f16(ctx: &GpuContext, label: &str, len: usize) -> Self {
+        let bytes = (len * 2) as u64;
+        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        Self {
+            inner: Arc::new(buf),
+            len,
+        }
+    }
+
     /// Upload from CPU. Length must match.
     pub fn upload(&self, ctx: &GpuContext, data: &[f32]) {
         debug_assert_eq!(data.len(), self.len);
@@ -136,7 +160,7 @@ impl GpuBuffer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        let _ = ctx.device.poll(wgpu::Maintain::Wait);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
         receiver
             .recv()
             .expect("map_async sender dropped")
@@ -177,7 +201,7 @@ impl GpuBuffer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        let _ = ctx.device.poll(wgpu::Maintain::Wait);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
         receiver
             .recv()
             .expect("map_async sender dropped")

@@ -66,6 +66,7 @@ struct Cli {
     k_start: usize,
     k_warmup: usize,
     gpu: bool,
+    conv_f16: bool,
     optimizer: String,
     muon_lr: f32,
     muon_momentum: f32,
@@ -131,6 +132,7 @@ impl Cli {
             k_start: 2,
             k_warmup: 0,
             gpu: false,
+            conv_f16: false,
             optimizer: "muon".into(),
             muon_lr: 0.04,
             muon_momentum: 0.95,
@@ -211,6 +213,10 @@ impl Cli {
                 }
                 "--gpu" => {
                     c.gpu = true;
+                    step = 1;
+                }
+                "--conv-f16" => {
+                    c.conv_f16 = true;
                     step = 1;
                 }
                 "--inject-every" => {
@@ -579,6 +585,7 @@ fn run_training_gpu(mut ctx: TrainCtx, gctx: aurora::gpu::GpuContext) {
     }
     let mut gpu = ThermoGpu::new(&gctx, &ctx.model, seq, b);
     gpu.inject_every = ctx.cli.inject_every;
+    gpu.conv_f16 = ctx.cli.conv_f16;
     let adam_base = AdamWConfig { weight_decay: ctx.cli.weight_decay, ..AdamWConfig::default() };
     let use_muon = ctx.cli.optimizer == "muon";
     let muon_base = MuonConfig { momentum: ctx.cli.muon_momentum, weight_decay: ctx.cli.weight_decay, ns_steps: ctx.cli.muon_ns, ..MuonConfig::default() };

@@ -994,3 +994,33 @@ fn rollout_backward_spectral_matches_cpu() {
         chk("d_bias", &g_cpu.readout.d_bias, &g_gpu.readout.d_bias);
     }
 }
+
+// The fp16-storage forward conv (im2col_f16 + f16 GEMM) must match the f32
+// im2col path within a loose fp16 tolerance. End-to-end through the real GPU
+// rollout (3D, where conv_im2col is active); compares the first-step forward
+// loss from identical weights, so only the conv-GEMM precision differs.
+#[test]
+fn conv_f16_forward_matches_f32_loose() {
+    let Some(ctx) = ctx_or_skip() else { return };
+    if !ctx.has_f16 {
+        eprintln!("no SHADER_F16, skipping f16 conv parity");
+        return;
+    }
+    let mut cfg = test_cfg(4, 4, 8, 16);
+    cfg.d = 2; // 3D → conv_im2col path, where the f16-storage GEMM applies
+    cfg.k_steps = 2;
+    let mut rng = StdRng::seed_from_u64(0xF16C0);
+    let model = ThermoLM::new(cfg.clone(), &mut rng);
+    let adam = AdamWConfig::default();
+    let (seq, b) = (4usize, 2usize);
+    let toks: Vec<u32> = (0..seq * b).map(|i| (i as u32 * 7 + 3) % cfg.vocab as u32).collect();
+
+    let mut g32 = ThermoGpu::new(&ctx, &model, seq, b);
+    let mut g16 = ThermoGpu::new(&ctx, &model, seq, b);
+    g32.conv_im2col = true;
+    g16.conv_im2col = true;
+    g16.conv_f16 = true;
+    let l32 = g32.train_step(&toks, &toks, &adam, true).unwrap();
+    let l16 = g16.train_step(&toks, &toks, &adam, true).unwrap();
+    assert!((l32 - l16).abs() < 2e-2, "conv f16 fwd loss: f32 {l32} vs f16 {l16}");
+}

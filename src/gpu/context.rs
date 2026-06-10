@@ -8,6 +8,10 @@ pub struct GpuContext {
     pub adapter: Arc<wgpu::Adapter>,
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
+    /// Device has `SHADER_F16` enabled → naga's `FLOAT16` capability is on, so
+    /// `enable f16;` shaders (the packed fp16 conv path) compile. False on
+    /// adapters lacking the feature; callers must fall back to f32 kernels.
+    pub has_f16: bool,
 }
 
 impl GpuContext {
@@ -20,40 +24,49 @@ impl GpuContext {
     /// Returns an error if no compute-capable adapter is available or
     /// device creation fails.
     pub fn new() -> Result<Self, GpuInitError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
         }))
-        .ok_or(GpuInitError::NoAdapter)?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("aurora gpu device"),
-                // PUSH_CONSTANTS lets kernels read params via
-                // `var<push_constant>` instead of a per-dispatch uniform
-                // buffer + bind group entry; saves ~100-200 µs per
-                // dispatch on the Vulkan path.
-                required_features: wgpu::Features::PUSH_CONSTANTS,
-                required_limits: {
-                    let supported = adapter.limits();
-                    let mut wanted = wgpu::Limits::default();
-                    wanted = wanted.using_resolution(supported.clone());
-                    // 32 bytes covers all current kernel param structs
-                    // (largest is AdamStepParams: 8 × u32/f32 = 32 B).
-                    wanted.max_push_constant_size = 32.max(supported.max_push_constant_size);
-                    wanted
-                },
-                memory_hints: wgpu::MemoryHints::default(),
+        .map_err(|_| GpuInitError::NoAdapter)?;
+        // SHADER_F16 is opt-in per adapter; request it only where supported so
+        // device creation still succeeds on GPUs without fp16 (they fall back
+        // to the f32 conv kernels). Enabling it turns on naga's FLOAT16
+        // validation capability, which `enable f16;` shaders require.
+        let has_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
+        let mut required_features = wgpu::Features::PUSH_CONSTANTS;
+        if has_f16 {
+            required_features |= wgpu::Features::SHADER_F16;
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("aurora gpu device"),
+            // PUSH_CONSTANTS lets kernels read params via
+            // `var<push_constant>` instead of a per-dispatch uniform
+            // buffer + bind group entry; saves ~100-200 µs per
+            // dispatch on the Vulkan path.
+            required_features,
+            required_limits: {
+                let supported = adapter.limits();
+                let mut wanted = wgpu::Limits::default();
+                wanted = wanted.using_resolution(supported.clone());
+                // 32 bytes covers all current kernel param structs
+                // (largest is AdamStepParams: 8 × u32/f32 = 32 B).
+                wanted.max_push_constant_size = 32.max(supported.max_push_constant_size);
+                wanted
             },
-            None,
-        ))
+            memory_hints: wgpu::MemoryHints::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            trace: wgpu::Trace::Off,
+        }))
         .map_err(GpuInitError::Device)?;
         Ok(Self {
             instance: Arc::new(instance),
             adapter: Arc::new(adapter),
             device: Arc::new(device),
             queue: Arc::new(queue),
+            has_f16,
         })
     }
 

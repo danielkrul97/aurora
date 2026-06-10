@@ -667,6 +667,80 @@ impl ThermoIm2colDw1Kernel {
     }
 }
 
+// ───── im2col writing an fp16 patch (feeds the f16-storage forward GEMM) ─
+//
+// Same patch as `ThermoIm2colDw1Kernel` but written to fp16 storage, so the
+// (bandwidth-dominant) patch read in the forward GEMM is halved. Only the
+// forward conv uses this; the backward d_w1 keeps the f32 patch.
+
+const IM2COL_F16_WGSL: &str = "
+enable f16;
+struct P { h:u32, w:u32, c:u32, ch:u32, nb:u32, d:u32, _p2:u32, _p3:u32 };
+@group(0) @binding(0) var<storage, read>       s:   array<f32>;  // [nb*cells*c]
+@group(0) @binding(1) var<storage, read_write> pat: array<f16>;  // [nb*cells*(c*27)]
+var<push_constant> p: P;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let cells = p.d * p.h * p.w;
+    if (idx >= p.nb * cells * p.c) { return; }
+    let ci = idx % p.c;
+    let t = idx / p.c;
+    let cell = t % cells;
+    let g = t / cells;
+    let j = cell % p.w;
+    let r1 = cell / p.w;
+    let i = r1 % p.h;
+    let z = r1 / p.h;
+    let base = (t * p.c + ci) * 27u;
+    for (var tap: u32 = 0u; tap < 27u; tap = tap + 1u) {
+        let ki = tap / 9u;
+        let kj = (tap / 3u) % 3u;
+        let kl = tap % 3u;
+        let zz = i32(z) + i32(ki) - 1;
+        let ii = i32(i) + i32(kj) - 1;
+        let jj = i32(j) + i32(kl) - 1;
+        var v = 0.0;
+        if (zz >= 0 && zz < i32(p.d) && ii >= 0 && ii < i32(p.h) && jj >= 0 && jj < i32(p.w)) {
+            let nbr = (u32(zz) * p.h + u32(ii)) * p.w + u32(jj);
+            v = s[(g * cells + nbr) * p.c + ci];
+        }
+        pat[base + tap] = f16(v);
+    }
+}
+";
+
+pub struct ThermoIm2colF16Kernel {
+    pipeline: Arc<wgpu::ComputePipeline>,
+    bgl: Arc<wgpu::BindGroupLayout>,
+}
+
+impl ThermoIm2colF16Kernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let (pipeline, bgl) = build(ctx, "thermo_im2col_f16", IM2COL_F16_WGSL, &[true, false]);
+        Self { pipeline, bgl }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_b(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        s: &GpuBuffer,
+        patch: &GpuBuffer,
+        h: u32,
+        w: u32,
+        c: u32,
+        nb: u32,
+        d: u32,
+    ) {
+        let p = Conv3Params::new(h, w, c, 0, nb, d);
+        dispatch_n(ctx, encoder, &self.pipeline, &self.bgl, &[s, patch], bytemuck::bytes_of(&p), (nb * d * h * w * c).div_ceil(WG));
+    }
+}
+
 // ───── fused conv3x3 + GELU writing BOTH pre/post (forward cache) ───────
 //
 // Folds the separate `conv3x3` (pre-act cache) and `gelu` dispatches into

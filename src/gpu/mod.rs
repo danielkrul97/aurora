@@ -44,7 +44,9 @@ pub use embedding::{EmbedScatterAddKernel, TokenPosEmbedKernel};
 pub use gelu::{GeluBackwardKernel, GeluKernel};
 pub use kv_cache::{KvBlockGpu, KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
 pub use layer_norm::{LayerNormBackwardKernel, LayerNormForwardKernel};
-pub use matmul::{cpu_gemm, cpu_gemm_transpose_b, GemmKernel, GemmTransposeBKernel};
+pub use matmul::{
+    cpu_gemm, cpu_gemm_transpose_b, GemmKernel, GemmTransposeBF16Kernel, GemmTransposeBKernel,
+};
 pub use muon::{
     MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel, MuonLoadStoreKernel,
     MuonMomentumKernel, MuonStepXKernel,
@@ -60,7 +62,7 @@ pub use thermo_model::ThermoGpu;
 pub use thermo_conv::{
     ThermoConv1x1Kernel, ThermoConv3x3Dw1Kernel, ThermoConv3x3Dw1SplitKKernel,
     ThermoConv3x3DsKernel, ThermoConv3x3GeluCacheKernel, ThermoConv3x3GeluKernel,
-    ThermoConv3x3Kernel, ThermoConvBwdHiddenKernel, ThermoIm2colDw1Kernel,
+    ThermoConv3x3Kernel, ThermoConvBwdHiddenKernel, ThermoIm2colDw1Kernel, ThermoIm2colF16Kernel,
 };
 pub use thermo_stencil::{
     ThermoAvgPoolBackwardKernel, ThermoAvgPoolKernel, ThermoDiffusionBwdDsKernel,

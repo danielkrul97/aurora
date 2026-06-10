@@ -23,36 +23,6 @@
 
 use crate::thermo::field::ThermoConfig;
 
-/// Stored flux on the +width edge of `(z,i,j)`, zero on the far wall.
-#[inline]
-fn fx_at(fx: &[f32], z: usize, i: usize, j: usize, m: usize, nc: usize, cfg: &ThermoConfig) -> f32 {
-    if j + 1 >= cfg.w {
-        0.0
-    } else {
-        fx[((z * cfg.h + i) * cfg.w + j) * nc + m]
-    }
-}
-
-/// Stored flux on the +height edge of `(z,i,j)`, zero on the far wall.
-#[inline]
-fn fy_at(fy: &[f32], z: usize, i: usize, j: usize, m: usize, nc: usize, cfg: &ThermoConfig) -> f32 {
-    if i + 1 >= cfg.h {
-        0.0
-    } else {
-        fy[((z * cfg.h + i) * cfg.w + j) * nc + m]
-    }
-}
-
-/// Stored flux on the +depth edge of `(z,i,j)`, zero on the far wall.
-#[inline]
-fn fz_at(fz: &[f32], z: usize, i: usize, j: usize, m: usize, nc: usize, cfg: &ThermoConfig) -> f32 {
-    if z + 1 >= cfg.d {
-        0.0
-    } else {
-        fz[((z * cfg.h + i) * cfg.w + j) * nc + m]
-    }
-}
-
 /// Forward: directed edge fluxes → per-cell divergence, all
 /// `[d*h*w*n_conserved]`.
 pub fn flux_div_forward(fx: &[f32], fy: &[f32], fz: &[f32], cfg: &ThermoConfig) -> Vec<f32> {
@@ -65,15 +35,23 @@ pub fn flux_div_forward(fx: &[f32], fy: &[f32], fz: &[f32], cfg: &ThermoConfig) 
     for z in 0..d {
         for i in 0..h {
             for j in 0..w {
-                let cell = (z * h + i) * w + j;
-                let out = &mut div[cell * nc..(cell + 1) * nc];
+                let base = ((z * h + i) * w + j) * nc;
+                // Boundary tests and neighbour bases depend only on (z,i,j),
+                // not the conserved channel — hoist them out of the m loop.
+                let (has_left, has_down, has_front) = (j > 0, i > 0, z > 0);
+                let (has_right, has_up, has_back) = (j + 1 < w, i + 1 < h, z + 1 < d);
+                let left = if has_left { base - nc } else { 0 };
+                let down = if has_down { base - w * nc } else { 0 };
+                let front = if has_front { base - h * w * nc } else { 0 };
+                let out = &mut div[base..base + nc];
                 for m in 0..nc {
-                    let in_left = if j == 0 { 0.0 } else { fx_at(fx, z, i, j - 1, m, nc, cfg) };
-                    let in_down = if i == 0 { 0.0 } else { fy_at(fy, z, i - 1, j, m, nc, cfg) };
-                    let in_front = if z == 0 { 0.0 } else { fz_at(fz, z - 1, i, j, m, nc, cfg) };
-                    out[m] = (in_left - fx_at(fx, z, i, j, m, nc, cfg))
-                        + (in_down - fy_at(fy, z, i, j, m, nc, cfg))
-                        + (in_front - fz_at(fz, z, i, j, m, nc, cfg));
+                    let in_left = if has_left { fx[left + m] } else { 0.0 };
+                    let in_down = if has_down { fy[down + m] } else { 0.0 };
+                    let in_front = if has_front { fz[front + m] } else { 0.0 };
+                    let cen_fx = if has_right { fx[base + m] } else { 0.0 };
+                    let cen_fy = if has_up { fy[base + m] } else { 0.0 };
+                    let cen_fz = if has_back { fz[base + m] } else { 0.0 };
+                    out[m] = (in_left - cen_fx) + (in_down - cen_fy) + (in_front - cen_fz);
                 }
             }
         }
@@ -90,24 +68,26 @@ pub fn flux_div_backward(d_div: &[f32], cfg: &ThermoConfig) -> (Vec<f32>, Vec<f3
     let mut d_fx = vec![0.0_f32; n];
     let mut d_fy = vec![0.0_f32; n];
     let mut d_fz = vec![0.0_f32; n];
-    let at = |z: usize, i: usize, j: usize, m: usize| d_div[((z * h + i) * w + j) * nc + m];
     for z in 0..d {
         for i in 0..h {
             for j in 0..w {
-                let cell = (z * h + i) * w + j;
+                let base = ((z * h + i) * w + j) * nc;
+                let (has_right, has_up, has_back) = (j + 1 < w, i + 1 < h, z + 1 < d);
+                let (right, up, back) = (base + nc, base + w * nc, base + h * w * nc);
                 for m in 0..nc {
+                    let c = d_div[base + m];
                     // fx[z,i,j] (+width edge, exists for j < w-1) enters
                     // div[z,i,j] with −1 and div[z,i,j+1] with +1.
-                    if j + 1 < w {
-                        d_fx[cell * nc + m] = -at(z, i, j, m) + at(z, i, j + 1, m);
+                    if has_right {
+                        d_fx[base + m] = -c + d_div[right + m];
                     }
                     // fy[z,i,j] (+height edge, exists for i < h-1).
-                    if i + 1 < h {
-                        d_fy[cell * nc + m] = -at(z, i, j, m) + at(z, i + 1, j, m);
+                    if has_up {
+                        d_fy[base + m] = -c + d_div[up + m];
                     }
                     // fz[z,i,j] (+depth edge, exists for z < d-1).
-                    if z + 1 < d {
-                        d_fz[cell * nc + m] = -at(z, i, j, m) + at(z + 1, i, j, m);
+                    if has_back {
+                        d_fz[base + m] = -c + d_div[back + m];
                     }
                 }
             }

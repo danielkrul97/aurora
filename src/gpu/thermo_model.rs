@@ -13,6 +13,7 @@ use super::buffers::GpuBuffer;
 use super::thermo_conv::{
     ThermoBiasGeluKernel, ThermoConv1x1Kernel, ThermoConv3x3DsKernel,
     ThermoConv3x3GeluCacheKernel, ThermoConvBwdHiddenKernel, ThermoIm2colDw1Kernel,
+    ThermoIm2colF16Kernel,
 };
 use super::thermo_step::{
     StepTransportBwdKernel, StepTransportFwdKernel, ThermoBiasRowAddKernel, ThermoScaleKernel,
@@ -24,11 +25,11 @@ use super::thermo_stencil::{
     ThermoInjectBatchedKernel, ThermoSpectralBackwardKernel, ThermoSpectralKernel,
 };
 use super::{
-    AdamWKernel, GemmKernel, GemmTransposeBKernel, GpuContext, GradNormSqReduceKernel,
-    MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel, MuonLoadStoreKernel, MuonMomentumKernel,
-    MuonStepXKernel, OuterProductAccumKernel, OuterProductSplitKKernel, RowReduceAddKernel,
-    ScaleByBufferKernel, SoftmaxCrossEntropyKernel, VectorAdd3Kernel, VectorAddKernel,
-    ZeroBufferKernel,
+    AdamWKernel, GemmKernel, GemmTransposeBF16Kernel, GemmTransposeBKernel, GpuContext,
+    GradNormSqReduceKernel, MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel,
+    MuonLoadStoreKernel, MuonMomentumKernel, MuonStepXKernel, OuterProductAccumKernel,
+    OuterProductSplitKKernel, RowReduceAddKernel, ScaleByBufferKernel, SoftmaxCrossEntropyKernel,
+    VectorAdd3Kernel, VectorAddKernel, ZeroBufferKernel,
 };
 use crate::optimizer::{bias_correction, AdamWConfig, MuonConfig};
 use crate::thermo::field::{free_channels_for, init_field, ThermoConfig};
@@ -69,6 +70,11 @@ pub struct ThermoGpu {
     /// (+ bias/GELU epilogue) instead of the per-element fused kernel.
     /// Runtime-toggleable for in-process A/B benchmarks.
     pub conv_im2col: bool,
+    /// Run the im2col forward GEMM (`hpre = patch @ w1ᵀ`) in fp16. Needs
+    /// `conv_im2col` + a SHADER_F16 device (`gtb_f16` is `Some`); silently
+    /// falls back to the f32 GEMM otherwise. Off by default (f32 parity);
+    /// the trainer opts in via `--conv-f16`.
+    pub conv_f16: bool,
     /// Re-inject the token (anneal-scaled) before every sub-step (H31).
     /// Set by the trainer; mirrors `ThermoLM::inject_every`.
     pub inject_every: bool,
@@ -80,6 +86,12 @@ pub struct ThermoGpu {
     transport_fwd: StepTransportFwdKernel,
     pool: ThermoAvgPoolKernel,
     gtb: GemmTransposeBKernel,
+    /// fp16-storage twin of `gtb` for the forward conv GEMM; `None` without
+    /// SHADER_F16. Reads the patch from `patch_f16` (built by `im2col_f16`).
+    gtb_f16: Option<GemmTransposeBF16Kernel>,
+    /// im2col that writes the patch as fp16 (forward conv only); `None` without
+    /// SHADER_F16.
+    im2col_f16: Option<ThermoIm2colF16Kernel>,
     vadd: VectorAddKernel,
     vadd3: VectorAdd3Kernel,
     inject: ThermoInjectBatchedKernel,
@@ -196,6 +208,8 @@ pub struct ThermoGpu {
     dw1_partials: GpuBuffer,
     /// im2col patch matrix `[nb·cells·(c·27)]` feeding the `d_w1` GEMM.
     patch: GpuBuffer,
+    /// fp16 patch for the f16-storage forward GEMM (same shape as `patch`).
+    patch_f16: GpuBuffer,
     dhpre: GpuBuffer,
     dsconv: GpuBuffer,
     tmp: GpuBuffer,
@@ -247,6 +261,7 @@ impl ThermoGpu {
             // (−17.5% at d=1), so default to it only for d>1. Bit-exact to the
             // per-element kernel, so this is a pure speed switch.
             conv_im2col: cfg.d > 1,
+            conv_f16: false,
             inject_every: false,
             conv3g: ThermoConv3x3GeluCacheKernel::new(ctx),
             bias_gelu: ThermoBiasGeluKernel::new(ctx),
@@ -255,6 +270,8 @@ impl ThermoGpu {
             transport_fwd: StepTransportFwdKernel::new(ctx),
             pool: ThermoAvgPoolKernel::new(ctx),
             gtb: GemmTransposeBKernel::new(ctx),
+            gtb_f16: ctx.has_f16.then(|| GemmTransposeBF16Kernel::new(ctx)),
+            im2col_f16: ctx.has_f16.then(|| ThermoIm2colF16Kernel::new(ctx)),
             vadd: VectorAddKernel::new(ctx),
             vadd3: VectorAdd3Kernel::new(ctx),
             inject: ThermoInjectBatchedKernel::new(ctx),
@@ -360,6 +377,7 @@ impl ThermoGpu {
             dw2_partials: z(OuterProductSplitKKernel::GROUPS as usize * cout * chid),
             dw1_partials: z(OuterProductSplitKKernel::GROUPS as usize * chid * c * 27),
             patch: z(b * cells * c * 27),
+            patch_f16: GpuBuffer::empty_f16(ctx, "patch_f16", b * cells * c * 27),
             dhpre: z(b * cells * chid),
             dsconv: z(b * cells * c),
             tmp: z(b * cells * c),
@@ -408,8 +426,19 @@ impl ThermoGpu {
                 let s_in = &self.s_traj[idx];
                 if self.conv_im2col {
                     // im2col → tiled GemmTransposeB (hpre = patch @ w1ᵀ) → bias+GELU.
-                    self.im2col_dw1.dispatch_b(&self.ctx, &mut enc, s_in, &self.patch, h as u32, w as u32, c as u32, bu, du);
-                    self.gtb.dispatch_into(&self.ctx, &mut enc, &self.patch, &self.w1.buf, &self.hpre_traj[idx], (b * cells) as u32, chid as u32, (c * 27) as u32);
+                    let (m, n, k) = ((b * cells) as u32, chid as u32, (c * 27) as u32);
+                    match (self.conv_f16, self.im2col_f16.as_ref(), self.gtb_f16.as_ref()) {
+                        // fp16-storage path: patch built directly as f16, GEMM reads it as f16.
+                        (true, Some(im2), Some(g)) => {
+                            im2.dispatch_b(&self.ctx, &mut enc, s_in, &self.patch_f16, h as u32, w as u32, c as u32, bu, du);
+                            g.dispatch_into(&self.ctx, &mut enc, &self.patch_f16, &self.w1.buf, &self.hpre_traj[idx], m, n, k);
+                        }
+                        // f32 path.
+                        _ => {
+                            self.im2col_dw1.dispatch_b(&self.ctx, &mut enc, s_in, &self.patch, h as u32, w as u32, c as u32, bu, du);
+                            self.gtb.dispatch_into(&self.ctx, &mut enc, &self.patch, &self.w1.buf, &self.hpre_traj[idx], m, n, k);
+                        }
+                    }
                     self.bias_gelu.dispatch_into(&self.ctx, &mut enc, &self.hpre_traj[idx], &self.b1.buf, &self.hpost_traj[idx], (b * cells) as u32, chid as u32);
                 } else {
                     // fused conv3x3 + GELU: caches pre + post in one dispatch.
@@ -489,10 +518,15 @@ impl ThermoGpu {
             (0..max_windows).map(|i| all[i * all.len() / max_windows]).collect()
         };
 
+        let n_chunks = windows.len().div_ceil(b);
+        // Per-chunk NLL is copied (GPU-side) into one accumulation buffer so the
+        // host blocks once at the end instead of draining the pipeline after
+        // every chunk. Same compute→copy ordering as `backward_dispatch`.
+        let acc = GpuBuffer::empty(&self.ctx, "thermo eval acc", n_chunks * seq * b);
+
         let mut toks = vec![0u32; seq * b];
         let mut tgts = vec![0u32; seq * b];
-        let mut total_nats = 0.0_f64;
-        for chunk in windows.chunks(b) {
+        for (ci, chunk) in windows.chunks(b).enumerate() {
             let valid = chunk.len();
             for (bi, &p) in chunk.iter().enumerate() {
                 for ti in 0..seq {
@@ -515,12 +549,18 @@ impl ThermoGpu {
             // loss_scale 1.0 → loss_seq holds raw per-position NLL (d_logits
             // is written but unused). Same [T,B] drive as `backward_dispatch`.
             self.sce.dispatch_into(&self.ctx, &mut enc, &self.logits, &self.d_logits, &self.loss_seq, &self.targets_buf, vocab as u32, b as u32, seq as u32, 1.0, 0);
+            enc.copy_buffer_to_buffer(&self.loss_seq.inner, 0, &acc.inner, (ci * seq * b * 4) as u64, (seq * b * 4) as u64);
             self.ctx.queue.submit(Some(enc.finish()));
+        }
 
-            let ls = self.loss_seq.download(&self.ctx);
+        let ls = acc.download(&self.ctx);
+        let mut total_nats = 0.0_f64;
+        for (ci, chunk) in windows.chunks(b).enumerate() {
+            let valid = chunk.len();
+            let base = ci * seq * b;
             for ti in 0..seq {
                 for bi in 0..valid {
-                    total_nats += f64::from(ls[ti * b + bi]);
+                    total_nats += f64::from(ls[base + ti * b + bi]);
                 }
             }
         }
@@ -807,7 +847,7 @@ impl ThermoGpu {
 
     /// Block until the GPU has finished all submitted work (profiling barrier).
     pub fn drain(&self) {
-        let _ = self.ctx.device.poll(wgpu::Maintain::Wait);
+        let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
     }
 
     /// Download all param grads into a CPU `ThermoGrads` (for parity / debug).

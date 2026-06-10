@@ -147,4 +147,52 @@ fn main() {
     println!("  per-element conv3g : {min_conv3g:7.2} ms/step");
     println!("  im2col + GEMM      : {min_im2col:7.2} ms/step");
     println!("  Δ = {d:+.2} ms/step ({:+.1}%)", d / min_conv3g * 100.0);
+
+    // ── In-process A/B: im2col forward GEMM f32 vs f16 (both im2col) ──
+    if !ctx.has_f16 {
+        println!("\nno SHADER_F16 — skipping f16 conv A/B");
+        return;
+    }
+    {
+        // Correctness: f16 forward loss vs f32, same model + input.
+        let mut g32 = ThermoGpu::new(&ctx, &model, seq, 4);
+        let mut g16 = ThermoGpu::new(&ctx, &model, seq, 4);
+        g32.conv_im2col = true;
+        g16.conv_im2col = true;
+        g16.conv_f16 = true;
+        let tc = toks(seq, 4, c.vocab);
+        let l32 = g32.train_step(&tc, &tc, &adam, true).unwrap();
+        let l16 = g16.train_step(&tc, &tc, &adam, true).unwrap();
+        println!("\ncorrectness: loss f32 {l32:.6}  f16 {l16:.6}  |Δ| {:.2e}", (l32 - l16).abs());
+    }
+    println!("\n── fwd conv GEMM: f32 vs f16 @ B=24, in-process A/B (im2col both) ──");
+    gpu.conv_im2col = true;
+    let mut min_f32 = f64::MAX;
+    let mut min_f16 = f64::MAX;
+    for round in 0..3 {
+        gpu.conv_f16 = false;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            gpu.train_step(&t, &tg, &adam, false);
+        }
+        let _ = gpu.read_mean_loss();
+        let f32ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+
+        gpu.conv_f16 = true;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            gpu.train_step(&t, &tg, &adam, false);
+        }
+        let _ = gpu.read_mean_loss();
+        let f16ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+
+        min_f32 = min_f32.min(f32ms);
+        min_f16 = min_f16.min(f16ms);
+        println!("  round {round}: f32 {f32ms:7.2}  f16 {f16ms:7.2}  Δ {:+.2} ms", f32ms - f16ms);
+    }
+    let df = min_f32 - min_f16;
+    println!("  ── min of 3 rounds (B=24, d={}) ──", c.d);
+    println!("  im2col + f32 GEMM  : {min_f32:7.2} ms/step");
+    println!("  im2col + f16 GEMM  : {min_f16:7.2} ms/step");
+    println!("  Δ = {df:+.2} ms/step ({:+.1}%)", df / min_f32 * 100.0);
 }

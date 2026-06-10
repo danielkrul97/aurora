@@ -26,7 +26,7 @@ fn bench(ctx: &GpuContext, mut record: impl FnMut(&mut wgpu::CommandEncoder)) ->
         let mut e = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         for _ in 0..N { record(&mut e); }
         ctx.queue.submit(Some(e.finish()));
-        let _ = ctx.device.poll(wgpu::Maintain::Wait);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
     }
     let mut best = f64::MAX;
     for _ in 0..ROUNDS {
@@ -35,7 +35,7 @@ fn bench(ctx: &GpuContext, mut record: impl FnMut(&mut wgpu::CommandEncoder)) ->
         let cb = e.finish();
         let t0 = Instant::now();
         ctx.queue.submit(Some(cb));
-        let _ = ctx.device.poll(wgpu::Maintain::Wait);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
         best = best.min(t0.elapsed().as_secs_f64() * 1e3 / f64::from(N));
     }
     best
