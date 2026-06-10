@@ -13,7 +13,7 @@
 use rand::Rng;
 
 use crate::attention::{linear_backward, linear_forward, LinearGrads, LinearProj};
-use crate::linalg::{gelu, gelu_backward};
+use crate::linalg::{gelu, gelu_backward, relu2, relu2_backward};
 
 #[derive(Clone, Debug)]
 pub struct FfnWeights {
@@ -21,6 +21,8 @@ pub struct FfnWeights {
     pub w_proj: LinearProj,
     pub d_model: usize,
     pub d_ff: usize,
+    /// Squared-ReLU activation instead of GELU.
+    pub relu2: bool,
 }
 
 impl FfnWeights {
@@ -31,6 +33,7 @@ impl FfnWeights {
             w_proj: LinearProj::new_scaled(d_ff, d_model, resid_scale, rng),
             d_model,
             d_ff,
+            relu2: false,
         }
     }
 }
@@ -67,7 +70,11 @@ pub struct FfnCache {
 
 pub fn ffn_forward(w: &FfnWeights, x: &[f32]) -> (Vec<f32>, FfnCache) {
     let h_pre = linear_forward(&w.w_fc, x);
-    let h_post: Vec<f32> = h_pre.iter().map(|&v| gelu(v)).collect();
+    let h_post: Vec<f32> = if w.relu2 {
+        h_pre.iter().map(|&v| relu2(v)).collect()
+    } else {
+        h_pre.iter().map(|&v| gelu(v)).collect()
+    };
     let y = linear_forward(&w.w_proj, &h_post);
     (
         y,
@@ -82,8 +89,14 @@ pub fn ffn_forward(w: &FfnWeights, x: &[f32]) -> (Vec<f32>, FfnCache) {
 pub fn ffn_backward(w: &FfnWeights, cache: &FfnCache, dy: &[f32], grads: &mut FfnGrads) -> Vec<f32> {
     let d_h_post = linear_backward(&w.w_proj, &cache.h_post, dy, &mut grads.d_w_proj);
     let mut d_h_pre = vec![0.0_f32; cache.h_pre.len()];
-    for i in 0..cache.h_pre.len() {
-        d_h_pre[i] = d_h_post[i] * gelu_backward(cache.h_pre[i]);
+    if w.relu2 {
+        for i in 0..cache.h_pre.len() {
+            d_h_pre[i] = d_h_post[i] * relu2_backward(cache.h_pre[i]);
+        }
+    } else {
+        for i in 0..cache.h_pre.len() {
+            d_h_pre[i] = d_h_post[i] * gelu_backward(cache.h_pre[i]);
+        }
     }
     linear_backward(&w.w_fc, &cache.x, &d_h_pre, &mut grads.d_w_fc)
 }

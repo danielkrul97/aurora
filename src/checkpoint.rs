@@ -6,23 +6,27 @@
     clippy::too_many_lines
 )]
 
-//! AURORA04 checkpoint format for the decoder-only transformer.
+//! AURORA05 checkpoint format for the decoder-only transformer.
 //!
 //! Binary layout (little-endian):
 //! ```text
-//! magic       : [u8; 8] = b"AURORA04"
+//! magic       : [u8; 8] = b"AURORA05"
 //! vocab       : u32
 //! d_model     : u32
 //! n_layer     : u32
 //! n_head      : u32
 //! d_ff        : u32
 //! seq_len_max : u32
-//! flags       : u32   (bit 0 = rope; w_pos is stored either way)
+//! flags       : u32   (bit 0 = rope; bit 1 = rmsnorm; bit 2 = relu2;
+//!                      bit 3 = qk_norm; bit 4 = untied_head.
+//!                      w_pos and LN β are stored either way)
+//! softcap     : f32   (0.0 = off)
 //! epoch       : u32
 //! step        : u64
 //!
 //! w_tok       : f32[vocab * d_model]
 //! w_pos       : f32[seq_len_max * d_model]
+//! w_head      : f32[vocab * d_model]   (only when untied_head)
 //! per block (× n_layer):
 //!   ln1_gamma : f32[d_model]
 //!   ln1_beta  : f32[d_model]
@@ -50,9 +54,13 @@ use rand::SeedableRng;
 
 use crate::transformer::{DecoderTransformer, TransformerConfig};
 
-const MAGIC: &[u8; 8] = b"AURORA04";
+const MAGIC: &[u8; 8] = b"AURORA05";
 
 const FLAG_ROPE: u32 = 1;
+const FLAG_RMSNORM: u32 = 1 << 1;
+const FLAG_RELU2: u32 = 1 << 2;
+const FLAG_QK_NORM: u32 = 1 << 3;
+const FLAG_UNTIED_HEAD: u32 = 1 << 4;
 
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
@@ -78,12 +86,32 @@ pub fn save<P: AsRef<Path>>(
     write_u32(&mut w, model.config.n_head as u32)?;
     write_u32(&mut w, model.config.d_ff as u32)?;
     write_u32(&mut w, model.config.seq_len_max as u32)?;
-    write_u32(&mut w, if model.config.rope { FLAG_ROPE } else { 0 })?;
+    let mut flags = 0u32;
+    if model.config.rope {
+        flags |= FLAG_ROPE;
+    }
+    if model.config.rmsnorm {
+        flags |= FLAG_RMSNORM;
+    }
+    if model.config.relu2 {
+        flags |= FLAG_RELU2;
+    }
+    if model.config.qk_norm {
+        flags |= FLAG_QK_NORM;
+    }
+    if model.config.untied_head {
+        flags |= FLAG_UNTIED_HEAD;
+    }
+    write_u32(&mut w, flags)?;
+    write_f32(&mut w, model.config.softcap)?;
     write_u32(&mut w, epoch)?;
     write_u64(&mut w, step)?;
 
     write_f32_slice(&mut w, &model.embed.w_tok)?;
     write_f32_slice(&mut w, &model.embed.w_pos)?;
+    if let Some(w_head) = model.w_head.as_ref() {
+        write_f32_slice(&mut w, w_head)?;
+    }
     for blk in &model.blocks {
         write_f32_slice(&mut w, &blk.ln1.gamma)?;
         write_f32_slice(&mut w, &blk.ln1.beta)?;
@@ -111,7 +139,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     if &magic != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bad checkpoint magic — expected AURORA04",
+            "bad checkpoint magic — expected AURORA05",
         ));
     }
     let vocab = read_u32(&mut r)? as usize;
@@ -121,6 +149,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     let d_ff = read_u32(&mut r)? as usize;
     let seq_len_max = read_u32(&mut r)? as usize;
     let flags = read_u32(&mut r)?;
+    let softcap = read_f32(&mut r)?;
     let epoch = read_u32(&mut r)?;
     let step = read_u64(&mut r)?;
 
@@ -132,6 +161,12 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
         d_ff,
         seq_len_max,
         rope: flags & FLAG_ROPE != 0,
+        rmsnorm: flags & FLAG_RMSNORM != 0,
+        relu2: flags & FLAG_RELU2 != 0,
+        qk_norm: flags & FLAG_QK_NORM != 0,
+        untied_head: flags & FLAG_UNTIED_HEAD != 0,
+        softcap,
+        zero_ffn_proj: false,
     };
 
     let mut rng = StdRng::seed_from_u64(0);
@@ -139,6 +174,9 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
 
     model.embed.w_tok = read_f32_vec(&mut r, vocab * d_model)?;
     model.embed.w_pos = read_f32_vec(&mut r, seq_len_max * d_model)?;
+    if cfg.untied_head {
+        model.w_head = Some(read_f32_vec(&mut r, vocab * d_model)?);
+    }
     for blk in &mut model.blocks {
         blk.ln1.gamma = read_f32_vec(&mut r, d_model)?;
         blk.ln1.beta = read_f32_vec(&mut r, d_model)?;

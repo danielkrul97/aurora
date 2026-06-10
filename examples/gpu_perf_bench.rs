@@ -146,6 +146,7 @@ fn main() {
             d_ff: 128,
             seq_len_max: 64,
             rope: false,
+        ..TransformerConfig::default()
         },
         32,
         5,
@@ -161,6 +162,7 @@ fn main() {
             d_ff: 1536,
             seq_len_max: 256,
             rope: false,
+        ..TransformerConfig::default()
         },
         128,
         5,
@@ -178,6 +180,7 @@ fn main() {
             d_ff: 128,
             seq_len_max: 64,
             rope: false,
+        ..TransformerConfig::default()
         },
         32,
         16,
@@ -194,6 +197,7 @@ fn main() {
             d_ff: 1536,
             seq_len_max: 256,
             rope: false,
+        ..TransformerConfig::default()
         },
         128,
         16,

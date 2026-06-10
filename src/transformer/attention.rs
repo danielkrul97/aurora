@@ -17,8 +17,9 @@
 use rand::Rng;
 
 use crate::attention::{
-    linear_backward, linear_forward, rope_rotate, scaled_dot_product_attention,
-    scaled_dot_product_attention_backward, AttentionCache, LinearGrads, LinearProj,
+    linear_backward, linear_forward, qk_norm_backward, qk_norm_forward, rope_rotate,
+    scaled_dot_product_attention, scaled_dot_product_attention_backward, AttentionCache,
+    LinearGrads, LinearProj,
 };
 
 #[derive(Clone, Debug)]
@@ -34,6 +35,9 @@ pub struct MhaWeights {
     /// cached q/k (and any KV history built from them) hold the
     /// already-rotated values.
     pub rope: bool,
+    /// Parameter-free RMS norm of each per-head Q/K row after
+    /// projection, before RoPE.
+    pub qk_norm: bool,
 }
 
 impl MhaWeights {
@@ -52,6 +56,7 @@ impl MhaWeights {
             d_head,
             d_model,
             rope: false,
+            qk_norm: false,
         }
     }
 }
@@ -89,6 +94,9 @@ pub struct MhaCache {
     pub q: Vec<f32>,
     pub k: Vec<f32>,
     pub v: Vec<f32>,
+    /// Pre-norm Q/K (empty unless `qk_norm`); needed by its backward.
+    pub q_raw: Vec<f32>,
+    pub k_raw: Vec<f32>,
     pub heads_out: Vec<f32>,
     pub attn_caches: Vec<AttentionCache>,
 }
@@ -104,6 +112,15 @@ pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
     let mut q = linear_forward(&w.w_q, x);
     let mut k = linear_forward(&w.w_k, x);
     let v = linear_forward(&w.w_v, x);
+    let (q_raw, k_raw) = if w.qk_norm {
+        let q_raw = q.clone();
+        let k_raw = k.clone();
+        qk_norm_forward(&mut q, n_head, d_head);
+        qk_norm_forward(&mut k, n_head, d_head);
+        (q_raw, k_raw)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     if w.rope {
         rope_rotate(&mut q, n_head, d_head, 0, false);
         rope_rotate(&mut k, n_head, d_head, 0, false);
@@ -143,6 +160,8 @@ pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
             q,
             k,
             v,
+            q_raw,
+            k_raw,
             heads_out,
             attn_caches,
         },
@@ -204,6 +223,10 @@ pub fn causal_mha_backward(
     if w.rope {
         rope_rotate(&mut d_q, n_head, d_head, 0, true);
         rope_rotate(&mut d_k, n_head, d_head, 0, true);
+    }
+    if w.qk_norm {
+        qk_norm_backward(&cache.q_raw, &mut d_q, n_head, d_head);
+        qk_norm_backward(&cache.k_raw, &mut d_k, n_head, d_head);
     }
 
     let dx_q = linear_backward(&w.w_q, &cache.x, &d_q, &mut grads.d_w_q);

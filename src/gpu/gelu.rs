@@ -1,4 +1,5 @@
-//! Element-wise GELU forward + backward.
+//! Element-wise FFN activation forward + backward.
+//! `mode == 0` GELU (tanh approximation), `mode == 1` squared ReLU.
 
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use super::softmax_ce::storage_entry;
 use super::GpuContext;
 
 const GELU_FORWARD_WGSL: &str = "
-struct G { n: u32, _p0: u32, _p1: u32, _p2: u32 };
+struct G { n: u32, mode: u32, _p1: u32, _p2: u32 };
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y: array<f32>;
 var<push_constant> p: G;
@@ -17,6 +18,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.n) { return; }
     let v = x[i];
+    if (p.mode == 1u) {
+        let r = max(v, 0.0);
+        y[i] = r * r;
+        return;
+    }
     let k: f32 = 0.7978845608028654; // sqrt(2/π)
     let inner = k * (v + 0.044715 * v * v * v);
     y[i] = 0.5 * v * (1.0 + tanh(inner));
@@ -24,7 +30,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 ";
 
 const GELU_BACKWARD_WGSL: &str = "
-struct G { n: u32, _p0: u32, _p1: u32, _p2: u32 };
+struct G { n: u32, mode: u32, _p1: u32, _p2: u32 };
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
 @group(0) @binding(1) var<storage, read>       dy: array<f32>;
 @group(0) @binding(2) var<storage, read_write> dx: array<f32>;
@@ -35,6 +41,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= p.n) { return; }
     let v = x[i];
+    if (p.mode == 1u) {
+        dx[i] = dy[i] * 2.0 * max(v, 0.0);
+        return;
+    }
     let k: f32 = 0.7978845608028654;
     let inner = k * (v + 0.044715 * v * v * v);
     let th = tanh(inner);
@@ -49,7 +59,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct GeluParams {
     n: u32,
-    _p0: u32,
+    mode: u32,
     _p1: u32,
     _p2: u32,
 }
@@ -107,8 +117,9 @@ impl GeluKernel {
         x: &GpuBuffer,
         y: &GpuBuffer,
         n: u32,
+        relu2: bool,
     ) {
-        let p = GeluParams { n, _p0: 0, _p1: 0, _p2: 0 };
+        let p = GeluParams { n, mode: u32::from(relu2), _p1: 0, _p2: 0 };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora gelu fwd bind"),
             layout: &self.bgl,
@@ -144,8 +155,9 @@ impl GeluKernel {
         pass: &mut wgpu::ComputePass<'_>,
         bind: &wgpu::BindGroup,
         n: u32,
+        relu2: bool,
     ) {
-        let p = GeluParams { n, _p0: 0, _p1: 0, _p2: 0 };
+        let p = GeluParams { n, mode: u32::from(relu2), _p1: 0, _p2: 0 };
         pass.set_bind_group(0, bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
@@ -210,8 +222,9 @@ impl GeluBackwardKernel {
         dy: &GpuBuffer,
         dx: &GpuBuffer,
         n: u32,
+        relu2: bool,
     ) {
-        let p = GeluParams { n, _p0: 0, _p1: 0, _p2: 0 };
+        let p = GeluParams { n, mode: u32::from(relu2), _p1: 0, _p2: 0 };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora gelu bwd bind"),
             layout: &self.bgl,
@@ -255,8 +268,9 @@ impl GeluBackwardKernel {
         pass: &mut wgpu::ComputePass<'_>,
         bind: &wgpu::BindGroup,
         n: u32,
+        relu2: bool,
     ) {
-        let p = GeluParams { n, _p0: 0, _p1: 0, _p2: 0 };
+        let p = GeluParams { n, mode: u32::from(relu2), _p1: 0, _p2: 0 };
         pass.set_bind_group(0, bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(n.div_ceil(256), 1, 1);

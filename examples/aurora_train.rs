@@ -40,13 +40,19 @@ use aurora::text_io::{bits_per_byte, load_corpus, sample_token};
 #[cfg(feature = "viz")]
 use aurora::transformer::ForwardCache;
 use aurora::transformer::{
-    cosine_warmup, DecoderTransformer, ModelGrads, TransformerConfig,
+    cosine_warmup, wsd_warmup, DecoderTransformer, ModelGrads, TransformerConfig,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 #[cfg(feature = "viz")]
 use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LrSchedule {
+    Cosine,
+    Wsd,
+}
 
 #[derive(Clone, Debug)]
 struct Cli {
@@ -76,6 +82,14 @@ struct Cli {
     muon_momentum: f32,
     muon_wd: f32,
     rope: bool,
+    rmsnorm: bool,
+    relu2: bool,
+    qk_norm: bool,
+    untied_head: bool,
+    softcap: f32,
+    zero_ffn_proj: bool,
+    lr_schedule: LrSchedule,
+    decay_frac: f32,
 }
 
 impl Cli {
@@ -106,6 +120,15 @@ impl Cli {
         let mut muon_momentum: f32 = 0.95;
         let mut muon_wd: f32 = 0.0;
         let mut rope: bool = false;
+        let mut rmsnorm: bool = false;
+        let mut relu2: bool = false;
+        let mut qk_norm: bool = false;
+        let mut untied_head: bool = false;
+        let mut softcap: Option<f32> = None;
+        let mut zero_ffn_proj: bool = false;
+        let mut lr_schedule: Option<LrSchedule> = None;
+        let mut decay_frac: f32 = 0.4;
+        let mut tier1: bool = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -226,12 +249,67 @@ impl Cli {
                     rope = true;
                     i += 1;
                 }
+                "--rmsnorm" => {
+                    rmsnorm = true;
+                    i += 1;
+                }
+                "--relu2" => {
+                    relu2 = true;
+                    i += 1;
+                }
+                "--qk-norm" => {
+                    qk_norm = true;
+                    i += 1;
+                }
+                "--untied-head" => {
+                    untied_head = true;
+                    i += 1;
+                }
+                "--softcap" => {
+                    softcap = Some(val(i, arg)?.parse().map_err(|e| format!("--softcap: {e}"))?);
+                    i += 2;
+                }
+                "--zero-ffn-proj" => {
+                    zero_ffn_proj = true;
+                    i += 1;
+                }
+                "--lr-schedule" => {
+                    lr_schedule = Some(match val(i, arg)?.as_str() {
+                        "cosine" => LrSchedule::Cosine,
+                        "wsd" => LrSchedule::Wsd,
+                        other => return Err(format!("--lr-schedule: unknown {other} (cosine|wsd)")),
+                    });
+                    i += 2;
+                }
+                "--decay-frac" => {
+                    decay_frac = val(i, arg)?.parse().map_err(|e| format!("--decay-frac: {e}"))?;
+                    i += 2;
+                }
+                // Tier-1 modernization pack: rope + rmsnorm + relu2 +
+                // qk-norm + untied head + softcap 30 + zero ffn proj + WSD.
+                "--tier1" => {
+                    tier1 = true;
+                    i += 1;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
                 other => return Err(format!("unknown flag {other}")),
             }
         }
+
+        if tier1 {
+            rope = true;
+            rmsnorm = true;
+            relu2 = true;
+            qk_norm = true;
+            untied_head = true;
+            zero_ffn_proj = true;
+            softcap = softcap.or(Some(30.0));
+            lr_schedule = lr_schedule.or(Some(LrSchedule::Wsd));
+        }
+        let softcap = softcap.unwrap_or(0.0);
+        let lr_schedule = lr_schedule.unwrap_or(LrSchedule::Cosine);
 
         if d_model % n_head != 0 {
             return Err(format!("d_model ({d_model}) must be divisible by n_head ({n_head})"));
@@ -272,6 +350,14 @@ impl Cli {
             muon_momentum,
             muon_wd,
             rope,
+            rmsnorm,
+            relu2,
+            qk_norm,
+            untied_head,
+            softcap,
+            zero_ffn_proj,
+            lr_schedule,
+            decay_frac,
         })
     }
 }
@@ -341,6 +427,21 @@ fn main() -> ExitCode {
     let mut rng = StdRng::seed_from_u64(cli.seed);
 
     // Load checkpoint if compatible, else fresh init.
+    let arch_cfg = TransformerConfig {
+        vocab: actual_vocab,
+        d_model: cli.d_model,
+        n_layer: cli.n_layer,
+        n_head: cli.n_head,
+        d_ff: cli.d_ff,
+        seq_len_max: cli.seq_len,
+        rope: cli.rope,
+        rmsnorm: cli.rmsnorm,
+        relu2: cli.relu2,
+        qk_norm: cli.qk_norm,
+        untied_head: cli.untied_head,
+        softcap: cli.softcap,
+        zero_ffn_proj: cli.zero_ffn_proj,
+    };
     let (model, start_epoch, step) = match checkpoint::load(&cli.checkpoint) {
         Ok(ckpt) => {
             if ckpt.model.config.vocab == actual_vocab
@@ -349,6 +450,11 @@ fn main() -> ExitCode {
                 && ckpt.model.config.n_head == cli.n_head
                 && ckpt.model.config.d_ff == cli.d_ff
                 && ckpt.model.config.rope == cli.rope
+                && ckpt.model.config.rmsnorm == cli.rmsnorm
+                && ckpt.model.config.relu2 == cli.relu2
+                && ckpt.model.config.qk_norm == cli.qk_norm
+                && ckpt.model.config.untied_head == cli.untied_head
+                && ckpt.model.config.softcap == cli.softcap
             {
                 println!(
                     "resuming from {} (epoch {}, step {})",
@@ -362,30 +468,12 @@ fn main() -> ExitCode {
                     "checkpoint {} architecture mismatch — fresh init",
                     cli.checkpoint.display()
                 );
-                let cfg = TransformerConfig {
-                    vocab: actual_vocab,
-                    d_model: cli.d_model,
-                    n_layer: cli.n_layer,
-                    n_head: cli.n_head,
-                    d_ff: cli.d_ff,
-                    seq_len_max: cli.seq_len,
-                    rope: cli.rope,
-                };
-                (DecoderTransformer::new(cfg, &mut rng), 0, 0u64)
+                (DecoderTransformer::new(arch_cfg.clone(), &mut rng), 0, 0u64)
             }
         }
         Err(_) => {
             println!("no checkpoint at {} — fresh init", cli.checkpoint.display());
-            let cfg = TransformerConfig {
-                vocab: actual_vocab,
-                d_model: cli.d_model,
-                n_layer: cli.n_layer,
-                n_head: cli.n_head,
-                d_ff: cli.d_ff,
-                seq_len_max: cli.seq_len,
-                rope: cli.rope,
-            };
-            (DecoderTransformer::new(cfg, &mut rng), 0, 0u64)
+            (DecoderTransformer::new(arch_cfg.clone(), &mut rng), 0, 0u64)
         }
     };
 
@@ -626,21 +714,29 @@ fn run_training_loop(mut ctx: TrainCtx) {
         let report_every = (n_chunks_per_stream / 50).max(1);
 
         for chunk_idx in 0..n_chunks_per_stream {
-            // Compute LR (cosine warmup) for both possible steppers.
-            let lr_t = cosine_warmup(
-                ctx.step as usize,
-                ctx.cli.warmup_steps,
-                total_steps_for_lr,
-                ctx.cli.lr,
-                ctx.cli.min_lr,
-            );
-            let muon_lr_t = cosine_warmup(
-                ctx.step as usize,
-                ctx.cli.warmup_steps,
-                total_steps_for_lr,
-                ctx.cli.muon_lr,
-                muon_min_lr,
-            );
+            // Compute LR (cosine or WSD, both with linear warmup) for
+            // both possible steppers.
+            let lr_at = |base: f32, min: f32| -> f32 {
+                match ctx.cli.lr_schedule {
+                    LrSchedule::Cosine => cosine_warmup(
+                        ctx.step as usize,
+                        ctx.cli.warmup_steps,
+                        total_steps_for_lr,
+                        base,
+                        min,
+                    ),
+                    LrSchedule::Wsd => wsd_warmup(
+                        ctx.step as usize,
+                        ctx.cli.warmup_steps,
+                        total_steps_for_lr,
+                        ctx.cli.decay_frac,
+                        base,
+                        min,
+                    ),
+                }
+            };
+            let lr_t = lr_at(ctx.cli.lr, ctx.cli.min_lr);
+            let muon_lr_t = lr_at(ctx.cli.muon_lr, muon_min_lr);
             let adam = AdamWConfig {
                 lr: lr_t,
                 weight_decay: ctx.cli.weight_decay,
@@ -1194,6 +1290,23 @@ fn print_header(
         if cli.rope { "rope" } else { "learned" }
     );
     println!(
+        " arch         : norm={} act={} qk_norm={} head={} softcap={} zero_proj={}",
+        if cli.rmsnorm { "rms" } else { "ln" },
+        if cli.relu2 { "relu2" } else { "gelu" },
+        cli.qk_norm,
+        if cli.untied_head { "untied" } else { "tied" },
+        cli.softcap,
+        cli.zero_ffn_proj,
+    );
+    println!(
+        " lr schedule  : {} (decay_frac {})",
+        match cli.lr_schedule {
+            LrSchedule::Cosine => "cosine",
+            LrSchedule::Wsd => "wsd",
+        },
+        cli.decay_frac,
+    );
+    println!(
         " optim        : muon hybrid | matrix lr {:.2e}, momentum {}, wd {} | embed/LN adamw lr {:.2e} → {:.2e}",
         cli.muon_lr,
         cli.muon_momentum,
@@ -1255,12 +1368,19 @@ impl MetricsWriter {
         params: usize,
     ) {
         let line = format!(
-            "{{\"event\":\"run\",\"corpus\":\"{}\",\"corpus_bytes\":{corpus_bytes},\"tokens\":{n_tokens},\"vocab\":{actual_vocab},\"d_model\":{},\"n_layer\":{},\"n_head\":{},\"d_ff\":{},\"seq_len\":{},\"batch_size\":{},\"epochs\":{},\"start_epoch\":{start_epoch},\"lr\":{:.6e},\"min_lr\":{:.6e},\"warmup_steps\":{},\"weight_decay\":{},\"grad_clip\":{},\"seed\":{},\"backend\":\"{backend}\",\"params\":{params},\"optimizer\":\"muon\",\"muon_lr\":{:.6e},\"muon_momentum\":{},\"muon_wd\":{},\"rope\":{}}}\n",
+            "{{\"event\":\"run\",\"corpus\":\"{}\",\"corpus_bytes\":{corpus_bytes},\"tokens\":{n_tokens},\"vocab\":{actual_vocab},\"d_model\":{},\"n_layer\":{},\"n_head\":{},\"d_ff\":{},\"seq_len\":{},\"batch_size\":{},\"epochs\":{},\"start_epoch\":{start_epoch},\"lr\":{:.6e},\"min_lr\":{:.6e},\"warmup_steps\":{},\"weight_decay\":{},\"grad_clip\":{},\"seed\":{},\"backend\":\"{backend}\",\"params\":{params},\"optimizer\":\"muon\",\"muon_lr\":{:.6e},\"muon_momentum\":{},\"muon_wd\":{},\"rope\":{},\"rmsnorm\":{},\"relu2\":{},\"qk_norm\":{},\"untied_head\":{},\"softcap\":{},\"zero_ffn_proj\":{},\"lr_schedule\":\"{}\",\"decay_frac\":{}}}\n",
             cli.corpus.display(),
             cli.d_model, cli.n_layer, cli.n_head, cli.d_ff, cli.seq_len,
             cli.batch_size, cli.epochs, cli.lr, cli.min_lr, cli.warmup_steps,
             cli.weight_decay, cli.grad_clip, cli.seed,
             cli.muon_lr, cli.muon_momentum, cli.muon_wd, cli.rope,
+            cli.rmsnorm, cli.relu2, cli.qk_norm, cli.untied_head,
+            cli.softcap, cli.zero_ffn_proj,
+            match cli.lr_schedule {
+                LrSchedule::Cosine => "cosine",
+                LrSchedule::Wsd => "wsd",
+            },
+            cli.decay_frac,
         );
         let _ = self.inner.write_all(line.as_bytes());
         self.flush();

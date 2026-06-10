@@ -18,7 +18,7 @@ use crate::optimizer::{
     MuonScratch,
 };
 use crate::transformer::block::{block_backward, block_forward, TransformerBlock, TransformerBlockCache, TransformerBlockGrads};
-use crate::transformer::embedding::{embed_backward, embed_forward, tied_lm_head_backward, tied_lm_head_forward, EmbedCache, EmbedGrads, EmbedWeights};
+use crate::transformer::embedding::{embed_backward, embed_forward, lm_head_backward, tied_lm_head_forward, EmbedCache, EmbedGrads, EmbedWeights};
 
 #[derive(Clone, Debug)]
 pub struct TransformerConfig {
@@ -31,6 +31,27 @@ pub struct TransformerConfig {
     /// Rotary position embedding on Q/K instead of the learned w_pos
     /// table (which stays allocated but unused when this is on).
     pub rope: bool,
+    /// RMSNorm instead of LayerNorm everywhere (β stays allocated as
+    /// zeros — checkpoint layout unchanged — but is unused).
+    pub rmsnorm: bool,
+    /// Squared-ReLU FFN activation instead of GELU.
+    pub relu2: bool,
+    /// Parameter-free RMS norm on per-head Q/K rows before RoPE.
+    pub qk_norm: bool,
+    /// Separate zero-initialized LM head matrix instead of tying to
+    /// `w_tok`. Trained with AdamW (+ weight decay).
+    pub untied_head: bool,
+    /// Logit softcap `cap·tanh(logits/cap)`; 0.0 = off.
+    pub softcap: f32,
+    /// Zero-init the FFN down-projection (like w_o), so each block
+    /// starts as the identity. Init-only — not stored in checkpoints.
+    pub zero_ffn_proj: bool,
+}
+
+impl Default for TransformerConfig {
+    fn default() -> Self {
+        Self::tiny(0)
+    }
 }
 
 impl TransformerConfig {
@@ -43,7 +64,7 @@ impl TransformerConfig {
             n_head: 6,
             d_ff: 1536,
             seq_len_max: 256,
-            rope: false,
+            ..Self::tiny(vocab)
         }
     }
 
@@ -57,6 +78,12 @@ impl TransformerConfig {
             d_ff: 128,
             seq_len_max: 64,
             rope: false,
+            rmsnorm: false,
+            relu2: false,
+            qk_norm: false,
+            untied_head: false,
+            softcap: 0.0,
+            zero_ffn_proj: false,
         }
     }
 }
@@ -65,6 +92,8 @@ impl TransformerConfig {
 pub struct DecoderTransformer {
     pub config: TransformerConfig,
     pub embed: EmbedWeights,
+    /// Untied LM head `[vocab * d_model]`; `None` = tied to `w_tok`.
+    pub w_head: Option<Vec<f32>>,
     pub blocks: Vec<TransformerBlock>,
     pub final_ln: LayerNorm,
     pub adam: AdamState,
@@ -76,6 +105,7 @@ pub struct DecoderTransformer {
 pub struct AdamState {
     pub g_w_tok: AdamGroup,
     pub g_w_pos: AdamGroup,
+    pub g_w_head: AdamGroup,
     pub blocks: Vec<BlockAdam>,
     pub g_final_gamma: AdamGroup,
     pub g_final_beta: AdamGroup,
@@ -127,10 +157,23 @@ impl DecoderTransformer {
                     rng,
                 );
                 blk.mha.rope = config.rope;
+                blk.mha.qk_norm = config.qk_norm;
+                blk.ln1.rms = config.rmsnorm;
+                blk.ln2.rms = config.rmsnorm;
+                blk.ffn.relu2 = config.relu2;
+                if config.zero_ffn_proj {
+                    blk.ffn.w_proj.w.fill(0.0);
+                }
                 blk
             })
             .collect();
-        let final_ln = LayerNorm::new(config.d_model);
+        let mut final_ln = LayerNorm::new(config.d_model);
+        final_ln.rms = config.rmsnorm;
+        // Zero-init: with softcap the initial logits are exactly uniform;
+        // gradient flow to the head is immediate either way.
+        let w_head = config
+            .untied_head
+            .then(|| vec![0.0_f32; config.vocab * config.d_model]);
 
         let d = config.d_model;
         let d_ff = config.d_ff;
@@ -149,6 +192,7 @@ impl DecoderTransformer {
         let adam = AdamState {
             g_w_tok: AdamGroup::zeros(config.vocab * d),
             g_w_pos: AdamGroup::zeros(config.seq_len_max * d),
+            g_w_head: AdamGroup::zeros(if config.untied_head { config.vocab * d } else { 0 }),
             blocks: (0..config.n_layer).map(|_| block_adam()).collect(),
             g_final_gamma: AdamGroup::zeros(d),
             g_final_beta: AdamGroup::zeros(d),
@@ -167,6 +211,7 @@ impl DecoderTransformer {
         Self {
             config,
             embed,
+            w_head,
             blocks,
             final_ln,
             adam,
@@ -182,7 +227,8 @@ impl DecoderTransformer {
         let d_ff = self.config.d_ff;
         let per_block = 2 * d + 2 * d + 4 * d * d + 2 * d * d_ff;
         let embed = self.config.vocab * d + self.config.seq_len_max * d;
-        embed + self.config.n_layer * per_block + 2 * d
+        let head = if self.config.untied_head { self.config.vocab * d } else { 0 };
+        embed + head + self.config.n_layer * per_block + 2 * d
     }
 }
 
@@ -204,8 +250,12 @@ pub struct ModelGrads {
 impl ModelGrads {
     #[must_use]
     pub fn zeros(config: &TransformerConfig) -> Self {
+        let mut embed = EmbedGrads::zeros(config.vocab, config.d_model, config.seq_len_max);
+        if config.untied_head {
+            embed.d_w_head = vec![0.0; config.vocab * config.d_model];
+        }
         Self {
-            embed: EmbedGrads::zeros(config.vocab, config.d_model, config.seq_len_max),
+            embed,
             blocks: (0..config.n_layer)
                 .map(|_| TransformerBlockGrads::zeros(config.d_model, config.d_ff))
                 .collect(),
@@ -229,6 +279,9 @@ impl ModelGrads {
             s += v * v;
         }
         for v in &self.embed.d_w_pos {
+            s += v * v;
+        }
+        for v in &self.embed.d_w_head {
             s += v * v;
         }
         for b in &self.blocks {
@@ -283,6 +336,9 @@ impl ModelGrads {
         for v in &self.embed.d_w_pos {
             s += v * v;
         }
+        for v in &self.embed.d_w_head {
+            s += v * v;
+        }
         for b in &self.blocks {
             for v in &b.d_ln1.d_gamma {
                 s += v * v;
@@ -306,12 +362,15 @@ impl ModelGrads {
         s.sqrt()
     }
 
-    /// Scale only the AdamW-managed subset (embed + LN).
+    /// Scale only the AdamW-managed subset (embed + head + LN).
     pub fn scale_adamw_subset(&mut self, factor: f32) {
         for v in &mut self.embed.d_w_tok {
             *v *= factor;
         }
         for v in &mut self.embed.d_w_pos {
+            *v *= factor;
+        }
+        for v in &mut self.embed.d_w_head {
             *v *= factor;
         }
         for b in &mut self.blocks {
@@ -341,6 +400,9 @@ impl ModelGrads {
             *v *= factor;
         }
         for v in &mut self.embed.d_w_pos {
+            *v *= factor;
+        }
+        for v in &mut self.embed.d_w_head {
             *v *= factor;
         }
         for b in &mut self.blocks {
@@ -394,6 +456,7 @@ impl ModelGrads {
         };
         add(&mut self.embed.d_w_tok, &other.embed.d_w_tok);
         add(&mut self.embed.d_w_pos, &other.embed.d_w_pos);
+        add(&mut self.embed.d_w_head, &other.embed.d_w_head);
         for (sb, ob) in self.blocks.iter_mut().zip(&other.blocks) {
             add(&mut sb.d_ln1.d_gamma, &ob.d_ln1.d_gamma);
             add(&mut sb.d_ln1.d_beta, &ob.d_ln1.d_beta);
@@ -423,12 +486,19 @@ impl DecoderTransformer {
             block_caches.push(cache);
         }
         let (h_final, final_ln_cache) = layer_norm_forward(&self.final_ln, &h);
-        let logits = tied_lm_head_forward(
+        let head_w = self.w_head.as_deref().unwrap_or(&self.embed.w_tok);
+        let mut logits = tied_lm_head_forward(
             &h_final,
-            &self.embed.w_tok,
+            head_w,
             self.config.vocab,
             self.config.d_model,
         );
+        let cap = self.config.softcap;
+        if cap > 0.0 {
+            for l in &mut logits {
+                *l = cap * (*l / cap).tanh();
+            }
+        }
 
         (
             logits,
@@ -466,8 +536,10 @@ impl DecoderTransformer {
 
         // Softmax + CE gradient computed in place into d_logits (no
         // per-row scratch), with the 1/T loss scale fused into the
-        // normalization pass.
+        // normalization pass. `logits` are post-softcap; the tanh chain
+        // factor is recovered from them (tanh = logit/cap), no extra cache.
         let inv_t = 1.0_f32 / t as f32;
+        let cap = self.config.softcap;
         for ti in 0..t {
             let row = &logits[ti * v..(ti + 1) * v];
             let drow = &mut d_logits[ti * v..(ti + 1) * v];
@@ -483,20 +555,26 @@ impl DecoderTransformer {
             let p_target = (drow[tgt] * inv_sum).max(1e-12);
             total_loss += -p_target.ln();
             drow[tgt] -= sum;
-            for c in 0..v {
-                drow[c] *= inv_sum * inv_t;
+            if cap > 0.0 {
+                let inv_cap = 1.0 / cap;
+                for c in 0..v {
+                    let th = row[c] * inv_cap;
+                    drow[c] *= inv_sum * inv_t * (1.0 - th * th);
+                }
+            } else {
+                for c in 0..v {
+                    drow[c] *= inv_sum * inv_t;
+                }
             }
         }
 
-        // Tied LM head backward.
-        let d_h_final = tied_lm_head_backward(
-            &cache.h_final,
-            &self.embed.w_tok,
-            &d_logits,
-            v,
-            d,
-            &mut grads.embed,
-        );
+        // LM head backward (into d_w_head when untied, else d_w_tok).
+        let head_w = self.w_head.as_deref().unwrap_or(&self.embed.w_tok);
+        let d_h_final = if self.config.untied_head {
+            lm_head_backward(&cache.h_final, head_w, &d_logits, v, d, &mut grads.embed.d_w_head)
+        } else {
+            lm_head_backward(&cache.h_final, head_w, &d_logits, v, d, &mut grads.embed.d_w_tok)
+        };
         // Final LayerNorm backward.
         let d_pre_final = layer_norm_backward(
             &self.final_ln,
@@ -550,6 +628,17 @@ impl DecoderTransformer {
             bc2,
             false,
         );
+        if let Some(w_head) = self.w_head.as_mut() {
+            adamw_apply(
+                w_head,
+                &grads.embed.d_w_head,
+                &mut self.adam.g_w_head,
+                config,
+                bc1,
+                bc2,
+                true,
+            );
+        }
         for (li, blk) in self.blocks.iter_mut().enumerate() {
             let ba = &mut self.adam.blocks[li];
             let bg = &grads.blocks[li];
@@ -615,6 +704,9 @@ impl DecoderTransformer {
         // all-Muon is equivalent to the previous interleaved order.
         adamw_apply(&mut self.embed.w_tok, &grads.embed.d_w_tok, &mut self.adam.g_w_tok, adam_cfg, bc1, bc2, true);
         adamw_apply(&mut self.embed.w_pos, &grads.embed.d_w_pos, &mut self.adam.g_w_pos, adam_cfg, bc1, bc2, false);
+        if let Some(w_head) = self.w_head.as_mut() {
+            adamw_apply(w_head, &grads.embed.d_w_head, &mut self.adam.g_w_head, adam_cfg, bc1, bc2, true);
+        }
         for (li, ba) in self.adam.blocks.iter_mut().enumerate() {
             let blk = &mut self.blocks[li];
             let bg = &grads.blocks[li];

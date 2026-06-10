@@ -1,4 +1,6 @@
-//! LayerNorm forward + backward (per-row reduction).
+//! LayerNorm / RMSNorm forward + backward (per-row reduction).
+//! `mode == 1` selects RMSNorm: no mean subtraction, β unused (forward)
+//! and ungradded (backward).
 
 use std::sync::Arc;
 
@@ -7,7 +9,7 @@ use super::softmax_ce::storage_entry;
 use super::GpuContext;
 
 const LN_FORWARD_WGSL: &str = "
-struct P { t: u32, d: u32, eps: f32, _pad: u32 };
+struct P { t: u32, d: u32, eps: f32, mode: u32 };
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
 @group(0) @binding(1) var<storage, read>       gamma: array<f32>;
 @group(0) @binding(2) var<storage, read>       beta: array<f32>;
@@ -58,7 +60,7 @@ fn main(
     }
     if (tid == 0u) {
         let inv_d = 1.0 / f32(p.d);
-        let mu = sh_sum[0] * inv_d;
+        let mu = select(sh_sum[0] * inv_d, 0.0, p.mode == 1u);
         let var_ = sh_sq[0] * inv_d - mu * mu;
         let s = inverseSqrt(var_ + p.eps);
         sh_mean = mu;
@@ -73,7 +75,7 @@ fn main(
         if (i >= p.d) { break; }
         let h = (x[base + i] - sh_mean) * sh_inv;
         x_hat[base + i] = h;
-        y[base + i] = h * gamma[i] + beta[i];
+        y[base + i] = h * gamma[i] + select(beta[i], 0.0, p.mode == 1u);
         i = i + 256u;
     }
 }
@@ -87,7 +89,7 @@ fn main(
 // Caller must pre-zero d_gamma/d_beta (the model's `g_*_gamma`/`g_*_beta`
 // buffers are zeroed by `zero_grad()` once per step before LN bwd runs).
 const LN_BACKWARD_WGSL: &str = "
-struct P { t: u32, d: u32, _pad0: u32, _pad1: u32 };
+struct P { t: u32, d: u32, mode: u32, _pad1: u32 };
 @group(0) @binding(0) var<storage, read>       dy: array<f32>;
 @group(0) @binding(1) var<storage, read>       gamma: array<f32>;
 @group(0) @binding(2) var<storage, read>       x_hat: array<f32>;
@@ -164,15 +166,18 @@ fn main(
     workgroupBarrier();
 
     let s = inv_std[row];
+    let mean_term = select(1.0, 0.0, p.mode == 1u);
     i = tid;
     loop {
         if (i >= p.d) { break; }
         let xh = x_hat[base + i];
         let dy_i = dy[base + i];
         let g = dy_i * gamma[i];
-        dx[base + i] = s * (g - inv_d * (sh_sum_g + xh * sh_sum_gx));
+        dx[base + i] = s * (g - inv_d * (mean_term * sh_sum_g + xh * sh_sum_gx));
         atomic_add_d_gamma(i, dy_i * xh);
-        atomic_add_d_beta(i, dy_i);
+        if (p.mode == 0u) {
+            atomic_add_d_beta(i, dy_i);
+        }
         i = i + 256u;
     }
 }
@@ -184,7 +189,7 @@ struct LnForwardParams {
     t: u32,
     d: u32,
     eps: f32,
-    _pad: u32,
+    mode: u32,
 }
 
 #[repr(C)]
@@ -192,7 +197,7 @@ struct LnForwardParams {
 struct LnBackwardParams {
     t: u32,
     d: u32,
-    _pad0: u32,
+    mode: u32,
     _pad1: u32,
 }
 
@@ -264,8 +269,9 @@ impl LayerNormForwardKernel {
         t: u32,
         d: u32,
         eps: f32,
+        rms: bool,
     ) {
-        let p = LnForwardParams { t, d, eps, _pad: 0 };
+        let p = LnForwardParams { t, d, eps, mode: u32::from(rms) };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora ln fwd bind"),
             layout: &self.bgl,
@@ -323,8 +329,9 @@ impl LayerNormForwardKernel {
         t: u32,
         d: u32,
         eps: f32,
+        rms: bool,
     ) {
-        let p = LnForwardParams { t, d, eps, _pad: 0 };
+        let p = LnForwardParams { t, d, eps, mode: u32::from(rms) };
         pass.set_bind_group(0, bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(t, 1, 1);
@@ -402,8 +409,9 @@ impl LayerNormBackwardKernel {
         d_beta: &GpuBuffer,
         t: u32,
         d: u32,
+        rms: bool,
     ) {
-        let p = LnBackwardParams { t, d, _pad0: 0, _pad1: 0 };
+        let p = LnBackwardParams { t, d, mode: u32::from(rms), _pad1: 0 };
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("aurora ln bwd bind"),
             layout: &self.bgl,
@@ -460,8 +468,9 @@ impl LayerNormBackwardKernel {
         bind: &wgpu::BindGroup,
         t: u32,
         d: u32,
+        rms: bool,
     ) {
-        let p = LnBackwardParams { t, d, _pad0: 0, _pad1: 0 };
+        let p = LnBackwardParams { t, d, mode: u32::from(rms), _pad1: 0 };
         pass.set_bind_group(0, bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
         pass.dispatch_workgroups(t, 1, 1);

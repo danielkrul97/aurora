@@ -19,8 +19,9 @@ use super::{
     GpuContext, GradNormFinalizeKernel, GradNormSqReduceKernel, LayerNormBackwardKernel,
     LayerNormForwardKernel, MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel,
     MuonLoadStoreKernel, MuonMomentumKernel, MuonStepXKernel, OuterProductAccumKernel,
-    RopeKernel, RowReduceAddKernel, ScaleByBufferKernel, SoftmaxCrossEntropyKernel,
-    TokenPosEmbedKernel, VectorAddKernel, ZeroBufferKernel,
+    QkNormBackwardKernel, QkNormKernel, RopeKernel, RowReduceAddKernel, ScaleByBufferKernel,
+    SoftcapBackwardKernel, SoftcapKernel, SoftmaxCrossEntropyKernel, TokenPosEmbedKernel,
+    VectorAddKernel, ZeroBufferKernel,
 };
 use crate::optimizer::{bias_correction, AdamWConfig, MuonConfig};
 use crate::transformer::{DecoderTransformer, TransformerConfig};
@@ -66,6 +67,10 @@ pub struct DecoderTransformerGpu {
     pub mha_kv: MhaKvCacheKernel,
     pub softmax_ce: SoftmaxCrossEntropyKernel,
     pub rope: RopeKernel,
+    pub qknorm_fwd: QkNormKernel,
+    pub qknorm_bwd: QkNormBackwardKernel,
+    pub softcap_fwd: SoftcapKernel,
+    pub softcap_bwd: SoftcapBackwardKernel,
 
     // Pure-GPU clip_grads scratch:
     //   gn_partials_flat — concatenated per-tensor partial sums of squares
@@ -116,6 +121,8 @@ pub(crate) struct ForwardOps {
     pub layers: Vec<LayerForwardOps>,
     pub final_ln: wgpu::BindGroup,
     pub final_gemm: wgpu::BindGroup,
+    /// In-place softcap on the logits buffer (None when softcap == 0).
+    pub softcap: Option<wgpu::BindGroup>,
 }
 
 pub(crate) struct LayerForwardOps {
@@ -123,6 +130,10 @@ pub(crate) struct LayerForwardOps {
     pub gemm_q: wgpu::BindGroup,
     pub gemm_k: wgpu::BindGroup,
     pub gemm_v: wgpu::BindGroup,
+    /// q_raw → q / k_raw → k RMS row norm (None when qk_norm off; the
+    /// QKV gemms then write q/k directly).
+    pub qknorm_q: Option<wgpu::BindGroup>,
+    pub qknorm_k: Option<wgpu::BindGroup>,
     pub rope_q: wgpu::BindGroup,
     pub rope_k: wgpu::BindGroup,
     pub mha: wgpu::BindGroup,
@@ -137,6 +148,8 @@ pub(crate) struct LayerForwardOps {
 
 pub(crate) struct BackwardOps {
     pub gemm_d_h_final: wgpu::BindGroup,
+    /// Accumulates the LM-head weight grad — into g_w_head when untied,
+    /// else into g_w_tok (tied).
     pub outer_g_w_tok: wgpu::BindGroup,
     pub final_ln_bwd: wgpu::BindGroup,
     pub layers: Vec<LayerBackwardOps>,
@@ -146,6 +159,8 @@ pub(crate) struct BackwardOps {
     /// serves every layer.
     pub rope_dq: wgpu::BindGroup,
     pub rope_dk: wgpu::BindGroup,
+    /// d_logits *= 1 − tanh² chain factor (None when softcap == 0).
+    pub softcap_bwd: Option<wgpu::BindGroup>,
 }
 
 pub(crate) struct LayerBackwardOps {
@@ -164,6 +179,10 @@ pub(crate) struct LayerBackwardOps {
     pub mha_bwd_dscores: wgpu::BindGroup,
     pub mha_bwd_dq: wgpu::BindGroup,
     pub mha_bwd_dkv: wgpu::BindGroup,
+    /// In-place qk-norm backward on dq/dk against this layer's cached
+    /// q_raw/k_raw (None when qk_norm off).
+    pub qknorm_dq: Option<wgpu::BindGroup>,
+    pub qknorm_dk: Option<wgpu::BindGroup>,
     pub gemm_dx_q: wgpu::BindGroup,
     pub gemm_dx_k: wgpu::BindGroup,
     pub gemm_dx_v: wgpu::BindGroup,
@@ -201,6 +220,10 @@ pub(crate) struct LayerCache {
     pub q: GpuBuffer,
     pub k: GpuBuffer,
     pub v: GpuBuffer,
+    /// Pre-qk-norm Q/K, kept for the norm's backward (1-element dummies
+    /// when qk_norm is off).
+    pub q_raw: GpuBuffer,
+    pub k_raw: GpuBuffer,
     pub heads_out: GpuBuffer,
     pub head_probs: GpuBuffer,
     pub ln2_out: GpuBuffer,
@@ -275,6 +298,7 @@ impl Activations {
         // run all sequences in one submission with a single readback.
         let bt = max_batch.max(1) * t;
 
+        let qk_raw_len = if cfg.qk_norm { td } else { 1 };
         let layers: Vec<LayerCache> = (0..cfg.n_layer)
             .map(|_| LayerCache {
                 ln1_out: GpuBuffer::empty(ctx, "ln1_out", td),
@@ -283,6 +307,8 @@ impl Activations {
                 q: GpuBuffer::empty(ctx, "q", td),
                 k: GpuBuffer::empty(ctx, "k", td),
                 v: GpuBuffer::empty(ctx, "v", td),
+                q_raw: GpuBuffer::empty(ctx, "q_raw", qk_raw_len),
+                k_raw: GpuBuffer::empty(ctx, "k_raw", qk_raw_len),
                 heads_out: GpuBuffer::empty(ctx, "heads", td),
                 head_probs: GpuBuffer::empty(ctx, "probs", probs_cap),
                 ln2_out: GpuBuffer::empty(ctx, "ln2_out", td),
@@ -341,12 +367,15 @@ impl Activations {
 pub struct GpuParams {
     pub w_tok: GpuBuffer,
     pub w_pos: GpuBuffer,
+    /// Untied LM head (None = tied to w_tok), plus its grad and moments.
+    pub w_head: Option<GpuBuffer>,
     pub blocks: Vec<GpuBlock>,
     pub final_gamma: GpuBuffer,
     pub final_beta: GpuBuffer,
 
     pub g_w_tok: GpuBuffer,
     pub g_w_pos: GpuBuffer,
+    pub g_w_head: Option<GpuBuffer>,
     pub g_final_gamma: GpuBuffer,
     pub g_final_beta: GpuBuffer,
 
@@ -354,6 +383,8 @@ pub struct GpuParams {
     pub m2_w_tok: GpuBuffer,
     pub m1_w_pos: GpuBuffer,
     pub m2_w_pos: GpuBuffer,
+    pub m1_w_head: Option<GpuBuffer>,
+    pub m2_w_head: Option<GpuBuffer>,
     pub m1_final_gamma: GpuBuffer,
     pub m2_final_gamma: GpuBuffer,
     pub m1_final_beta: GpuBuffer,
@@ -468,6 +499,8 @@ fn build_forward_ops(
     gelu_fwd: &GeluKernel,
     vadd: &VectorAddKernel,
     rope: &RopeKernel,
+    qknorm_fwd: &QkNormKernel,
+    softcap_fwd: &SoftcapKernel,
 ) -> ForwardOps {
     let embed = embed_fwd.build_bind(ctx, &a.tok_buf, &p.w_tok, &p.w_pos, &a.h0);
     let layers: Vec<LayerForwardOps> = (0..cfg.n_layer)
@@ -475,14 +508,27 @@ fn build_forward_ops(
             let blk = &p.blocks[li];
             let lc = &a.layers[li];
             let x = if li == 0 { &a.h0 } else { &a.z_chain[li - 1] };
+            // With qk-norm the QKV gemms write into q_raw/k_raw and the
+            // norm produces q/k; without it they write q/k directly.
+            let (q_dst, k_dst) = if cfg.qk_norm {
+                (&lc.q_raw, &lc.k_raw)
+            } else {
+                (&lc.q, &lc.k)
+            };
             LayerForwardOps {
                 ln1: ln_fwd.build_bind(
                     ctx, x, &blk.ln1_gamma, &blk.ln1_beta, &lc.ln1_out, &a.ln1_mean,
                     &lc.ln1_inv, &lc.ln1_xhat,
                 ),
-                gemm_q: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_q, &lc.q),
-                gemm_k: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_k, &lc.k),
+                gemm_q: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_q, q_dst),
+                gemm_k: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_k, k_dst),
                 gemm_v: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_v, &lc.v),
+                qknorm_q: cfg
+                    .qk_norm
+                    .then(|| qknorm_fwd.build_bind(ctx, &lc.q_raw, &lc.q)),
+                qknorm_k: cfg
+                    .qk_norm
+                    .then(|| qknorm_fwd.build_bind(ctx, &lc.k_raw, &lc.k)),
                 rope_q: rope.build_bind(ctx, &lc.q),
                 rope_k: rope.build_bind(ctx, &lc.k),
                 mha: mha_fwd.build_bind(ctx, &lc.q, &lc.k, &lc.v, &lc.heads_out, &lc.head_probs),
@@ -503,8 +549,10 @@ fn build_forward_ops(
         ctx, &a.z_chain[cfg.n_layer - 1], &p.final_gamma, &p.final_beta,
         &a.h_final, &a.f_mean, &a.f_inv, &a.f_xhat,
     );
-    let final_gemm = gemm_t.build_bind(ctx, &a.h_final, &p.w_tok, &a.logits_buf);
-    ForwardOps { embed, layers, final_ln, final_gemm }
+    let head_w = p.w_head.as_ref().unwrap_or(&p.w_tok);
+    let final_gemm = gemm_t.build_bind(ctx, &a.h_final, head_w, &a.logits_buf);
+    let softcap = (cfg.softcap > 0.0).then(|| softcap_fwd.build_bind(ctx, &a.logits_buf));
+    ForwardOps { embed, layers, final_ln, final_gemm, softcap }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -523,9 +571,13 @@ fn build_backward_ops(
     embed_scatter_reduce: &EmbedScatterReduceKernel,
     zerob: &ZeroBufferKernel,
     rope: &RopeKernel,
+    qknorm_bwd: &QkNormBackwardKernel,
+    softcap_bwd: &SoftcapBackwardKernel,
 ) -> BackwardOps {
-    let gemm_d_h_final = gemm.build_bind(ctx, &a.d_logits_buf, &p.w_tok, &a.d_h_final);
-    let outer_g_w_tok = outer_accum.build_bind(ctx, &a.h_final, &a.d_logits_buf, &p.g_w_tok);
+    let head_w = p.w_head.as_ref().unwrap_or(&p.w_tok);
+    let g_head = p.g_w_head.as_ref().unwrap_or(&p.g_w_tok);
+    let gemm_d_h_final = gemm.build_bind(ctx, &a.d_logits_buf, head_w, &a.d_h_final);
+    let outer_g_w_tok = outer_accum.build_bind(ctx, &a.h_final, &a.d_logits_buf, g_head);
     let final_ln_bwd = ln_bwd.build_bind(
         ctx, &a.d_h_final, &p.final_gamma, &a.f_xhat, &a.f_inv,
         &a.d_pre_final, &p.g_final_gamma, &p.g_final_beta,
@@ -563,6 +615,12 @@ fn build_backward_ops(
                     ctx, &lc.q, &lc.head_probs, &a.d_heads_out, &a.d_scores_scratch,
                     &a.dk, &a.dv,
                 ),
+                qknorm_dq: cfg
+                    .qk_norm
+                    .then(|| qknorm_bwd.build_bind(ctx, &lc.q_raw, &a.dq)),
+                qknorm_dk: cfg
+                    .qk_norm
+                    .then(|| qknorm_bwd.build_bind(ctx, &lc.k_raw, &a.dk)),
                 gemm_dx_q: gemm.build_bind(ctx, &a.dq, &blk.w_q, &a.dx_q),
                 gemm_dx_k: gemm.build_bind(ctx, &a.dk, &blk.w_k, &a.dx_k),
                 gemm_dx_v: gemm.build_bind(ctx, &a.dv, &blk.w_v, &a.dx_v),
@@ -594,6 +652,8 @@ fn build_backward_ops(
         embed_scatter_reduce,
         rope_dq: rope.build_bind(ctx, &a.dq),
         rope_dk: rope.build_bind(ctx, &a.dk),
+        softcap_bwd: (cfg.softcap > 0.0)
+            .then(|| softcap_bwd.build_bind(ctx, &a.logits_buf, &a.d_logits_buf)),
     }
 }
 
@@ -637,6 +697,12 @@ fn build_grad_ops(
 
     push(&p.w_tok, &p.g_w_tok, &p.m1_w_tok, &p.m2_w_tok, (v * d) as u32, true, false);
     push(&p.w_pos, &p.g_w_pos, &p.m1_w_pos, &p.m2_w_pos, (seq_max * d) as u32, false, false);
+    if let (Some(w_head), Some(g_w_head), Some(m1), Some(m2)) =
+        (&p.w_head, &p.g_w_head, &p.m1_w_head, &p.m2_w_head)
+    {
+        // Untied head: AdamW-managed (not Muon), decoupled WD on.
+        push(w_head, g_w_head, m1, m2, (v * d) as u32, true, false);
+    }
     push(&p.final_gamma, &p.g_final_gamma, &p.m1_final_gamma, &p.m2_final_gamma, d as u32, false, false);
     push(&p.final_beta, &p.g_final_beta, &p.m1_final_beta, &p.m2_final_beta, d as u32, false, false);
     for blk in &p.blocks {
@@ -815,12 +881,20 @@ impl DecoderTransformerGpu {
         let p = GpuParams {
             w_tok: GpuBuffer::from_slice(&ctx, "w_tok", &cpu.embed.w_tok),
             w_pos: GpuBuffer::from_slice(&ctx, "w_pos", &cpu.embed.w_pos),
+            w_head: cpu
+                .w_head
+                .as_ref()
+                .map(|h| GpuBuffer::from_slice(&ctx, "w_head", h)),
             blocks: cpu.blocks.iter().map(|b| upload_block(&ctx, b)).collect(),
             final_gamma: GpuBuffer::from_slice(&ctx, "f_g", &cpu.final_ln.gamma),
             final_beta: GpuBuffer::from_slice(&ctx, "f_b", &cpu.final_ln.beta),
 
             g_w_tok: GpuBuffer::zeros(&ctx, "g_w_tok", v * d),
             g_w_pos: GpuBuffer::zeros(&ctx, "g_w_pos", seq_max * d),
+            g_w_head: cpu
+                .w_head
+                .is_some()
+                .then(|| GpuBuffer::zeros(&ctx, "g_w_head", v * d)),
             g_final_gamma: GpuBuffer::zeros(&ctx, "g_f_g", d),
             g_final_beta: GpuBuffer::zeros(&ctx, "g_f_b", d),
 
@@ -828,14 +902,23 @@ impl DecoderTransformerGpu {
             m2_w_tok: GpuBuffer::zeros(&ctx, "m2_tok", v * d),
             m1_w_pos: GpuBuffer::zeros(&ctx, "m1_pos", seq_max * d),
             m2_w_pos: GpuBuffer::zeros(&ctx, "m2_pos", seq_max * d),
+            m1_w_head: cpu
+                .w_head
+                .is_some()
+                .then(|| GpuBuffer::zeros(&ctx, "m1_head", v * d)),
+            m2_w_head: cpu
+                .w_head
+                .is_some()
+                .then(|| GpuBuffer::zeros(&ctx, "m2_head", v * d)),
             m1_final_gamma: GpuBuffer::zeros(&ctx, "m1_fg", d),
             m2_final_gamma: GpuBuffer::zeros(&ctx, "m2_fg", d),
             m1_final_beta: GpuBuffer::zeros(&ctx, "m1_fb", d),
             m2_final_beta: GpuBuffer::zeros(&ctx, "m2_fb", d),
         };
 
-        // 4 top-level grad tensors + 10 per block. N_GROUPS_PER_TENSOR=8.
-        let total_partials = (4 + cfg.n_layer * 10) * GN_GROUPS_PER_TENSOR as usize;
+        // 4 top-level grad tensors (+1 untied head) + 10 per block.
+        let n_top = 4 + usize::from(cfg.untied_head);
+        let total_partials = (n_top + cfg.n_layer * 10) * GN_GROUPS_PER_TENSOR as usize;
         let gn_partials_flat = GpuBuffer::zeros(&ctx, "gn_partials_flat", total_partials);
         let gn_result = GpuBuffer::zeros(&ctx, "gn_result", 2);
 
@@ -868,6 +951,10 @@ impl DecoderTransformerGpu {
         let mha_kv = MhaKvCacheKernel::new(&ctx);
         let softmax_ce = SoftmaxCrossEntropyKernel::new(&ctx);
         let rope = RopeKernel::new(&ctx);
+        let qknorm_fwd = QkNormKernel::new(&ctx);
+        let qknorm_bwd = QkNormBackwardKernel::new(&ctx);
+        let softcap_fwd = SoftcapKernel::new(&ctx);
+        let softcap_bwd = SoftcapBackwardKernel::new(&ctx);
 
         let grad_ops =
             build_grad_ops(&ctx, &p, &cfg, &zerob, &adamw, &gn_sq, &scaleb_buf,
@@ -884,11 +971,13 @@ impl DecoderTransformerGpu {
         let fwd_ops = build_forward_ops(
             &ctx, &p, &acts, &cfg,
             &embed_fwd, &ln_fwd, &gemm_t, &mha_fwd, &gelu_fwd, &vadd, &rope,
+            &qknorm_fwd, &softcap_fwd,
         );
         let bwd_ops = build_backward_ops(
             &ctx, &p, &acts, &cfg,
             &gemm, &ln_bwd, &mha_bwd, &gelu_bwd, &vadd, &outer_accum,
             &embed_bwd, &embed_scatter_reduce, &zerob, &rope,
+            &qknorm_bwd, &softcap_bwd,
         );
 
         Self {
@@ -921,6 +1010,10 @@ impl DecoderTransformerGpu {
             mha_kv,
             softmax_ce,
             rope,
+            qknorm_fwd,
+            qknorm_bwd,
+            softcap_fwd,
+            softcap_bwd,
             gn_partials_flat,
             gn_result,
             ctx,
@@ -949,6 +1042,7 @@ impl DecoderTransformerGpu {
         let mut cpu = DecoderTransformer::new(self.config.clone(), &mut rng);
         cpu.embed.w_tok = self.p.w_tok.download(&self.ctx);
         cpu.embed.w_pos = self.p.w_pos.download(&self.ctx);
+        cpu.w_head = self.p.w_head.as_ref().map(|h| h.download(&self.ctx));
         cpu.final_ln.gamma = self.p.final_gamma.download(&self.ctx);
         cpu.final_ln.beta = self.p.final_beta.download(&self.ctx);
         for (li, blk) in cpu.blocks.iter_mut().enumerate() {
@@ -1107,7 +1201,7 @@ impl DecoderTransformerGpu {
                     label: Some("ln1"), timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.ln_fwd.pipeline);
-                self.ln_fwd.dispatch_with_bind(&mut pass, &fop.ln1, t_u, d_u, 1e-5);
+                self.ln_fwd.dispatch_with_bind(&mut pass, &fop.ln1, t_u, d_u, 1e-5, cfg.rmsnorm);
             }
             // QKV — independent gemm_t writes; batch into one pass (1.2).
             {
@@ -1118,6 +1212,19 @@ impl DecoderTransformerGpu {
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_q, t_u, d_u, d_u);
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_k, t_u, d_u, d_u);
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_v, t_u, d_u, d_u);
+            }
+            // QK-norm — q_raw → q, k_raw → k (disjoint outputs, one pass).
+            if let (Some(qn_q), Some(qn_k)) = (&fop.qknorm_q, &fop.qknorm_k) {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("qk norm"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.qknorm_fwd.pipeline);
+                self.qknorm_fwd.dispatch_with_bind(
+                    &mut pass, qn_q, t_u, n_head as u32, d_head as u32,
+                );
+                self.qknorm_fwd.dispatch_with_bind(
+                    &mut pass, qn_k, t_u, n_head as u32, d_head as u32,
+                );
             }
             // RoPE — in-place rotation of q and k (disjoint buffers, one pass).
             if cfg.rope {
@@ -1164,7 +1271,7 @@ impl DecoderTransformerGpu {
                     label: Some("ln2"), timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.ln_fwd.pipeline);
-                self.ln_fwd.dispatch_with_bind(&mut pass, &fop.ln2, t_u, d_u, 1e-5);
+                self.ln_fwd.dispatch_with_bind(&mut pass, &fop.ln2, t_u, d_u, 1e-5, cfg.rmsnorm);
             }
             // fc + gelu + proj (each in its own pass — sequential deps).
             {
@@ -1179,7 +1286,9 @@ impl DecoderTransformerGpu {
                     label: Some("gelu"), timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.gelu_fwd.pipeline);
-                self.gelu_fwd.dispatch_with_bind(&mut pass, &fop.gelu, (t * d_ff) as u32);
+                self.gelu_fwd.dispatch_with_bind(
+                    &mut pass, &fop.gelu, (t * d_ff) as u32, cfg.relu2,
+                );
             }
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1204,15 +1313,27 @@ impl DecoderTransformerGpu {
                 label: Some("final ln"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.ln_fwd.pipeline);
-            self.ln_fwd.dispatch_with_bind(&mut pass, &self.fwd_ops.final_ln, t_u, d_u, 1e-5);
+            self.ln_fwd.dispatch_with_bind(
+                &mut pass, &self.fwd_ops.final_ln, t_u, d_u, 1e-5, cfg.rmsnorm,
+            );
         }
-        // Tied LM head (logits = h_final × w_tokᵀ)
+        // LM head (logits = h_final × w_headᵀ, w_head = w_tok when tied)
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("lm head"), timestamp_writes: None,
             });
             pass.set_pipeline(self.gemm_t.pipeline());
             self.gemm_t.dispatch_with_bind(&mut pass, &self.fwd_ops.final_gemm, t_u, v as u32, d_u);
+        }
+        // Logit softcap (in place on the logits buffer).
+        if let Some(sc) = &self.fwd_ops.softcap {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("softcap"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.softcap_fwd.pipeline);
+            self.softcap_fwd.dispatch_with_bind(
+                &mut pass, sc, (t * v) as u32, cfg.softcap,
+            );
         }
     }
 
@@ -1342,7 +1463,19 @@ impl DecoderTransformerGpu {
             bt_offset,
         );
 
-        // d_h_final = d_logits × w_tok  AND  outer_accum into g_w_tok.
+        // Softcap chain rule: d_logits *= 1 − tanh² (tanh recovered from
+        // the capped logits still sitting in logits_buf).
+        if let Some(sc) = &self.bwd_ops.softcap_bwd {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("softcap bwd"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.softcap_bwd.pipeline);
+            self.softcap_bwd.dispatch_with_bind(
+                &mut pass, sc, (t * v) as u32, cfg.softcap,
+            );
+        }
+
+        // d_h_final = d_logits × w_head  AND  outer_accum into the head grad.
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("lm head bwd"), timestamp_writes: None,
@@ -1363,7 +1496,7 @@ impl DecoderTransformerGpu {
             });
             pass.set_pipeline(&self.ln_bwd.pipeline);
             self.ln_bwd.dispatch_with_bind(
-                &mut pass, &self.bwd_ops.final_ln_bwd, t_u, d_u,
+                &mut pass, &self.bwd_ops.final_ln_bwd, t_u, d_u, cfg.rmsnorm,
             );
         }
 
@@ -1536,7 +1669,7 @@ impl DecoderTransformerGpu {
                 label: Some("gelu bwd"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.gelu_bwd.pipeline);
-            self.gelu_bwd.dispatch_with_bind(&mut pass, &bop.gelu_bwd, td_ff);
+            self.gelu_bwd.dispatch_with_bind(&mut pass, &bop.gelu_bwd, td_ff, self.config.relu2);
         }
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1552,7 +1685,7 @@ impl DecoderTransformerGpu {
                 label: Some("ln2 bwd"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.ln_bwd.pipeline);
-            self.ln_bwd.dispatch_with_bind(&mut pass, &bop.ln2_bwd, t_u, d_u);
+            self.ln_bwd.dispatch_with_bind(&mut pass, &bop.ln2_bwd, t_u, d_u, self.config.rmsnorm);
         }
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1601,6 +1734,20 @@ impl DecoderTransformerGpu {
                 &mut pass, &self.bwd_ops.rope_dk, t_u, n_head as u32, d_head as u32, 0, true,
             );
         }
+        // QK-norm backward: dq/dk (w.r.t. normalized rows) → w.r.t. raw,
+        // in place, using this layer's cached q_raw/k_raw.
+        if let (Some(qn_dq), Some(qn_dk)) = (&bop.qknorm_dq, &bop.qknorm_dk) {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("qk norm bwd"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.qknorm_bwd.pipeline);
+            self.qknorm_bwd.dispatch_with_bind(
+                &mut pass, qn_dq, t_u, n_head as u32, d_head as u32,
+            );
+            self.qknorm_bwd.dispatch_with_bind(
+                &mut pass, qn_dk, t_u, n_head as u32, d_head as u32,
+            );
+        }
 
         // dx_q, dx_k, dx_v — all read distinct dq/dk/dv, write disjoint
         // dx_q/k/v. Safe in one pass.
@@ -1645,7 +1792,7 @@ impl DecoderTransformerGpu {
                 label: Some("ln1 bwd"), timestamp_writes: None,
             });
             pass.set_pipeline(&self.ln_bwd.pipeline);
-            self.ln_bwd.dispatch_with_bind(&mut pass, &bop.ln1_bwd, t_u, d_u);
+            self.ln_bwd.dispatch_with_bind(&mut pass, &bop.ln1_bwd, t_u, d_u, self.config.rmsnorm);
         }
         // Final residual: dx = d_post_attn + d_x_mha. Writes a.dx which
         // becomes d_z for the next (earlier) block's backward.
@@ -2088,15 +2235,27 @@ impl DecoderTransformerGpu {
             let ln1_xhat = GpuBuffer::empty(&self.ctx, "ln1_xhat", d);
             self.ln_fwd.dispatch_into(
                 &self.ctx, &mut enc, &h, &blk.ln1_gamma, &blk.ln1_beta, &ln1_out, &ln1_mean,
-                &ln1_inv, &ln1_xhat, 1, d as u32, 1e-5,
+                &ln1_inv, &ln1_xhat, 1, d as u32, 1e-5, cfg.rmsnorm,
             );
 
-            let q_new = GpuBuffer::empty(&self.ctx, "step_q", d);
-            let k_new = GpuBuffer::empty(&self.ctx, "step_k", d);
+            let mut q_new = GpuBuffer::empty(&self.ctx, "step_q", d);
+            let mut k_new = GpuBuffer::empty(&self.ctx, "step_k", d);
             let v_new = GpuBuffer::empty(&self.ctx, "step_v", d);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_q, &q_new, 1, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_k, &k_new, 1, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_v, &v_new, 1, d as u32, d as u32);
+            if cfg.qk_norm {
+                let q_n = GpuBuffer::empty(&self.ctx, "step_qn", d);
+                let k_n = GpuBuffer::empty(&self.ctx, "step_kn", d);
+                self.qknorm_fwd.dispatch_into(
+                    &self.ctx, &mut enc, &q_new, &q_n, 1, n_head as u32, d_head as u32,
+                );
+                self.qknorm_fwd.dispatch_into(
+                    &self.ctx, &mut enc, &k_new, &k_n, 1, n_head as u32, d_head as u32,
+                );
+                q_new = q_n;
+                k_new = k_n;
+            }
             if cfg.rope {
                 self.rope.dispatch_into(&self.ctx, &mut enc, &q_new, 1, n_head as u32, d_head as u32, pos as u32, false);
                 self.rope.dispatch_into(&self.ctx, &mut enc, &k_new, 1, n_head as u32, d_head as u32, pos as u32, false);
@@ -2127,10 +2286,10 @@ impl DecoderTransformerGpu {
             self.vadd.dispatch_into(&self.ctx, &mut enc, &h, &mha_out, &post_attn, d as u32);
             self.ln_fwd.dispatch_into(
                 &self.ctx, &mut enc, &post_attn, &blk.ln2_gamma, &blk.ln2_beta, &ln2_out,
-                &ln2_mean, &ln2_inv, &ln2_xhat, 1, d as u32, 1e-5,
+                &ln2_mean, &ln2_inv, &ln2_xhat, 1, d as u32, 1e-5, cfg.rmsnorm,
             );
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln2_out, &blk.w_fc, &h_pre, 1, d_ff as u32, d as u32);
-            self.gelu_fwd.dispatch_into(&self.ctx, &mut enc, &h_pre, &h_post, d_ff as u32);
+            self.gelu_fwd.dispatch_into(&self.ctx, &mut enc, &h_pre, &h_post, d_ff as u32, cfg.relu2);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &h_post, &blk.w_proj, &ffn_out, 1, d as u32, d_ff as u32);
             self.vadd.dispatch_into(&self.ctx, &mut enc, &post_attn, &ffn_out, &z, d as u32);
 
@@ -2144,11 +2303,17 @@ impl DecoderTransformerGpu {
         let logits = GpuBuffer::empty(&self.ctx, "step_logits", v_dim);
         self.ln_fwd.dispatch_into(
             &self.ctx, &mut enc, &h, &self.p.final_gamma, &self.p.final_beta, &h_final,
-            &f_mean, &f_inv, &f_xhat, 1, d as u32, 1e-5,
+            &f_mean, &f_inv, &f_xhat, 1, d as u32, 1e-5, cfg.rmsnorm,
         );
+        let head_w = self.p.w_head.as_ref().unwrap_or(&self.p.w_tok);
         self.gemm_t.dispatch_into(
-            &self.ctx, &mut enc, &h_final, &self.p.w_tok, &logits, 1, v_dim as u32, d as u32,
+            &self.ctx, &mut enc, &h_final, head_w, &logits, 1, v_dim as u32, d as u32,
         );
+        if cfg.softcap > 0.0 {
+            self.softcap_fwd.dispatch_into(
+                &self.ctx, &mut enc, &logits, v_dim as u32, cfg.softcap,
+            );
+        }
         self.ctx.queue.submit(Some(enc.finish()));
 
         cache.current_len = t_total_after;
@@ -2194,8 +2359,8 @@ impl DecoderTransformerGpu {
             let ln1_mean = GpuBuffer::empty(&self.ctx, "ln1_mean", t);
             let ln1_inv = GpuBuffer::empty(&self.ctx, "ln1_inv", t);
             let ln1_xhat = GpuBuffer::empty(&self.ctx, "ln1_xhat", t * d);
-            let q = GpuBuffer::empty(&self.ctx, "q", t * d);
-            let k = GpuBuffer::empty(&self.ctx, "k", t * d);
+            let mut q = GpuBuffer::empty(&self.ctx, "q", t * d);
+            let mut k = GpuBuffer::empty(&self.ctx, "k", t * d);
             let val = GpuBuffer::empty(&self.ctx, "v", t * d);
             let mut enc = self
                 .ctx
@@ -2205,11 +2370,23 @@ impl DecoderTransformerGpu {
                 });
             self.ln_fwd.dispatch_into(
                 &self.ctx, &mut enc, &x, &blk.ln1_gamma, &blk.ln1_beta, &ln1_out, &ln1_mean,
-                &ln1_inv, &ln1_xhat, t as u32, d as u32, 1e-5,
+                &ln1_inv, &ln1_xhat, t as u32, d as u32, 1e-5, cfg.rmsnorm,
             );
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_q, &q, t as u32, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_k, &k, t as u32, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_v, &val, t as u32, d as u32, d as u32);
+            if cfg.qk_norm {
+                let q_n = GpuBuffer::empty(&self.ctx, "q_n", t * d);
+                let k_n = GpuBuffer::empty(&self.ctx, "k_n", t * d);
+                self.qknorm_fwd.dispatch_into(
+                    &self.ctx, &mut enc, &q, &q_n, t as u32, n_head as u32, d_head as u32,
+                );
+                self.qknorm_fwd.dispatch_into(
+                    &self.ctx, &mut enc, &k, &k_n, t as u32, n_head as u32, d_head as u32,
+                );
+                q = q_n;
+                k = k_n;
+            }
             if cfg.rope {
                 self.rope.dispatch_into(&self.ctx, &mut enc, &q, t as u32, n_head as u32, d_head as u32, 0, false);
                 self.rope.dispatch_into(&self.ctx, &mut enc, &k, t as u32, n_head as u32, d_head as u32, 0, false);
@@ -2238,10 +2415,10 @@ impl DecoderTransformerGpu {
             self.vadd.dispatch_into(&self.ctx, &mut enc, &x, &mha_out, &post_attn, (t * d) as u32);
             self.ln_fwd.dispatch_into(
                 &self.ctx, &mut enc, &post_attn, &blk.ln2_gamma, &blk.ln2_beta, &ln2_out,
-                &ln2_mean, &ln2_inv, &ln2_xhat, t as u32, d as u32, 1e-5,
+                &ln2_mean, &ln2_inv, &ln2_xhat, t as u32, d as u32, 1e-5, cfg.rmsnorm,
             );
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln2_out, &blk.w_fc, &h_pre, t as u32, d_ff as u32, d as u32);
-            self.gelu_fwd.dispatch_into(&self.ctx, &mut enc, &h_pre, &h_post, (t * d_ff) as u32);
+            self.gelu_fwd.dispatch_into(&self.ctx, &mut enc, &h_pre, &h_post, (t * d_ff) as u32, cfg.relu2);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &h_post, &blk.w_proj, &ffn_out, t as u32, d as u32, d_ff as u32);
             self.vadd.dispatch_into(&self.ctx, &mut enc, &post_attn, &ffn_out, &z, (t * d) as u32);
             self.ctx.queue.submit(Some(enc.finish()));

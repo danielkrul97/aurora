@@ -58,3 +58,16 @@ pub fn gelu_backward(x: f32) -> f32 {
     let d_inner_dx = k * (1.0 + 3.0 * 0.044715 * x * x);
     0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * d_inner_dx
 }
+
+/// Squared ReLU (Primer / nanoGPT-speedrun FFN activation).
+#[must_use]
+pub fn relu2(x: f32) -> f32 {
+    let r = x.max(0.0);
+    r * r
+}
+
+/// `d_relu2/dx` at `x`.
+#[must_use]
+pub fn relu2_backward(x: f32) -> f32 {
+    2.0 * x.max(0.0)
+}

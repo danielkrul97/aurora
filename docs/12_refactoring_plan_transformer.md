@@ -636,6 +636,53 @@ už v pořádku — zbývaly CPU hot paths a eval.
 
 ---
 
+## Sprint 65 — Tier-1 modernizační balík (speedrun kánon)
+
+**Cíl:** zabudovat šest prověřených modernizací z modded-nanogpt
+literatury jako opt-in balík pro pack-vs-baseline A/B na plném enwik8.
+Všechno CPU + GPU, za CLI flagy (default chování beze změny):
+
+1. **RMSNorm** (`--rmsnorm`) — LN bez mean-subtrakce a bez β. β zůstává
+   alokovaná (checkpoint layout nezměněn), nedostává gradient. GPU: mode
+   bit v push constants LN fwd/bwd kernelů.
+2. **ReLU²** (`--relu2`) — squared-ReLU místo GELU ve FFN (Primer). GPU:
+   mode bit v gelu kernelech.
+3. **QK-norm** (`--qk-norm`) — parameter-free RMS norm per-head Q/K řádků
+   po projekci, před RoPE. Nový kernel `qk_norm.rs` (fwd + in-place bwd);
+   `MhaCache` nese `q_raw`/`k_raw` pro backward.
+4. **Untied head** (`--untied-head`) — samostatná zero-init `w_head`
+   matice (AdamW + WD, ne Muon). Zero-init + softcap ⇒ přesně uniformní
+   logity v kroku 0 (loss = ln V, ověřeno).
+5. **Softcap** (`--softcap 30`) — `cap·tanh(logits/cap)` (Gemma 2).
+   Backward bez extra cache: tanh se rekonstruuje z capped logits.
+   Nový kernel `softcap.rs`.
+6. **WSD schedule** (`--lr-schedule wsd`, `--decay-frac 0.4`) — warmup →
+   stable → lineární decay; run je prodloužitelný bez přeplánování.
+
+Plus `--zero-ffn-proj` (zero-init FFN down-projekce; w_o už zero byla)
+a **`--tier1`** = celý balík jedním flagem (softcap 30, wsd).
+
+**Checkpoint AURORA05:** flags bity 1–4 (rmsnorm/relu2/qk_norm/untied),
+nové f32 pole `softcap` v hlavičce, podmíněný tensor `w_head` za
+`w_pos`. Žádný backward compat s AURORA04.
+
+**Testy (+9):** numerické gradient checky (rmsnorm, relu2 FFN, qk-norm
+MHA, softcap+untied full-model), zero-proj init, WSD shape, KV-cache
+parity tier1 (CPU), checkpoint round-trip tier1, GPU full-model tier1
+parity (loss + g_w_q/k/fc/proj/ln1 + g_w_head + per-token NLL + nulový
+β grad). Celkem 70/70 zelených (GPU sada).
+
+**Smoke (tiny_200k, GTX 1650):** `--gpu --tier1` 1 epocha → val 3.245,
+resume z AURORA05 pokračuje (2. epocha → 3.085). CPU backend i
+`--features gpu,viz` build ověřeny.
+
+**Doporučený overnight A/B:** baseline `--gpu --rope --muon-wd 0.05`
+vs pack `--gpu --tier1 --muon-wd 0.05`, plný enwik8, stejný seed a
+wall-clock budget. Pack se přijímá/odmítá jako celek; ablace jen pokud
+prohraje (noise floor ~0.035 BPB).
+
+---
+
 ## Sprint 60+ — otevřená pole
 
 | Větev | Co odemyká | Effort |

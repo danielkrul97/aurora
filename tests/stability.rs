@@ -23,6 +23,7 @@ fn tiny_model(seed: u64) -> (DecoderTransformer, TransformerConfig) {
         d_ff: 64,
         seq_len_max: 32,
         rope: false,
+        ..TransformerConfig::default()
     };
     let mut rng = StdRng::seed_from_u64(seed);
     (DecoderTransformer::new(cfg.clone(), &mut rng), cfg)
@@ -237,4 +238,29 @@ fn very_small_lr_does_not_diverge() {
         rel_change < 0.5,
         "tiny-lr loss moved too much: {first_loss} → {last_loss}"
     );
+}
+
+#[test]
+fn wsd_schedule_warmup_flat_decay() {
+    use aurora::transformer::wsd_warmup;
+    let base = 1.0_f32;
+    let min = 0.1_f32;
+    let (warmup, max_steps, frac) = (100, 1000, 0.4);
+
+    // Warmup rises monotonically toward base.
+    assert!(wsd_warmup(0, warmup, max_steps, frac, base, min) < wsd_warmup(50, warmup, max_steps, frac, base, min));
+    assert!(wsd_warmup(50, warmup, max_steps, frac, base, min) < base + 1e-6);
+
+    // Stable phase sits exactly at base (decay starts at step 600).
+    assert!((wsd_warmup(100, warmup, max_steps, frac, base, min) - base).abs() < 1e-6);
+    assert!((wsd_warmup(599, warmup, max_steps, frac, base, min) - base).abs() < 1e-6);
+
+    // Linear decay phase: strictly between min and base, decreasing.
+    let mid = wsd_warmup(800, warmup, max_steps, frac, base, min);
+    assert!(mid < base && mid > min);
+    assert!(wsd_warmup(900, warmup, max_steps, frac, base, min) < mid);
+
+    // End of schedule clamps to min.
+    assert!((wsd_warmup(1000, warmup, max_steps, frac, base, min) - min).abs() < 1e-6);
+    assert!((wsd_warmup(5000, warmup, max_steps, frac, base, min) - min).abs() < 1e-6);
 }

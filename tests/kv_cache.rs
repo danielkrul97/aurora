@@ -29,9 +29,27 @@ fn kv_cache_generate_step_matches_full_forward_rope() {
     kv_cache_parity_for(true);
 }
 
+#[test]
+fn kv_cache_generate_step_matches_full_forward_tier1() {
+    kv_cache_parity_cfg(TransformerConfig {
+        vocab: 32,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 32,
+        rope: true,
+        rmsnorm: true,
+        relu2: true,
+        qk_norm: true,
+        untied_head: true,
+        softcap: 5.0,
+        ..TransformerConfig::default()
+    });
+}
+
 fn kv_cache_parity_for(rope: bool) {
-    let mut rng = StdRng::seed_from_u64(0xCACE);
-    let cfg = TransformerConfig {
+    kv_cache_parity_cfg(TransformerConfig {
         vocab: 32,
         d_model: 32,
         n_layer: 2,
@@ -39,8 +57,21 @@ fn kv_cache_parity_for(rope: bool) {
         d_ff: 64,
         seq_len_max: 32,
         rope,
-    };
-    let model = DecoderTransformer::new(cfg.clone(), &mut rng);
+        ..TransformerConfig::default()
+    });
+}
+
+fn kv_cache_parity_cfg(cfg: TransformerConfig) {
+    use rand::Rng;
+    let mut rng = StdRng::seed_from_u64(0xCACE);
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // Production zero-inits the untied head; randomize so logits differ.
+    if let Some(h) = model.w_head.as_mut() {
+        for v in h.iter_mut() {
+            *v = rng.random::<f32>() * 2.0 - 1.0;
+        }
+    }
+    let model = model;
 
     let seed: Vec<u32> = vec![3, 7, 2, 11, 5];
     let mut tokens = seed.clone();
@@ -117,6 +148,7 @@ fn kv_cache_reset_clears_state() {
         d_ff: 64,
         seq_len_max: 16,
         rope: false,
+        ..TransformerConfig::default()
     };
     let model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut cache = KvCache::new(cfg.n_layer, cfg.d_model);
@@ -144,6 +176,7 @@ fn kv_cache_generates_deterministic_with_temperature_0() {
         d_ff: 32,
         seq_len_max: 16,
         rope: false,
+        ..TransformerConfig::default()
     };
     let model = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -213,6 +246,7 @@ fn gpu_kv_cache_matches_cpu_kv_cache() {
         d_ff: 64,
         seq_len_max: 16,
         rope: false,
+        ..TransformerConfig::default()
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
@@ -263,6 +297,7 @@ fn gpu_kv_cache_greedy_matches_full_forward() {
         d_ff: 64,
         seq_len_max: 16,
         rope: false,
+        ..TransformerConfig::default()
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
@@ -327,6 +362,7 @@ fn gpu_kv_cache_parity_for(rope: bool) {
         d_ff: 64,
         seq_len_max: 96, // > 64 forces stride loops in phase 1/2
         rope,
+        ..TransformerConfig::default()
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
@@ -371,6 +407,7 @@ fn gpu_kv_cache_reset_correctness() {
         d_ff: 64,
         seq_len_max: 16,
         rope: false,
+        ..TransformerConfig::default()
     };
     let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);

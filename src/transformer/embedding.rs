@@ -56,6 +56,8 @@ impl EmbedWeights {
 pub struct EmbedGrads {
     pub d_w_tok: Vec<f32>,
     pub d_w_pos: Vec<f32>,
+    /// Untied LM head gradient; empty when the head is tied.
+    pub d_w_head: Vec<f32>,
 }
 
 impl EmbedGrads {
@@ -64,12 +66,14 @@ impl EmbedGrads {
         Self {
             d_w_tok: vec![0.0; vocab * d_model],
             d_w_pos: vec![0.0; seq_len_max * d_model],
+            d_w_head: Vec::new(),
         }
     }
 
     pub fn zero(&mut self) {
         self.d_w_tok.fill(0.0);
         self.d_w_pos.fill(0.0);
+        self.d_w_head.fill(0.0);
     }
 }
 
@@ -160,27 +164,27 @@ pub fn tied_lm_head_forward(h: &[f32], w_tok: &[f32], vocab: usize, d_model: usi
     logits
 }
 
-/// Backward through the tied LM head. Returns `d_h` and accumulates
-/// `d_w_tok` into `grads.d_w_tok`. Crucially, this is the **same**
-/// gradient buffer as the input embedding path — the caller is
-/// responsible for clearing once per step.
-pub fn tied_lm_head_backward(
+/// Backward through the LM head matmul. Returns `d_h` and accumulates
+/// the head-weight gradient into `d_w`. With a tied head `d_w` is the
+/// **same** buffer as the input-embedding gradient (`d_w_tok`) — the
+/// caller is responsible for clearing once per step.
+pub fn lm_head_backward(
     h: &[f32],
-    w_tok: &[f32],
+    w: &[f32],
     d_logits: &[f32],
     vocab: usize,
     d_model: usize,
-    grads: &mut EmbedGrads,
+    d_w: &mut [f32],
 ) -> Vec<f32> {
     let t = h.len() / d_model;
     let mut d_h = vec![0.0_f32; h.len()];
-    assert_eq!(grads.d_w_tok.len(), vocab * d_model);
+    assert_eq!(d_w.len(), vocab * d_model);
     let mut t0 = 0;
     while t0 < t {
         let tb = HEAD_BLOCK_T.min(t - t0);
         for v in 0..vocab {
-            let wr = &w_tok[v * d_model..(v + 1) * d_model];
-            let dwr = &mut grads.d_w_tok[v * d_model..(v + 1) * d_model];
+            let wr = &w[v * d_model..(v + 1) * d_model];
+            let dwr = &mut d_w[v * d_model..(v + 1) * d_model];
             for tt in 0..tb {
                 let ti = t0 + tt;
                 let g = d_logits[ti * vocab + v];
@@ -195,4 +199,16 @@ pub fn tied_lm_head_backward(
         t0 += tb;
     }
     d_h
+}
+
+/// Tied-head wrapper: accumulates into `grads.d_w_tok`.
+pub fn tied_lm_head_backward(
+    h: &[f32],
+    w_tok: &[f32],
+    d_logits: &[f32],
+    vocab: usize,
+    d_model: usize,
+    grads: &mut EmbedGrads,
+) -> Vec<f32> {
+    lm_head_backward(h, w_tok, d_logits, vocab, d_model, &mut grads.d_w_tok)
 }

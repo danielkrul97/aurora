@@ -13,8 +13,8 @@
 //! Output of `generate_step` is identical to running `forward()` over
 //! the full context up to that point (asserted in tests).
 
-use crate::attention::linear_forward;
-use crate::linalg::gelu;
+use crate::attention::{linear_forward, qk_norm_forward};
+use crate::linalg::{gelu, relu2};
 use crate::transformer::block::TransformerBlock;
 use crate::transformer::embedding::tied_lm_head_forward;
 use crate::transformer::model::DecoderTransformer;
@@ -116,9 +116,16 @@ pub fn generate_step(
         h = block_step(blk, kv, &h, t_new_pos);
     }
 
-    // 3. Final LN + tied LM head over single position.
+    // 3. Final LN + LM head over single position.
     let (h_final, _) = crate::attention::layer_norm_forward(&model.final_ln, &h);
-    let logits = tied_lm_head_forward(&h_final, &model.embed.w_tok, v_dim, d);
+    let head_w = model.w_head.as_deref().unwrap_or(&model.embed.w_tok);
+    let mut logits = tied_lm_head_forward(&h_final, head_w, v_dim, d);
+    let cap = model.config.softcap;
+    if cap > 0.0 {
+        for l in &mut logits {
+            *l = cap * (*l / cap).tanh();
+        }
+    }
 
     cache.current_len += 1;
     logits
@@ -142,6 +149,10 @@ fn block_step(
     let mut q_new = linear_forward(&blk.mha.w_q, &ln1_out);
     let mut k_new = linear_forward(&blk.mha.w_k, &ln1_out);
     let v_new = linear_forward(&blk.mha.w_v, &ln1_out);
+    if blk.mha.qk_norm {
+        qk_norm_forward(&mut q_new, n_head, d_head);
+        qk_norm_forward(&mut k_new, n_head, d_head);
+    }
     if blk.mha.rope {
         crate::attention::rope_rotate(&mut q_new, n_head, d_head, t_new_pos, false);
         crate::attention::rope_rotate(&mut k_new, n_head, d_head, t_new_pos, false);
@@ -208,7 +219,11 @@ fn block_step(
     // FFN
     let (ln2_out, _) = crate::attention::layer_norm_forward(&blk.ln2, &post_attn);
     let h_pre = linear_forward(&blk.ffn.w_fc, &ln2_out);
-    let h_post: Vec<f32> = h_pre.iter().map(|&v| gelu(v)).collect();
+    let h_post: Vec<f32> = if blk.ffn.relu2 {
+        h_pre.iter().map(|&v| relu2(v)).collect()
+    } else {
+        h_pre.iter().map(|&v| gelu(v)).collect()
+    };
     let ffn_out = linear_forward(&blk.ffn.w_proj, &h_post);
 
     let mut z = vec![0.0_f32; d];

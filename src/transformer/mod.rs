@@ -20,11 +20,11 @@ pub use block::{
     block_backward, block_forward, TransformerBlock, TransformerBlockCache, TransformerBlockGrads,
 };
 pub use embedding::{
-    embed_backward, embed_forward, tied_lm_head_backward, tied_lm_head_forward, EmbedCache,
-    EmbedGrads, EmbedWeights,
+    embed_backward, embed_forward, lm_head_backward, tied_lm_head_backward,
+    tied_lm_head_forward, EmbedCache, EmbedGrads, EmbedWeights,
 };
 pub use ffn::{ffn_backward, ffn_forward, FfnCache, FfnGrads, FfnWeights};
 pub use kv_cache::{generate_step, KvBlock, KvCache};
 pub use loss::{argmax, cross_entropy_with_grad, softmax};
 pub use model::{DecoderTransformer, ForwardCache, ModelGrads, TransformerConfig};
-pub use schedule::cosine_warmup;
+pub use schedule::{cosine_warmup, wsd_warmup};

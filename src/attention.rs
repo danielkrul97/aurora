@@ -33,6 +33,9 @@ pub struct LayerNorm {
     pub beta: Vec<f32>,
     pub eps: f32,
     pub d: usize,
+    /// RMSNorm mode: no mean subtraction, no beta (stays allocated as
+    /// zeros so the checkpoint layout is unchanged, receives no grad).
+    pub rms: bool,
 }
 
 impl LayerNorm {
@@ -43,6 +46,7 @@ impl LayerNorm {
             beta: vec![0.0; d],
             eps: 1e-5,
             d,
+            rms: false,
         }
     }
 }
@@ -88,7 +92,11 @@ pub fn layer_norm_forward(ln: &LayerNorm, x: &[f32]) -> (Vec<f32>, LayerNormCach
     let inv_d = 1.0 / d as f32;
     for i in 0..t {
         let row = &x[i * d..(i + 1) * d];
-        let mu: f32 = row.iter().sum::<f32>() * inv_d;
+        let mu: f32 = if ln.rms {
+            0.0
+        } else {
+            row.iter().sum::<f32>() * inv_d
+        };
         let var: f32 = row.iter().map(|v| (v - mu).powi(2)).sum::<f32>() * inv_d;
         let s = (var + ln.eps).sqrt().recip();
         mean[i] = mu;
@@ -96,7 +104,11 @@ pub fn layer_norm_forward(ln: &LayerNorm, x: &[f32]) -> (Vec<f32>, LayerNormCach
         for j in 0..d {
             let h = (row[j] - mu) * s;
             x_hat[i * d + j] = h;
-            y[i * d + j] = h * ln.gamma[j] + ln.beta[j];
+            y[i * d + j] = if ln.rms {
+                h * ln.gamma[j]
+            } else {
+                h * ln.gamma[j] + ln.beta[j]
+            };
         }
     }
     (y, LayerNormCache { mean, inv_std, x_hat })
@@ -127,14 +139,18 @@ pub fn layer_norm_backward(
         let mut sum_dy_gamma = 0.0_f32;
         for j in 0..d {
             grads.d_gamma[j] += dy_row[j] * xh[j];
-            grads.d_beta[j] += dy_row[j];
+            if !ln.rms {
+                grads.d_beta[j] += dy_row[j];
+            }
             let g = dy_row[j] * ln.gamma[j];
             sum_dy_gamma += g;
             sum_dy_xh_gamma += g * xh[j];
         }
+        // RMS mode: identical to LN minus the mean-coupling term.
+        let mean_term = if ln.rms { 0.0 } else { 1.0 };
         for j in 0..d {
             let g = dy_row[j] * ln.gamma[j];
-            dx[off + j] = s * (g - inv_d * (sum_dy_gamma + xh[j] * sum_dy_xh_gamma));
+            dx[off + j] = s * (g - inv_d * (mean_term * sum_dy_gamma + xh[j] * sum_dy_xh_gamma));
         }
     }
     dx
@@ -303,6 +319,56 @@ pub fn rope_rotate(
                 let x1 = x[off + 1];
                 x[off] = x0 * cos - x1 * sin;
                 x[off + 1] = x0 * sin + x1 * cos;
+            }
+        }
+    }
+}
+
+// --- QK-norm --------------------------------------------------------------
+
+pub const QK_NORM_EPS: f32 = 1e-6;
+
+/// Parameter-free RMS normalization of each per-head row of `x`
+/// (`[T * n_head * d_head]`), in place. Applied to Q and K after
+/// projection, before RoPE.
+pub fn qk_norm_forward(x: &mut [f32], n_head: usize, d_head: usize) {
+    let d = n_head * d_head;
+    let t = x.len() / d;
+    let inv_dh = 1.0 / d_head as f32;
+    for ti in 0..t {
+        for h in 0..n_head {
+            let off = ti * d + h * d_head;
+            let row = &mut x[off..off + d_head];
+            let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() * inv_dh;
+            let r = (ms + QK_NORM_EPS).sqrt().recip();
+            for v in row.iter_mut() {
+                *v *= r;
+            }
+        }
+    }
+}
+
+/// Backward of `qk_norm_forward`: maps `dy` (grad w.r.t. the normalized
+/// rows) to the grad w.r.t. `x_raw`, in place on `dy`.
+pub fn qk_norm_backward(x_raw: &[f32], dy: &mut [f32], n_head: usize, d_head: usize) {
+    let d = n_head * d_head;
+    let t = x_raw.len() / d;
+    let inv_dh = 1.0 / d_head as f32;
+    for ti in 0..t {
+        for h in 0..n_head {
+            let off = ti * d + h * d_head;
+            let xr = &x_raw[off..off + d_head];
+            let dyr = &mut dy[off..off + d_head];
+            let ms: f32 = xr.iter().map(|v| v * v).sum::<f32>() * inv_dh;
+            let r = (ms + QK_NORM_EPS).sqrt().recip();
+            let mut s = 0.0_f32;
+            for j in 0..d_head {
+                s += dyr[j] * xr[j] * r;
+            }
+            s *= inv_dh;
+            for j in 0..d_head {
+                let y = xr[j] * r;
+                dyr[j] = r * (dyr[j] - y * s);
             }
         }
     }

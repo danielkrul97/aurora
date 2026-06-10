@@ -46,6 +46,7 @@ fn cpu_transformer_byte_lm_converges_under_one_epoch() {
         d_ff: 128,
         seq_len_max: 64,
         rope: false,
+        ..TransformerConfig::default()
     };
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut grads = ModelGrads::zeros(&cfg);
@@ -106,6 +107,7 @@ fn cpu_transformer_bpe_lm_converges_under_one_epoch() {
         d_ff: 128,
         seq_len_max: 32,
         rope: false,
+        ..TransformerConfig::default()
     };
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
     let mut grads = ModelGrads::zeros(&cfg);
@@ -154,6 +156,7 @@ fn checkpoint_v3_round_trip_preserves_loss() {
         d_ff: 64,
         seq_len_max: 16,
         rope: false,
+        ..TransformerConfig::default()
     };
     let model = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -206,6 +209,7 @@ fn checkpoint_round_trip_preserves_rope_flag() {
         d_ff: 64,
         seq_len_max: 16,
         rope: true,
+        ..TransformerConfig::default()
     };
     let model = DecoderTransformer::new(cfg.clone(), &mut rng);
 
@@ -224,6 +228,57 @@ fn checkpoint_round_trip_preserves_rope_flag() {
     let (b, _) = loaded.model.forward(&tokens[..15]);
     for i in 0..a.len() {
         assert!((a[i] - b[i]).abs() < 1e-6, "logits diverge at {i}");
+    }
+}
+
+#[test]
+fn checkpoint_round_trip_preserves_tier1_flags_and_head() {
+    use rand::Rng;
+    let mut rng = StdRng::seed_from_u64(0x71E1);
+    let cfg = TransformerConfig {
+        vocab: 32,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        rope: true,
+        rmsnorm: true,
+        relu2: true,
+        qk_norm: true,
+        untied_head: true,
+        softcap: 30.0,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    if let Some(h) = model.w_head.as_mut() {
+        for v in h.iter_mut() {
+            *v = rng.random::<f32>() * 0.2 - 0.1;
+        }
+    }
+
+    let tmp = std::env::temp_dir().join("aurora_ckpt_tier1_roundtrip.bin");
+    checkpoint::save(&tmp, &model, 0, model.step).expect("save");
+    let loaded = checkpoint::load(&tmp).expect("load");
+    std::fs::remove_file(&tmp).ok();
+
+    let lc = &loaded.model.config;
+    assert!(lc.rope && lc.rmsnorm && lc.relu2 && lc.qk_norm && lc.untied_head, "tier1 flags lost");
+    assert!((lc.softcap - 30.0).abs() < 1e-6, "softcap lost");
+    assert!(loaded.model.blocks.iter().all(|b| b.mha.qk_norm && b.ffn.relu2 && b.ln1.rms && b.ln2.rms));
+    assert!(loaded.model.final_ln.rms);
+
+    let w_head_a = model.w_head.as_ref().unwrap();
+    let w_head_b = loaded.model.w_head.as_ref().expect("w_head missing after load");
+    for i in 0..w_head_a.len() {
+        assert!((w_head_a[i] - w_head_b[i]).abs() < 1e-6, "w_head diverges at {i}");
+    }
+
+    let tokens: Vec<u32> = (0..16u32).collect();
+    let (a, _) = model.forward(&tokens[..15]);
+    let (b, _) = loaded.model.forward(&tokens[..15]);
+    for i in 0..a.len() {
+        assert!((a[i] - b[i]).abs() < 1e-6, "tier1 logits diverge at {i}");
     }
 }
 
