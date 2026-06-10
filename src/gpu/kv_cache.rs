@@ -28,6 +28,9 @@ pub struct KvCacheGpu {
     pub current_len: usize,
     pub max_len: usize,
     pub d_model: usize,
+    /// Most recent token — the n-gram table needs the (prev, cur)
+    /// bigram when embedding the next one.
+    pub last_token: Option<u32>,
     /// Owned by the cache so `new`/`reset` never touch host memory for
     /// buffer initialization. Cached pipeline is cheap to keep around
     /// (Arc<ComputePipeline>).
@@ -63,6 +66,7 @@ impl KvCacheGpu {
             current_len: 0,
             max_len,
             d_model,
+            last_token: None,
             zero_kernel,
         }
     }
@@ -88,6 +92,7 @@ impl KvCacheGpu {
         }
         ctx.queue.submit(Some(enc.finish()));
         self.current_len = 0;
+        self.last_token = None;
     }
 }
 
@@ -251,7 +256,7 @@ struct P {
     n_head: u32,
     max_len: u32,
     scale: f32,
-    _p0: u32,
+    wnd: u32,
     _p1: u32,
     _p2: u32,
 };
@@ -279,18 +284,28 @@ fn main(
     let h_off = head_idx * p.d_head;
     let scratch_base = head_idx * p.max_len;
 
-    // Phase 1: parallel score compute + local max reduction.
+    // Phase 1: parallel score compute + local max reduction. The
+    // sliding window hides history older than `wnd` positions: their
+    // score is set to -inf so phase 2's exp zeroes them.
+    var j_start: u32 = 0u;
+    if (p.wnd > 0u && p.t_total > p.wnd) {
+        j_start = p.t_total - p.wnd;
+    }
     var local_max: f32 = -3.4028235e38;
     var j: u32 = tid;
     loop {
         if (j >= p.t_total) { break; }
-        var s: f32 = 0.0;
-        for (var c: u32 = 0u; c < p.d_head; c = c + 1u) {
-            s = s + q_new[h_off + c] * k_history[j * d_model + h_off + c];
+        if (j < j_start) {
+            scratch[scratch_base + j] = -3.4028235e38;
+        } else {
+            var s: f32 = 0.0;
+            for (var c: u32 = 0u; c < p.d_head; c = c + 1u) {
+                s = s + q_new[h_off + c] * k_history[j * d_model + h_off + c];
+            }
+            s = s * p.scale;
+            scratch[scratch_base + j] = s;
+            if (s > local_max) { local_max = s; }
         }
-        s = s * p.scale;
-        scratch[scratch_base + j] = s;
-        if (s > local_max) { local_max = s; }
         j = j + 64u;
     }
     sh_max[tid] = local_max;
@@ -358,7 +373,7 @@ struct MhaKvParams {
     n_head: u32,
     max_len: u32,
     scale: f32,
-    _p0: u32,
+    wnd: u32,
     _p1: u32,
     _p2: u32,
 }
@@ -431,6 +446,7 @@ impl MhaKvCacheKernel {
         n_head: u32,
         d_head: u32,
         max_len: u32,
+        window: u32,
     ) {
         let scale = (d_head as f32).sqrt().recip();
         let p = MhaKvParams {
@@ -439,7 +455,7 @@ impl MhaKvCacheKernel {
             n_head,
             max_len,
             scale,
-            _p0: 0,
+            wnd: window,
             _p1: 0,
             _p2: 0,
         };

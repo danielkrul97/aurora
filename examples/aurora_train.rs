@@ -90,6 +90,14 @@ struct Cli {
     zero_ffn_proj: bool,
     lr_schedule: LrSchedule,
     decay_frac: f32,
+    muon_momentum_warmup: usize,
+    seq_curriculum: bool,
+    mtp_weight: f32,
+    value_resid: bool,
+    tie_layers: bool,
+    local_window: usize,
+    global_layers: usize,
+    ngram_rows: usize,
 }
 
 impl Cli {
@@ -129,6 +137,14 @@ impl Cli {
         let mut lr_schedule: Option<LrSchedule> = None;
         let mut decay_frac: f32 = 0.4;
         let mut tier1: bool = false;
+        let mut muon_momentum_warmup: usize = 0;
+        let mut seq_curriculum: bool = false;
+        let mut mtp_weight: f32 = 0.0;
+        let mut value_resid: bool = false;
+        let mut tie_layers: bool = false;
+        let mut local_window: usize = 0;
+        let mut global_layers: usize = 1;
+        let mut ngram_rows: usize = 0;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -291,6 +307,40 @@ impl Cli {
                     tier1 = true;
                     i += 1;
                 }
+                "--mtp-weight" => {
+                    mtp_weight = val(i, arg)?.parse().map_err(|e| format!("--mtp-weight: {e}"))?;
+                    i += 2;
+                }
+                "--value-resid" => {
+                    value_resid = true;
+                    i += 1;
+                }
+                "--tie-layers" => {
+                    tie_layers = true;
+                    i += 1;
+                }
+                "--local-window" => {
+                    local_window = val(i, arg)?.parse().map_err(|e| format!("--local-window: {e}"))?;
+                    i += 2;
+                }
+                "--global-layers" => {
+                    global_layers = val(i, arg)?.parse().map_err(|e| format!("--global-layers: {e}"))?;
+                    i += 2;
+                }
+                "--ngram-rows" => {
+                    ngram_rows = val(i, arg)?.parse().map_err(|e| format!("--ngram-rows: {e}"))?;
+                    i += 2;
+                }
+                "--muon-momentum-warmup" => {
+                    muon_momentum_warmup = val(i, arg)?
+                        .parse()
+                        .map_err(|e| format!("--muon-momentum-warmup: {e}"))?;
+                    i += 2;
+                }
+                "--seq-curriculum" => {
+                    seq_curriculum = true;
+                    i += 1;
+                }
                 "-h" | "--help" => {
                     return Err("see file header for usage".into());
                 }
@@ -358,8 +408,31 @@ impl Cli {
             zero_ffn_proj,
             lr_schedule,
             decay_frac,
+            muon_momentum_warmup,
+            seq_curriculum,
+            mtp_weight,
+            value_resid,
+            tie_layers,
+            local_window,
+            global_layers,
+            ngram_rows,
         })
     }
+}
+
+/// Per-epoch context-length curriculum: quarter, half, then full
+/// `seq_len`. Short early sequences are ~free wall-clock and warm the
+/// model up on local structure first.
+fn seq_for_epoch(cli: &Cli, epoch: u32) -> usize {
+    if !cli.seq_curriculum {
+        return cli.seq_len;
+    }
+    let s = match epoch {
+        0 => cli.seq_len / 4,
+        1 => cli.seq_len / 2,
+        _ => cli.seq_len,
+    };
+    s.clamp(16.min(cli.seq_len), cli.seq_len)
 }
 
 struct TrainCtx {
@@ -441,6 +514,12 @@ fn main() -> ExitCode {
         untied_head: cli.untied_head,
         softcap: cli.softcap,
         zero_ffn_proj: cli.zero_ffn_proj,
+        mtp_weight: cli.mtp_weight,
+        value_resid: cli.value_resid,
+        tie_layers: cli.tie_layers,
+        local_window: cli.local_window,
+        global_layers: cli.global_layers,
+        ngram_rows: cli.ngram_rows,
     };
     let (model, start_epoch, step) = match checkpoint::load(&cli.checkpoint) {
         Ok(ckpt) => {
@@ -455,6 +534,11 @@ fn main() -> ExitCode {
                 && ckpt.model.config.qk_norm == cli.qk_norm
                 && ckpt.model.config.untied_head == cli.untied_head
                 && ckpt.model.config.softcap == cli.softcap
+                && (ckpt.model.config.mtp_weight > 0.0) == (cli.mtp_weight > 0.0)
+                && ckpt.model.config.value_resid == cli.value_resid
+                && ckpt.model.config.tie_layers == cli.tie_layers
+                && ckpt.model.config.local_window == cli.local_window
+                && ckpt.model.config.ngram_rows == cli.ngram_rows
             {
                 println!(
                     "resuming from {} (epoch {}, step {})",
@@ -655,11 +739,16 @@ fn run_training_loop(mut ctx: TrainCtx) {
     };
 
     let stream_len = train_toks.len() / ctx.cli.batch_size;
-    let max_chunk_advance = ctx.cli.seq_len.max(1);
-    let n_chunks_per_stream = stream_len.saturating_sub(1) / max_chunk_advance;
-    let total_steps_planned =
-        (ctx.cli.epochs - ctx.start_epoch as usize) * n_chunks_per_stream;
-    let total_steps_for_lr = (ctx.cli.epochs * n_chunks_per_stream).max(1);
+    let chunks_for = |seq: usize| stream_len.saturating_sub(1) / seq.max(1);
+    // With the seq-len curriculum, early epochs have more (shorter)
+    // chunks — the LR schedule total accounts for that.
+    let total_steps_planned: usize = (ctx.start_epoch..ctx.cli.epochs as u32)
+        .map(|e| chunks_for(seq_for_epoch(&ctx.cli, e)))
+        .sum();
+    let total_steps_for_lr = (0..ctx.cli.epochs as u32)
+        .map(|e| chunks_for(seq_for_epoch(&ctx.cli, e)))
+        .sum::<usize>()
+        .max(1);
 
     if let Some(m) = metrics.as_mut() {
         m.run_meta(
@@ -707,7 +796,13 @@ fn run_training_loop(mut ctx: TrainCtx) {
 
     for epoch in ctx.start_epoch..ctx.cli.epochs as u32 {
         let epoch_start = Instant::now();
-        println!("\n── epoch {epoch} ───────────────────────────────");
+        let cur_seq = seq_for_epoch(&ctx.cli, epoch);
+        let n_chunks_per_stream = chunks_for(cur_seq);
+        if cur_seq == ctx.cli.seq_len {
+            println!("\n── epoch {epoch} ───────────────────────────────");
+        } else {
+            println!("\n── epoch {epoch} (curriculum seq {cur_seq}) ────────────");
+        }
 
         let mut total_nats = 0.0_f32;
         let mut total_tokens = 0_usize;
@@ -742,9 +837,17 @@ fn run_training_loop(mut ctx: TrainCtx) {
                 weight_decay: ctx.cli.weight_decay,
                 ..AdamWConfig::default()
             };
+            // Momentum warmup (modded-nanogpt): 0.85 → target over the
+            // first `muon_momentum_warmup` steps.
+            let momentum_t = if ctx.cli.muon_momentum_warmup > 0 {
+                let f = (ctx.step as f32 / ctx.cli.muon_momentum_warmup as f32).min(1.0);
+                0.85 + (ctx.cli.muon_momentum - 0.85) * f
+            } else {
+                ctx.cli.muon_momentum
+            };
             let muon_cfg = MuonConfig {
                 lr: muon_lr_t,
-                momentum: ctx.cli.muon_momentum,
+                momentum: momentum_t,
                 weight_decay: ctx.cli.muon_wd,
                 ..MuonConfig::default()
             };
@@ -773,9 +876,9 @@ fn run_training_loop(mut ctx: TrainCtx) {
                 let mut inputs: Vec<&[u32]> = Vec::with_capacity(ctx.cli.batch_size);
                 let mut tgts: Vec<&[u32]> = Vec::with_capacity(ctx.cli.batch_size);
                 for b in 0..ctx.cli.batch_size {
-                    let p = b * stream_len + chunk_idx * ctx.cli.seq_len;
-                    inputs.push(&train_toks[p..p + ctx.cli.seq_len]);
-                    tgts.push(&train_toks[p + 1..p + ctx.cli.seq_len + 1]);
+                    let p = b * stream_len + chunk_idx * cur_seq;
+                    inputs.push(&train_toks[p..p + cur_seq]);
+                    tgts.push(&train_toks[p + 1..p + cur_seq + 1]);
                 }
                 // Whole batch in one encoder / one submit / one loss readback.
                 batch_loss += gpu.train_step_batch(&inputs, &tgts);
@@ -800,7 +903,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
                         train_toks,
                         stream_len,
                         chunk_idx,
-                        ctx.cli.seq_len,
+                        cur_seq,
                         ctx.cli.grad_clip,
                         &mut grads,
                         &mut batch_grads,
@@ -815,9 +918,9 @@ fn run_training_loop(mut ctx: TrainCtx) {
                     grads.zero();
                     for b in 0..ctx.cli.batch_size {
                         let stream_start = b * stream_len;
-                        let p = stream_start + chunk_idx * ctx.cli.seq_len;
-                        let input = &train_toks[p..p + ctx.cli.seq_len];
-                        let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
+                        let p = stream_start + chunk_idx * cur_seq;
+                        let input = &train_toks[p..p + cur_seq];
+                        let target = &train_toks[p + 1..p + cur_seq + 1];
                         let (logits, cache) = ctx.model.forward(input);
                         let loss = ctx.model.backward(&cache, &logits, target, &mut grads);
                         batch_loss += loss;
@@ -846,7 +949,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
                         train_toks,
                         stream_len,
                         chunk_idx,
-                        ctx.cli.seq_len,
+                        cur_seq,
                         ctx.cli.grad_clip,
                         &mut grads,
                         &mut batch_grads,
@@ -861,9 +964,9 @@ fn run_training_loop(mut ctx: TrainCtx) {
                     grads.zero();
                     for b in 0..ctx.cli.batch_size {
                         let stream_start = b * stream_len;
-                        let p = stream_start + chunk_idx * ctx.cli.seq_len;
-                        let input = &train_toks[p..p + ctx.cli.seq_len];
-                        let target = &train_toks[p + 1..p + ctx.cli.seq_len + 1];
+                        let p = stream_start + chunk_idx * cur_seq;
+                        let input = &train_toks[p..p + cur_seq];
+                        let target = &train_toks[p + 1..p + cur_seq + 1];
                         let (logits, cache) = ctx.model.forward(input);
                         let loss = ctx.model.backward(&cache, &logits, target, &mut grads);
                         batch_loss += loss;
@@ -885,8 +988,8 @@ fn run_training_loop(mut ctx: TrainCtx) {
             }
 
             let avg_loss = batch_loss / ctx.cli.batch_size as f32;
-            total_nats += avg_loss * ctx.cli.seq_len as f32;
-            total_tokens += ctx.cli.seq_len;
+            total_nats += avg_loss * cur_seq as f32;
+            total_tokens += cur_seq;
 
             let bpb_running =
                 bits_per_byte(total_nats, (total_tokens as f32 * ctx.comp) as usize);

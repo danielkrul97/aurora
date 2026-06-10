@@ -18,8 +18,8 @@ use rand::Rng;
 
 use crate::attention::{
     linear_backward, linear_forward, qk_norm_backward, qk_norm_forward, rope_rotate,
-    scaled_dot_product_attention, scaled_dot_product_attention_backward, AttentionCache,
-    LinearGrads, LinearProj,
+    scaled_dot_product_attention_backward, scaled_dot_product_attention_windowed,
+    AttentionCache, LinearGrads, LinearProj,
 };
 
 #[derive(Clone, Debug)]
@@ -38,6 +38,10 @@ pub struct MhaWeights {
     /// Parameter-free RMS norm of each per-head Q/K row after
     /// projection, before RoPE.
     pub qk_norm: bool,
+    /// Value residual: mix layer-0's value stream into this layer's,
+    /// `v = λ[0]·v_raw + λ[1]·v0`, learnable per-layer scalars.
+    pub value_resid: bool,
+    pub lambda_v: [f32; 2],
 }
 
 impl MhaWeights {
@@ -57,6 +61,8 @@ impl MhaWeights {
             d_model,
             rope: false,
             qk_norm: false,
+            value_resid: false,
+            lambda_v: [1.0, 0.0],
         }
     }
 }
@@ -67,6 +73,7 @@ pub struct MhaGrads {
     pub d_w_k: LinearGrads,
     pub d_w_v: LinearGrads,
     pub d_w_o: LinearGrads,
+    pub d_lambda_v: [f32; 2],
 }
 
 impl MhaGrads {
@@ -77,6 +84,7 @@ impl MhaGrads {
             d_w_k: LinearGrads::zeros(d_model, d_model),
             d_w_v: LinearGrads::zeros(d_model, d_model),
             d_w_o: LinearGrads::zeros(d_model, d_model),
+            d_lambda_v: [0.0; 2],
         }
     }
 
@@ -85,6 +93,7 @@ impl MhaGrads {
         self.d_w_k.zero();
         self.d_w_v.zero();
         self.d_w_o.zero();
+        self.d_lambda_v = [0.0; 2];
     }
 }
 
@@ -97,12 +106,36 @@ pub struct MhaCache {
     /// Pre-norm Q/K (empty unless `qk_norm`); needed by its backward.
     pub q_raw: Vec<f32>,
     pub k_raw: Vec<f32>,
+    /// Pre-mix V (empty unless this layer mixed in a v0).
+    pub v_raw: Vec<f32>,
     pub heads_out: Vec<f32>,
     pub attn_caches: Vec<AttentionCache>,
 }
 
 /// Causal MHA forward. `x: [T * D]` → `y: [T * D]` with `D = n_head * d_head`.
 pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
+    causal_mha_forward_full(w, x, 0, None)
+}
+
+/// Like `causal_mha_forward` with a sliding attention window (a
+/// property of the layer's position in the stack, not of its weights —
+/// hence a parameter, which also keeps it compatible with layer tying).
+pub fn causal_mha_forward_windowed(
+    w: &MhaWeights,
+    x: &[f32],
+    window: usize,
+) -> (Vec<f32>, MhaCache) {
+    causal_mha_forward_full(w, x, window, None)
+}
+
+/// Full-feature MHA forward: sliding window + optional value residual
+/// (`v0` = layer 0's value stream; mixed when `w.value_resid`).
+pub fn causal_mha_forward_full(
+    w: &MhaWeights,
+    x: &[f32],
+    window: usize,
+    v0: Option<&[f32]>,
+) -> (Vec<f32>, MhaCache) {
     let d = w.d_model;
     let n_head = w.n_head;
     let d_head = w.d_head;
@@ -111,7 +144,17 @@ pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
 
     let mut q = linear_forward(&w.w_q, x);
     let mut k = linear_forward(&w.w_k, x);
-    let v = linear_forward(&w.w_v, x);
+    let mut v = linear_forward(&w.w_v, x);
+    let v_raw = if let (true, Some(v0)) = (w.value_resid, v0) {
+        let v_raw = v.clone();
+        let [la, lb] = w.lambda_v;
+        for (vi, &v0i) in v.iter_mut().zip(v0) {
+            *vi = la * *vi + lb * v0i;
+        }
+        v_raw
+    } else {
+        Vec::new()
+    };
     let (q_raw, k_raw) = if w.qk_norm {
         let q_raw = q.clone();
         let k_raw = k.clone();
@@ -141,8 +184,9 @@ pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
             k_h[dst_off..dst_off + d_head].copy_from_slice(&k[src_off..src_off + d_head]);
             v_h[dst_off..dst_off + d_head].copy_from_slice(&v[src_off..src_off + d_head]);
         }
-        let (out_h, cache_h) =
-            scaled_dot_product_attention(&q_h, &k_h, &v_h, d_head, d_head, true);
+        let (out_h, cache_h) = scaled_dot_product_attention_windowed(
+            &q_h, &k_h, &v_h, d_head, d_head, true, window,
+        );
         for ti in 0..t {
             let dst_off = ti * d + h * d_head;
             let src_off = ti * d_head;
@@ -162,6 +206,7 @@ pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
             v,
             q_raw,
             k_raw,
+            v_raw,
             heads_out,
             attn_caches,
         },
@@ -174,6 +219,22 @@ pub fn causal_mha_backward(
     cache: &MhaCache,
     dy: &[f32],
     grads: &mut MhaGrads,
+) -> Vec<f32> {
+    causal_mha_backward_full(w, cache, dy, grads, None, None, None)
+}
+
+/// Full-feature MHA backward. `v0` + `d_v0_accum` close the value
+/// residual: this layer's λ-grads and its contribution to layer 0's
+/// d_v are produced here. `extra_d_v` injects the accumulated
+/// cross-layer d_v0 when running layer 0 itself.
+pub fn causal_mha_backward_full(
+    w: &MhaWeights,
+    cache: &MhaCache,
+    dy: &[f32],
+    grads: &mut MhaGrads,
+    v0: Option<&[f32]>,
+    extra_d_v: Option<&[f32]>,
+    mut d_v0_accum: Option<&mut Vec<f32>>,
 ) -> Vec<f32> {
     let d = w.d_model;
     let n_head = w.n_head;
@@ -215,6 +276,33 @@ pub fn causal_mha_backward(
                 .copy_from_slice(&dk_h[src_off..src_off + d_head]);
             d_v[dst_off..dst_off + d_head]
                 .copy_from_slice(&dv_h[src_off..src_off + d_head]);
+        }
+    }
+
+    if let Some(extra) = extra_d_v {
+        for (dvi, &e) in d_v.iter_mut().zip(extra) {
+            *dvi += e;
+        }
+    }
+    // Value residual backward: d_v is w.r.t. the MIXED v. Produce λ
+    // grads, push λb·d_v toward layer 0, and chain λa into v_raw.
+    if let (true, Some(v0)) = (w.value_resid, v0) {
+        let [la, lb] = w.lambda_v;
+        let mut da = 0.0_f32;
+        let mut db = 0.0_f32;
+        for i in 0..d_v.len() {
+            da += d_v[i] * cache.v_raw[i];
+            db += d_v[i] * v0[i];
+        }
+        grads.d_lambda_v[0] += da;
+        grads.d_lambda_v[1] += db;
+        if let Some(acc) = d_v0_accum.as_deref_mut() {
+            for i in 0..d_v.len() {
+                acc[i] += lb * d_v[i];
+            }
+        }
+        for dvi in &mut d_v {
+            *dvi *= la;
         }
     }
 

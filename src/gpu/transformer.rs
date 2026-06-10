@@ -13,15 +13,17 @@
 
 use super::buffers::GpuBuffer;
 use super::kv_cache::{KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
+use super::{NgramEmbedAddKernel, NgramScatterAddKernel, VMixBackwardKernel, VMixKernel};
+use crate::transformer::embedding::NGRAM_SENTINEL;
 use super::{
     AdamWKernel, CausalMhaBackwardKernel, CausalMhaForwardKernel, EmbedScatterAddKernel,
     EmbedScatterReduceKernel, GeluBackwardKernel, GeluKernel, GemmKernel, GemmTransposeBKernel,
     GpuContext, GradNormFinalizeKernel, GradNormSqReduceKernel, LayerNormBackwardKernel,
     LayerNormForwardKernel, MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel,
     MuonLoadStoreKernel, MuonMomentumKernel, MuonStepXKernel, OuterProductAccumKernel,
-    QkNormBackwardKernel, QkNormKernel, RopeKernel, RowReduceAddKernel, ScaleByBufferKernel,
-    SoftcapBackwardKernel, SoftcapKernel, SoftmaxCrossEntropyKernel, TokenPosEmbedKernel,
-    VectorAddKernel, ZeroBufferKernel,
+    AddAssignKernel, QkNormBackwardKernel, QkNormKernel, RopeKernel, RowReduceAddKernel,
+    ScaleByBufferKernel, SoftcapBackwardKernel, SoftcapKernel, SoftmaxCrossEntropyKernel,
+    TokenPosEmbedKernel, VectorAddKernel, ZeroBufferKernel,
 };
 use crate::optimizer::{bias_correction, AdamWConfig, MuonConfig};
 use crate::transformer::{DecoderTransformer, TransformerConfig};
@@ -71,6 +73,11 @@ pub struct DecoderTransformerGpu {
     pub qknorm_bwd: QkNormBackwardKernel,
     pub softcap_fwd: SoftcapKernel,
     pub softcap_bwd: SoftcapBackwardKernel,
+    pub add_assign: AddAssignKernel,
+    pub ngram_add: NgramEmbedAddKernel,
+    pub ngram_scatter: NgramScatterAddKernel,
+    pub vmix_fwd: VMixKernel,
+    pub vmix_bwd: VMixBackwardKernel,
 
     // Pure-GPU clip_grads scratch:
     //   gn_partials_flat — concatenated per-tensor partial sums of squares
@@ -123,6 +130,10 @@ pub(crate) struct ForwardOps {
     pub final_gemm: wgpu::BindGroup,
     /// In-place softcap on the logits buffer (None when softcap == 0).
     pub softcap: Option<wgpu::BindGroup>,
+    /// MTP aux logits gemm: h_final × w_head2ᵀ → logits2 (None when off).
+    pub gemm_logits2: Option<wgpu::BindGroup>,
+    /// h0 += w_ngram[hash(prev, cur)] (None when off).
+    pub ngram_add: Option<wgpu::BindGroup>,
 }
 
 pub(crate) struct LayerForwardOps {
@@ -134,6 +145,8 @@ pub(crate) struct LayerForwardOps {
     /// QKV gemms then write q/k directly).
     pub qknorm_q: Option<wgpu::BindGroup>,
     pub qknorm_k: Option<wgpu::BindGroup>,
+    /// v_raw + layer-0 v → v (None when value residual off or layer 0).
+    pub vmix: Option<wgpu::BindGroup>,
     pub rope_q: wgpu::BindGroup,
     pub rope_k: wgpu::BindGroup,
     pub mha: wgpu::BindGroup,
@@ -161,6 +174,15 @@ pub(crate) struct BackwardOps {
     pub rope_dk: wgpu::BindGroup,
     /// d_logits *= 1 − tanh² chain factor (None when softcap == 0).
     pub softcap_bwd: Option<wgpu::BindGroup>,
+    /// MTP aux backward (None when off): d_logits2 × w_head2 → d_h_final2,
+    /// h_final ⊗ d_logits2 → g_w_head2, then d_h_final += d_h_final2.
+    pub gemm_d_hf2: Option<wgpu::BindGroup>,
+    pub outer_g_head2: Option<wgpu::BindGroup>,
+    pub addassign_dhf2: Option<wgpu::BindGroup>,
+    /// g_w_ngram scatter-add from dx (None when off).
+    pub ngram_scatter: Option<wgpu::BindGroup>,
+    /// Zero d_v0_accum at the start of each element's backward.
+    pub zerob_dv0: Option<wgpu::BindGroup>,
 }
 
 pub(crate) struct LayerBackwardOps {
@@ -183,6 +205,10 @@ pub(crate) struct LayerBackwardOps {
     /// q_raw/k_raw (None when qk_norm off).
     pub qknorm_dq: Option<wgpu::BindGroup>,
     pub qknorm_dk: Option<wgpu::BindGroup>,
+    /// Layers > 0: in-place value-residual backward on dv.
+    pub vmix_bwd: Option<wgpu::BindGroup>,
+    /// Layer 0 only: dv += d_v0_accum.
+    pub addassign_dv0: Option<wgpu::BindGroup>,
     pub gemm_dx_q: wgpu::BindGroup,
     pub gemm_dx_k: wgpu::BindGroup,
     pub gemm_dx_v: wgpu::BindGroup,
@@ -224,6 +250,8 @@ pub(crate) struct LayerCache {
     /// when qk_norm is off).
     pub q_raw: GpuBuffer,
     pub k_raw: GpuBuffer,
+    /// Pre-mix V for the value residual (1-element dummy when off).
+    pub v_raw: GpuBuffer,
     pub heads_out: GpuBuffer,
     pub head_probs: GpuBuffer,
     pub ln2_out: GpuBuffer,
@@ -255,6 +283,15 @@ pub(crate) struct Activations {
     pub h_final: GpuBuffer,
     pub logits_buf: GpuBuffer,
     pub d_logits_buf: GpuBuffer,
+    /// MTP aux logits / grads / per-token NLL sink (1-element dummies
+    /// when MTP is off).
+    pub logits2_buf: GpuBuffer,
+    pub d_logits2_buf: GpuBuffer,
+    pub loss2_seq_buf: GpuBuffer,
+    pub d_h_final2: GpuBuffer,
+    /// Cross-layer value-residual gradient accumulator (1-element dummy
+    /// when off). Zeroed once per element's backward.
+    pub d_v0_accum: GpuBuffer,
     /// Per-token NLL written by `SoftmaxCrossEntropyKernel`. Sized for `seq_len_max`.
     pub loss_seq_buf: GpuBuffer,
     /// u32 target token IDs uploaded once per call to train_step / eval_step.
@@ -309,6 +346,7 @@ impl Activations {
                 v: GpuBuffer::empty(ctx, "v", td),
                 q_raw: GpuBuffer::empty(ctx, "q_raw", qk_raw_len),
                 k_raw: GpuBuffer::empty(ctx, "k_raw", qk_raw_len),
+                v_raw: GpuBuffer::empty(ctx, "v_raw", if cfg.value_resid { td } else { 1 }),
                 heads_out: GpuBuffer::empty(ctx, "heads", td),
                 head_probs: GpuBuffer::empty(ctx, "probs", probs_cap),
                 ln2_out: GpuBuffer::empty(ctx, "ln2_out", td),
@@ -338,6 +376,11 @@ impl Activations {
             h_final: GpuBuffer::empty(ctx, "h_final", td),
             logits_buf: GpuBuffer::empty(ctx, "logits", t * v),
             d_logits_buf: GpuBuffer::empty(ctx, "d_logits", t * v),
+            logits2_buf: GpuBuffer::empty(ctx, "logits2", if cfg.mtp_weight > 0.0 { t * v } else { 1 }),
+            d_logits2_buf: GpuBuffer::empty(ctx, "d_logits2", if cfg.mtp_weight > 0.0 { t * v } else { 1 }),
+            loss2_seq_buf: GpuBuffer::empty(ctx, "loss2_seq", if cfg.mtp_weight > 0.0 { bt } else { 1 }),
+            d_h_final2: GpuBuffer::empty(ctx, "d_h_final2", if cfg.mtp_weight > 0.0 { td } else { 1 }),
+            d_v0_accum: GpuBuffer::empty(ctx, "d_v0_accum", if cfg.value_resid { td } else { 1 }),
             loss_seq_buf: GpuBuffer::empty(ctx, "loss_seq", bt),
             targets_buf: GpuBuffer::empty(ctx, "targets", bt),
             d_h_final: GpuBuffer::empty(ctx, "d_h_final", td),
@@ -369,6 +412,10 @@ pub struct GpuParams {
     pub w_pos: GpuBuffer,
     /// Untied LM head (None = tied to w_tok), plus its grad and moments.
     pub w_head: Option<GpuBuffer>,
+    /// MTP auxiliary head (None when mtp_weight == 0).
+    pub w_head2: Option<GpuBuffer>,
+    /// Hashed bigram table (None when ngram_rows == 0).
+    pub w_ngram: Option<GpuBuffer>,
     pub blocks: Vec<GpuBlock>,
     pub final_gamma: GpuBuffer,
     pub final_beta: GpuBuffer,
@@ -376,6 +423,8 @@ pub struct GpuParams {
     pub g_w_tok: GpuBuffer,
     pub g_w_pos: GpuBuffer,
     pub g_w_head: Option<GpuBuffer>,
+    pub g_w_head2: Option<GpuBuffer>,
+    pub g_w_ngram: Option<GpuBuffer>,
     pub g_final_gamma: GpuBuffer,
     pub g_final_beta: GpuBuffer,
 
@@ -385,6 +434,10 @@ pub struct GpuParams {
     pub m2_w_pos: GpuBuffer,
     pub m1_w_head: Option<GpuBuffer>,
     pub m2_w_head: Option<GpuBuffer>,
+    pub m1_w_head2: Option<GpuBuffer>,
+    pub m2_w_head2: Option<GpuBuffer>,
+    pub m1_w_ngram: Option<GpuBuffer>,
+    pub m2_w_ngram: Option<GpuBuffer>,
     pub m1_final_gamma: GpuBuffer,
     pub m2_final_gamma: GpuBuffer,
     pub m1_final_beta: GpuBuffer,
@@ -402,6 +455,13 @@ pub struct GpuBlock {
     pub ln2_beta: GpuBuffer,
     pub w_fc: GpuBuffer,
     pub w_proj: GpuBuffer,
+
+    /// Value-residual scalars [λa, λb] + grad + moments (2 floats each;
+    /// allocated always, used only when value_resid).
+    pub lambda_v: GpuBuffer,
+    pub g_lambda_v: GpuBuffer,
+    pub m1_lambda_v: GpuBuffer,
+    pub m2_lambda_v: GpuBuffer,
 
     pub g_ln1_gamma: GpuBuffer,
     pub g_ln1_beta: GpuBuffer,
@@ -501,20 +561,25 @@ fn build_forward_ops(
     rope: &RopeKernel,
     qknorm_fwd: &QkNormKernel,
     softcap_fwd: &SoftcapKernel,
+    ngram_add: &NgramEmbedAddKernel,
+    vmix_fwd: &VMixKernel,
 ) -> ForwardOps {
     let embed = embed_fwd.build_bind(ctx, &a.tok_buf, &p.w_tok, &p.w_pos, &a.h0);
     let layers: Vec<LayerForwardOps> = (0..cfg.n_layer)
         .map(|li| {
-            let blk = &p.blocks[li];
+            let blk = &p.blocks[cfg.block_index(li)];
             let lc = &a.layers[li];
             let x = if li == 0 { &a.h0 } else { &a.z_chain[li - 1] };
             // With qk-norm the QKV gemms write into q_raw/k_raw and the
             // norm produces q/k; without it they write q/k directly.
+            // Same idea for the value residual (layers > 0 only).
             let (q_dst, k_dst) = if cfg.qk_norm {
                 (&lc.q_raw, &lc.k_raw)
             } else {
                 (&lc.q, &lc.k)
             };
+            let mixes_v = cfg.value_resid && li > 0;
+            let v_dst = if mixes_v { &lc.v_raw } else { &lc.v };
             LayerForwardOps {
                 ln1: ln_fwd.build_bind(
                     ctx, x, &blk.ln1_gamma, &blk.ln1_beta, &lc.ln1_out, &a.ln1_mean,
@@ -522,7 +587,10 @@ fn build_forward_ops(
                 ),
                 gemm_q: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_q, q_dst),
                 gemm_k: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_k, k_dst),
-                gemm_v: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_v, &lc.v),
+                gemm_v: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_v, v_dst),
+                vmix: mixes_v.then(|| {
+                    vmix_fwd.build_bind(ctx, &lc.v_raw, &a.layers[0].v, &blk.lambda_v, &lc.v)
+                }),
                 qknorm_q: cfg
                     .qk_norm
                     .then(|| qknorm_fwd.build_bind(ctx, &lc.q_raw, &lc.q)),
@@ -552,7 +620,15 @@ fn build_forward_ops(
     let head_w = p.w_head.as_ref().unwrap_or(&p.w_tok);
     let final_gemm = gemm_t.build_bind(ctx, &a.h_final, head_w, &a.logits_buf);
     let softcap = (cfg.softcap > 0.0).then(|| softcap_fwd.build_bind(ctx, &a.logits_buf));
-    ForwardOps { embed, layers, final_ln, final_gemm, softcap }
+    let gemm_logits2 = p
+        .w_head2
+        .as_ref()
+        .map(|w2| gemm_t.build_bind(ctx, &a.h_final, w2, &a.logits2_buf));
+    let ngram_add = p
+        .w_ngram
+        .as_ref()
+        .map(|wn| ngram_add.build_bind(ctx, &a.tok_buf, wn, &a.h0));
+    ForwardOps { embed, layers, final_ln, final_gemm, softcap, gemm_logits2, ngram_add }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -573,6 +649,9 @@ fn build_backward_ops(
     rope: &RopeKernel,
     qknorm_bwd: &QkNormBackwardKernel,
     softcap_bwd: &SoftcapBackwardKernel,
+    add_assign: &AddAssignKernel,
+    ngram_scatter: &NgramScatterAddKernel,
+    vmix_bwd: &VMixBackwardKernel,
 ) -> BackwardOps {
     let head_w = p.w_head.as_ref().unwrap_or(&p.w_tok);
     let g_head = p.g_w_head.as_ref().unwrap_or(&p.g_w_tok);
@@ -586,7 +665,7 @@ fn build_backward_ops(
     let n = cfg.n_layer;
     let layers: Vec<LayerBackwardOps> = (0..n)
         .map(|li| {
-            let blk = &p.blocks[li];
+            let blk = &p.blocks[cfg.block_index(li)];
             let lc = &a.layers[li];
             // d_z is d_pre_final only for the LAST backward iteration
             // (which is li = n-1 since we iterate in reverse).
@@ -621,6 +700,14 @@ fn build_backward_ops(
                 qknorm_dk: cfg
                     .qk_norm
                     .then(|| qknorm_bwd.build_bind(ctx, &lc.k_raw, &a.dk)),
+                vmix_bwd: (cfg.value_resid && li > 0).then(|| {
+                    vmix_bwd.build_bind(
+                        ctx, &lc.v_raw, &a.layers[0].v, &blk.lambda_v,
+                        &a.dv, &a.d_v0_accum, &blk.g_lambda_v,
+                    )
+                }),
+                addassign_dv0: (cfg.value_resid && li == 0)
+                    .then(|| add_assign.build_bind(ctx, &a.d_v0_accum, &a.dv)),
                 gemm_dx_q: gemm.build_bind(ctx, &a.dq, &blk.w_q, &a.dx_q),
                 gemm_dx_k: gemm.build_bind(ctx, &a.dk, &blk.w_k, &a.dx_k),
                 gemm_dx_v: gemm.build_bind(ctx, &a.dv, &blk.w_v, &a.dx_v),
@@ -654,6 +741,23 @@ fn build_backward_ops(
         rope_dk: rope.build_bind(ctx, &a.dk),
         softcap_bwd: (cfg.softcap > 0.0)
             .then(|| softcap_bwd.build_bind(ctx, &a.logits_buf, &a.d_logits_buf)),
+        gemm_d_hf2: p
+            .w_head2
+            .as_ref()
+            .map(|w2| gemm.build_bind(ctx, &a.d_logits2_buf, w2, &a.d_h_final2)),
+        outer_g_head2: p
+            .g_w_head2
+            .as_ref()
+            .map(|g2| outer_accum.build_bind(ctx, &a.h_final, &a.d_logits2_buf, g2)),
+        addassign_dhf2: p
+            .w_head2
+            .as_ref()
+            .map(|_| add_assign.build_bind(ctx, &a.d_h_final2, &a.d_h_final)),
+        ngram_scatter: p
+            .g_w_ngram
+            .as_ref()
+            .map(|g| ngram_scatter.build_bind(ctx, &a.tok_buf, &a.dx, g)),
+        zerob_dv0: cfg.value_resid.then(|| zerob.build_bind(ctx, &a.d_v0_accum)),
     }
 }
 
@@ -703,11 +807,24 @@ fn build_grad_ops(
         // Untied head: AdamW-managed (not Muon), decoupled WD on.
         push(w_head, g_w_head, m1, m2, (v * d) as u32, true, false);
     }
+    if let (Some(w_head2), Some(g_w_head2), Some(m1), Some(m2)) =
+        (&p.w_head2, &p.g_w_head2, &p.m1_w_head2, &p.m2_w_head2)
+    {
+        push(w_head2, g_w_head2, m1, m2, (v * d) as u32, true, false);
+    }
+    if let (Some(w_ngram), Some(g_w_ngram), Some(m1), Some(m2)) =
+        (&p.w_ngram, &p.g_w_ngram, &p.m1_w_ngram, &p.m2_w_ngram)
+    {
+        push(w_ngram, g_w_ngram, m1, m2, (cfg.ngram_rows * d) as u32, true, false);
+    }
     push(&p.final_gamma, &p.g_final_gamma, &p.m1_final_gamma, &p.m2_final_gamma, d as u32, false, false);
     push(&p.final_beta, &p.g_final_beta, &p.m1_final_beta, &p.m2_final_beta, d as u32, false, false);
     for blk in &p.blocks {
         push(&blk.ln1_gamma, &blk.g_ln1_gamma, &blk.m1.ln1_gamma, &blk.m2.ln1_gamma, d as u32, false, false);
         push(&blk.ln1_beta, &blk.g_ln1_beta, &blk.m1.ln1_beta, &blk.m2.ln1_beta, d as u32, false, false);
+        if cfg.value_resid {
+            push(&blk.lambda_v, &blk.g_lambda_v, &blk.m1_lambda_v, &blk.m2_lambda_v, 2, false, false);
+        }
         push(&blk.w_q, &blk.g_w_q, &blk.m1.w_q, &blk.m2.w_q, (d * d) as u32, true, true);
         push(&blk.w_k, &blk.g_w_k, &blk.m1.w_k, &blk.m2.w_k, (d * d) as u32, true, true);
         push(&blk.w_v, &blk.g_w_v, &blk.m1.w_v, &blk.m2.w_v, (d * d) as u32, true, true);
@@ -843,6 +960,10 @@ fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) ->
         w_proj: zeros_dff(),
     };
     GpuBlock {
+        lambda_v: GpuBuffer::from_slice(ctx, "lam_v", &cpu.mha.lambda_v),
+        g_lambda_v: GpuBuffer::zeros(ctx, "g_lam_v", 2),
+        m1_lambda_v: GpuBuffer::zeros(ctx, "m1_lam_v", 2),
+        m2_lambda_v: GpuBuffer::zeros(ctx, "m2_lam_v", 2),
         ln1_gamma: GpuBuffer::from_slice(ctx, "ln1_g", &cpu.ln1.gamma),
         ln1_beta: GpuBuffer::from_slice(ctx, "ln1_b", &cpu.ln1.beta),
         w_q: GpuBuffer::from_slice(ctx, "wq", &cpu.mha.w_q.w),
@@ -885,6 +1006,12 @@ impl DecoderTransformerGpu {
                 .w_head
                 .as_ref()
                 .map(|h| GpuBuffer::from_slice(&ctx, "w_head", h)),
+            w_head2: cpu
+                .w_head2
+                .as_ref()
+                .map(|h| GpuBuffer::from_slice(&ctx, "w_head2", h)),
+            w_ngram: (cfg.ngram_rows > 0)
+                .then(|| GpuBuffer::from_slice(&ctx, "w_ngram", &cpu.embed.w_ngram)),
             blocks: cpu.blocks.iter().map(|b| upload_block(&ctx, b)).collect(),
             final_gamma: GpuBuffer::from_slice(&ctx, "f_g", &cpu.final_ln.gamma),
             final_beta: GpuBuffer::from_slice(&ctx, "f_b", &cpu.final_ln.beta),
@@ -895,6 +1022,12 @@ impl DecoderTransformerGpu {
                 .w_head
                 .is_some()
                 .then(|| GpuBuffer::zeros(&ctx, "g_w_head", v * d)),
+            g_w_head2: cpu
+                .w_head2
+                .is_some()
+                .then(|| GpuBuffer::zeros(&ctx, "g_w_head2", v * d)),
+            g_w_ngram: (cfg.ngram_rows > 0)
+                .then(|| GpuBuffer::zeros(&ctx, "g_w_ngram", cfg.ngram_rows * d)),
             g_final_gamma: GpuBuffer::zeros(&ctx, "g_f_g", d),
             g_final_beta: GpuBuffer::zeros(&ctx, "g_f_b", d),
 
@@ -910,15 +1043,32 @@ impl DecoderTransformerGpu {
                 .w_head
                 .is_some()
                 .then(|| GpuBuffer::zeros(&ctx, "m2_head", v * d)),
+            m1_w_head2: cpu
+                .w_head2
+                .is_some()
+                .then(|| GpuBuffer::zeros(&ctx, "m1_head2", v * d)),
+            m2_w_head2: cpu
+                .w_head2
+                .is_some()
+                .then(|| GpuBuffer::zeros(&ctx, "m2_head2", v * d)),
+            m1_w_ngram: (cfg.ngram_rows > 0)
+                .then(|| GpuBuffer::zeros(&ctx, "m1_ngram", cfg.ngram_rows * d)),
+            m2_w_ngram: (cfg.ngram_rows > 0)
+                .then(|| GpuBuffer::zeros(&ctx, "m2_ngram", cfg.ngram_rows * d)),
             m1_final_gamma: GpuBuffer::zeros(&ctx, "m1_fg", d),
             m2_final_gamma: GpuBuffer::zeros(&ctx, "m2_fg", d),
             m1_final_beta: GpuBuffer::zeros(&ctx, "m1_fb", d),
             m2_final_beta: GpuBuffer::zeros(&ctx, "m2_fb", d),
         };
 
-        // 4 top-level grad tensors (+1 untied head) + 10 per block.
-        let n_top = 4 + usize::from(cfg.untied_head);
-        let total_partials = (n_top + cfg.n_layer * 10) * GN_GROUPS_PER_TENSOR as usize;
+        // 4 top-level grad tensors (+untied head, +MTP head, +ngram) + 10 per block.
+        let n_top = 4
+            + usize::from(cfg.untied_head)
+            + usize::from(cfg.mtp_weight > 0.0)
+            + usize::from(cfg.ngram_rows > 0);
+        let per_block = 10 + usize::from(cfg.value_resid);
+        let total_partials =
+            (n_top + cfg.unique_blocks() * per_block) * GN_GROUPS_PER_TENSOR as usize;
         let gn_partials_flat = GpuBuffer::zeros(&ctx, "gn_partials_flat", total_partials);
         let gn_result = GpuBuffer::zeros(&ctx, "gn_result", 2);
 
@@ -955,6 +1105,11 @@ impl DecoderTransformerGpu {
         let qknorm_bwd = QkNormBackwardKernel::new(&ctx);
         let softcap_fwd = SoftcapKernel::new(&ctx);
         let softcap_bwd = SoftcapBackwardKernel::new(&ctx);
+        let add_assign = AddAssignKernel::new(&ctx);
+        let ngram_add = NgramEmbedAddKernel::new(&ctx);
+        let ngram_scatter = NgramScatterAddKernel::new(&ctx);
+        let vmix_fwd = VMixKernel::new(&ctx);
+        let vmix_bwd = VMixBackwardKernel::new(&ctx);
 
         let grad_ops =
             build_grad_ops(&ctx, &p, &cfg, &zerob, &adamw, &gn_sq, &scaleb_buf,
@@ -971,13 +1126,13 @@ impl DecoderTransformerGpu {
         let fwd_ops = build_forward_ops(
             &ctx, &p, &acts, &cfg,
             &embed_fwd, &ln_fwd, &gemm_t, &mha_fwd, &gelu_fwd, &vadd, &rope,
-            &qknorm_fwd, &softcap_fwd,
+            &qknorm_fwd, &softcap_fwd, &ngram_add, &vmix_fwd,
         );
         let bwd_ops = build_backward_ops(
             &ctx, &p, &acts, &cfg,
             &gemm, &ln_bwd, &mha_bwd, &gelu_bwd, &vadd, &outer_accum,
             &embed_bwd, &embed_scatter_reduce, &zerob, &rope,
-            &qknorm_bwd, &softcap_bwd,
+            &qknorm_bwd, &softcap_bwd, &add_assign, &ngram_scatter, &vmix_bwd,
         );
 
         Self {
@@ -1014,6 +1169,11 @@ impl DecoderTransformerGpu {
             qknorm_bwd,
             softcap_fwd,
             softcap_bwd,
+            add_assign,
+            ngram_add,
+            ngram_scatter,
+            vmix_fwd,
+            vmix_bwd,
             gn_partials_flat,
             gn_result,
             ctx,
@@ -1043,10 +1203,16 @@ impl DecoderTransformerGpu {
         cpu.embed.w_tok = self.p.w_tok.download(&self.ctx);
         cpu.embed.w_pos = self.p.w_pos.download(&self.ctx);
         cpu.w_head = self.p.w_head.as_ref().map(|h| h.download(&self.ctx));
+        cpu.w_head2 = self.p.w_head2.as_ref().map(|h| h.download(&self.ctx));
+        if let Some(wn) = self.p.w_ngram.as_ref() {
+            cpu.embed.w_ngram = wn.download(&self.ctx);
+        }
         cpu.final_ln.gamma = self.p.final_gamma.download(&self.ctx);
         cpu.final_ln.beta = self.p.final_beta.download(&self.ctx);
         for (li, blk) in cpu.blocks.iter_mut().enumerate() {
             let gb = &self.p.blocks[li];
+            let lam = gb.lambda_v.download(&self.ctx);
+            blk.mha.lambda_v = [lam[0], lam[1]];
             blk.ln1.gamma = gb.ln1_gamma.download(&self.ctx);
             blk.ln1.beta = gb.ln1_beta.download(&self.ctx);
             blk.mha.w_q.w = gb.w_q.download(&self.ctx);
@@ -1191,6 +1357,17 @@ impl DecoderTransformerGpu {
                 t_u, d_u, v as u32, cfg.seq_len_max as u32, tok_offset, !cfg.rope,
             );
         }
+        // n-gram table add: h0 += w_ngram[hash(prev, cur)]. Window-initial
+        // position uses the sentinel — same convention as the CPU path.
+        if let Some(ng) = &self.fwd_ops.ngram_add {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ngram add"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.ngram_add.pipeline);
+            self.ngram_add.dispatch_with_bind(
+                &mut pass, ng, t_u, d_u, cfg.ngram_rows as u32, tok_offset, NGRAM_SENTINEL,
+            );
+        }
 
         for li in 0..cfg.n_layer {
             let fop = &self.fwd_ops.layers[li];
@@ -1226,6 +1403,14 @@ impl DecoderTransformerGpu {
                     &mut pass, qn_k, t_u, n_head as u32, d_head as u32,
                 );
             }
+            // Value residual — v = λa·v_raw + λb·v0 (layer 0's v).
+            if let Some(vm) = &fop.vmix {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("v mix"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.vmix_fwd.pipeline);
+                self.vmix_fwd.dispatch_with_bind(&mut pass, vm, (t * d) as u32);
+            }
             // RoPE — in-place rotation of q and k (disjoint buffers, one pass).
             if cfg.rope {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1247,6 +1432,7 @@ impl DecoderTransformerGpu {
                 pass.set_pipeline(&self.mha_fwd.pipeline);
                 self.mha_fwd.dispatch_with_bind(
                     &mut pass, &fop.mha, t_u, n_head as u32, d_head as u32,
+                    cfg.layer_window(li) as u32,
                 );
             }
             // W_O
@@ -1475,6 +1661,55 @@ impl DecoderTransformerGpu {
             );
         }
 
+        // MTP auxiliary head: logits2 over positions 0..T-1, CE against
+        // targets shifted one further (the t+2 token), gradient scaled
+        // by λ/(T-1). No softcap on aux logits. Mirrors the CPU backward.
+        let mtp = cfg.mtp_weight > 0.0 && t >= 2;
+        if mtp {
+            let t2 = (t - 1) as u32;
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mtp logits2"), timestamp_writes: None,
+                });
+                pass.set_pipeline(self.gemm_t.pipeline());
+                self.gemm_t.dispatch_with_bind(
+                    &mut pass,
+                    self.fwd_ops.gemm_logits2.as_ref().unwrap(),
+                    t2, v as u32, d_u,
+                );
+            }
+            self.softmax_ce.dispatch_into(
+                &self.ctx,
+                enc,
+                &self.acts.logits2_buf,
+                &self.acts.d_logits2_buf,
+                &self.acts.loss2_seq_buf,
+                &self.acts.targets_buf,
+                v as u32,
+                t2,
+                1,
+                cfg.mtp_weight / t2 as f32,
+                bt_offset + 1,
+            );
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("mtp head bwd"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.gemm.pipeline);
+                self.gemm.dispatch_with_bind(
+                    &mut pass,
+                    self.bwd_ops.gemm_d_hf2.as_ref().unwrap(),
+                    t2, d_u, v as u32,
+                );
+                pass.set_pipeline(&self.outer_accum.pipeline);
+                self.outer_accum.dispatch_with_bind(
+                    &mut pass,
+                    self.bwd_ops.outer_g_head2.as_ref().unwrap(),
+                    v as u32, d_u, t2,
+                );
+            }
+        }
+
         // d_h_final = d_logits × w_head  AND  outer_accum into the head grad.
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1489,6 +1724,18 @@ impl DecoderTransformerGpu {
                 &mut pass, &self.bwd_ops.outer_g_w_tok, v as u32, d_u, t_u,
             );
         }
+        // Fold the MTP contribution into d_h_final (prefix rows only).
+        if mtp {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mtp dhf add"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.add_assign.pipeline);
+            self.add_assign.dispatch_with_bind(
+                &mut pass,
+                self.bwd_ops.addassign_dhf2.as_ref().unwrap(),
+                ((t - 1) * d) as u32,
+            );
+        }
         // Final LN bwd
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1500,7 +1747,16 @@ impl DecoderTransformerGpu {
             );
         }
 
-        // Block backward chain.
+        // Block backward chain. With the value residual, layers > 0
+        // accumulate λb·dv into d_v0_accum (zeroed here) and layer 0
+        // injects the sum into its own dv.
+        if let Some(z) = &self.bwd_ops.zerob_dv0 {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("zero dv0"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.zerob.pipeline);
+            self.zerob.dispatch_with_bind(&mut pass, z, (t * d) as u32);
+        }
         for li in (0..cfg.n_layer).rev() {
             self.block_backward(enc, li, t, d, n_head, d_head, d_ff);
         }
@@ -1523,6 +1779,15 @@ impl DecoderTransformerGpu {
             pass.set_pipeline(&self.embed_scatter_reduce.pipeline);
             self.embed_scatter_reduce.dispatch_with_bind(
                 &mut pass, &self.bwd_ops.embed_scatter_reduce, t_u, d_u, tok_offset,
+            );
+        }
+        if let Some(ng) = &self.bwd_ops.ngram_scatter {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ngram scatter"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.ngram_scatter.pipeline);
+            self.ngram_scatter.dispatch_with_bind(
+                &mut pass, ng, t_u, d_u, cfg.ngram_rows as u32, tok_offset, NGRAM_SENTINEL,
             );
         }
     }
@@ -1747,6 +2012,23 @@ impl DecoderTransformerGpu {
             self.qknorm_bwd.dispatch_with_bind(
                 &mut pass, qn_dk, t_u, n_head as u32, d_head as u32,
             );
+        }
+        // Value-residual backward: λ grads + d_v0 accumulation + λa
+        // chain (in place on dv). Layer 0 instead absorbs the
+        // accumulated cross-layer d_v0 into its dv.
+        if let Some(vm) = &bop.vmix_bwd {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("v mix bwd"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.vmix_bwd.pipeline);
+            self.vmix_bwd.dispatch_with_bind(&mut pass, vm, td);
+        }
+        if let Some(av) = &bop.addassign_dv0 {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dv0 inject"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.add_assign.pipeline);
+            self.add_assign.dispatch_with_bind(&mut pass, av, td);
         }
 
         // dx_q, dx_k, dx_v — all read distinct dq/dk/dv, write disjoint
@@ -2193,6 +2475,7 @@ impl DecoderTransformerGpu {
         }
         self.ctx.queue.submit(Some(enc.finish()));
         cache.current_len = tokens.len();
+        cache.last_token = tokens.last().copied();
         cache
     }
 
@@ -2220,13 +2503,24 @@ impl DecoderTransformerGpu {
             &self.ctx, &mut enc, &self.p.w_tok, &self.p.w_pos, &h_cur,
             d as u32, v_dim as u32, cfg.seq_len_max as u32, new_token, pos as u32, !cfg.rope,
         );
+        if let Some(wn) = self.p.w_ngram.as_ref() {
+            let tok_one = GpuBuffer::from_u32_slice(&self.ctx, "step_tok", &[new_token]);
+            let prev0 = cache.last_token.unwrap_or(NGRAM_SENTINEL);
+            self.ngram_add.dispatch_into(
+                &self.ctx, &mut enc, &tok_one, wn, &h_cur,
+                1, d as u32, cfg.ngram_rows as u32, 0, prev0,
+            );
+        }
 
         let mha_scratch = GpuBuffer::empty(&self.ctx, "step_scratch", n_head * cache.max_len);
 
         let mut h = h_cur;
         let t_total_after = pos + 1;
+        // Layer 0's (raw) value vector, kept for the value residual mix
+        // in later layers.
+        let mut v0_step: Option<GpuBuffer> = None;
         for li in 0..cfg.n_layer {
-            let blk = &self.p.blocks[li];
+            let blk = &self.p.blocks[cfg.block_index(li)];
             let kv = &cache.blocks[li];
 
             let ln1_out = GpuBuffer::empty(&self.ctx, "ln1_out", d);
@@ -2240,10 +2534,24 @@ impl DecoderTransformerGpu {
 
             let mut q_new = GpuBuffer::empty(&self.ctx, "step_q", d);
             let mut k_new = GpuBuffer::empty(&self.ctx, "step_k", d);
-            let v_new = GpuBuffer::empty(&self.ctx, "step_v", d);
+            let mut v_new = GpuBuffer::empty(&self.ctx, "step_v", d);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_q, &q_new, 1, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_k, &k_new, 1, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_v, &v_new, 1, d as u32, d as u32);
+            if cfg.value_resid {
+                if li == 0 {
+                    let v0 = GpuBuffer::empty(&self.ctx, "step_v0", d);
+                    enc.copy_buffer_to_buffer(&v_new.inner, 0, &v0.inner, 0, (d * 4) as u64);
+                    v0_step = Some(v0);
+                } else {
+                    let v_m = GpuBuffer::empty(&self.ctx, "step_vm", d);
+                    self.vmix_fwd.dispatch_into(
+                        &self.ctx, &mut enc, &v_new, v0_step.as_ref().unwrap(),
+                        &blk.lambda_v, &v_m, d as u32,
+                    );
+                    v_new = v_m;
+                }
+            }
             if cfg.qk_norm {
                 let q_n = GpuBuffer::empty(&self.ctx, "step_qn", d);
                 let k_n = GpuBuffer::empty(&self.ctx, "step_kn", d);
@@ -2270,6 +2578,7 @@ impl DecoderTransformerGpu {
                 &self.ctx, &mut enc, &q_new, &kv.k_history, &kv.v_history,
                 &heads_out, &mha_scratch,
                 t_total_after as u32, n_head as u32, d_head as u32, cache.max_len as u32,
+                cfg.layer_window(li) as u32,
             );
 
             let mha_out = GpuBuffer::empty(&self.ctx, "step_mha_out", d);
@@ -2317,6 +2626,7 @@ impl DecoderTransformerGpu {
         self.ctx.queue.submit(Some(enc.finish()));
 
         cache.current_len = t_total_after;
+        cache.last_token = Some(new_token);
         logits.download(&self.ctx)
     }
 
@@ -2348,12 +2658,19 @@ impl DecoderTransformerGpu {
             &self.ctx, &mut enc, &tok_buf, &self.p.w_tok, &self.p.w_pos, &h0,
             t as u32, d as u32, v as u32, cfg.seq_len_max as u32, !cfg.rope,
         );
+        if let Some(wn) = self.p.w_ngram.as_ref() {
+            self.ngram_add.dispatch_into(
+                &self.ctx, &mut enc, &tok_buf, wn, &h0,
+                t as u32, d as u32, cfg.ngram_rows as u32, 0, NGRAM_SENTINEL,
+            );
+        }
         self.ctx.queue.submit(Some(enc.finish()));
 
         let mut x = h0;
         let mut kv_per_block: Vec<(GpuBuffer, GpuBuffer)> = Vec::with_capacity(cfg.n_layer);
+        let mut v0_prefill: Option<GpuBuffer> = None;
         for li in 0..cfg.n_layer {
-            let blk = &self.p.blocks[li];
+            let blk = &self.p.blocks[cfg.block_index(li)];
 
             let ln1_out = GpuBuffer::empty(&self.ctx, "ln1_out", t * d);
             let ln1_mean = GpuBuffer::empty(&self.ctx, "ln1_mean", t);
@@ -2361,7 +2678,7 @@ impl DecoderTransformerGpu {
             let ln1_xhat = GpuBuffer::empty(&self.ctx, "ln1_xhat", t * d);
             let mut q = GpuBuffer::empty(&self.ctx, "q", t * d);
             let mut k = GpuBuffer::empty(&self.ctx, "k", t * d);
-            let val = GpuBuffer::empty(&self.ctx, "v", t * d);
+            let mut val = GpuBuffer::empty(&self.ctx, "v", t * d);
             let mut enc = self
                 .ctx
                 .device
@@ -2375,6 +2692,20 @@ impl DecoderTransformerGpu {
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_q, &q, t as u32, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_k, &k, t as u32, d as u32, d as u32);
             self.gemm_t.dispatch_into(&self.ctx, &mut enc, &ln1_out, &blk.w_v, &val, t as u32, d as u32, d as u32);
+            if cfg.value_resid {
+                if li == 0 {
+                    let v0 = GpuBuffer::empty(&self.ctx, "v0_pre", t * d);
+                    enc.copy_buffer_to_buffer(&val.inner, 0, &v0.inner, 0, (t * d * 4) as u64);
+                    v0_prefill = Some(v0);
+                } else {
+                    let v_m = GpuBuffer::empty(&self.ctx, "v_mix", t * d);
+                    self.vmix_fwd.dispatch_into(
+                        &self.ctx, &mut enc, &val, v0_prefill.as_ref().unwrap(),
+                        &blk.lambda_v, &v_m, (t * d) as u32,
+                    );
+                    val = v_m;
+                }
+            }
             if cfg.qk_norm {
                 let q_n = GpuBuffer::empty(&self.ctx, "q_n", t * d);
                 let k_n = GpuBuffer::empty(&self.ctx, "k_n", t * d);
@@ -2397,7 +2728,7 @@ impl DecoderTransformerGpu {
             let pb = GpuBuffer::empty(&self.ctx, "probs", n_head * t * t);
             self.mha_fwd.dispatch_into(
                 &self.ctx, &mut enc, &q, &k, &val, &heads_out, &pb,
-                t as u32, n_head as u32, d_head as u32,
+                t as u32, n_head as u32, d_head as u32, cfg.layer_window(li) as u32,
             );
             let _ = pb;
 

@@ -232,6 +232,78 @@ fn checkpoint_round_trip_preserves_rope_flag() {
 }
 
 #[test]
+fn checkpoint_round_trip_preserves_tier3_fields() {
+    use rand::Rng;
+    let mut rng = StdRng::seed_from_u64(0x71E3);
+    let cfg = TransformerConfig {
+        vocab: 32,
+        d_model: 32,
+        n_layer: 3,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        rope: true,
+        untied_head: true,
+        softcap: 30.0,
+        mtp_weight: 0.5,
+        value_resid: true,
+        tie_layers: true,
+        local_window: 4,
+        global_layers: 2,
+        ngram_rows: 64,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    assert_eq!(model.blocks.len(), 1);
+    if let Some(h) = model.w_head.as_mut() {
+        for v in h.iter_mut() {
+            *v = rng.random::<f32>() * 0.2 - 0.1;
+        }
+    }
+    if let Some(h) = model.w_head2.as_mut() {
+        for v in h.iter_mut() {
+            *v = rng.random::<f32>() * 0.2 - 0.1;
+        }
+    }
+    for v in model.embed.w_ngram.iter_mut() {
+        *v = rng.random::<f32>() * 0.2 - 0.1;
+    }
+    model.blocks[0].mha.lambda_v = [0.8, 0.5];
+
+    let tmp = std::env::temp_dir().join("aurora_ckpt_tier3_roundtrip.bin");
+    checkpoint::save(&tmp, &model, 0, model.step).expect("save");
+    let loaded = checkpoint::load(&tmp).expect("load");
+    std::fs::remove_file(&tmp).ok();
+
+    let lc = &loaded.model.config;
+    assert!((lc.mtp_weight - 0.5).abs() < 1e-6, "mtp_weight lost");
+    assert!(lc.value_resid && lc.tie_layers, "vr/tie flags lost");
+    assert_eq!(lc.local_window, 4);
+    assert_eq!(lc.global_layers, 2);
+    assert_eq!(lc.ngram_rows, 64);
+    assert_eq!(loaded.model.blocks.len(), 1, "tied checkpoint must store 1 block");
+    assert_eq!(loaded.model.blocks[0].mha.lambda_v, [0.8, 0.5], "lambda lost");
+    let h2a = model.w_head2.as_ref().unwrap();
+    let h2b = loaded.model.w_head2.as_ref().expect("w_head2 missing");
+    for i in 0..h2a.len() {
+        assert!((h2a[i] - h2b[i]).abs() < 1e-6, "w_head2 diverges at {i}");
+    }
+    for i in 0..model.embed.w_ngram.len() {
+        assert!(
+            (model.embed.w_ngram[i] - loaded.model.embed.w_ngram[i]).abs() < 1e-6,
+            "w_ngram diverges at {i}"
+        );
+    }
+
+    let tokens: Vec<u32> = (0..16u32).collect();
+    let (a, _) = model.forward(&tokens[..15]);
+    let (b, _) = loaded.model.forward(&tokens[..15]);
+    for i in 0..a.len() {
+        assert!((a[i] - b[i]).abs() < 1e-6, "tier3 logits diverge at {i}");
+    }
+}
+
+#[test]
 fn checkpoint_round_trip_preserves_tier1_flags_and_head() {
     use rand::Rng;
     let mut rng = StdRng::seed_from_u64(0x71E1);

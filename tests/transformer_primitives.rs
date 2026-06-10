@@ -605,6 +605,371 @@ fn softcap_untied_head_model_backward_matches_numerical() {
 }
 
 #[test]
+fn mtp_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0x347B);
+    let lambda = 0.7_f32;
+    let cfg = TransformerConfig {
+        vocab: 12,
+        d_model: 8,
+        n_layer: 1,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        mtp_weight: lambda,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // Aux head is zero-init in production; randomize so its CE is not
+    // exactly uniform and trunk gradients through it are nontrivial.
+    model.w_head2 = Some(random_vec(cfg.vocab * cfg.d_model, &mut rng));
+
+    let tokens: Vec<u32> = vec![3, 7, 1, 9, 4];
+    let targets: Vec<u32> = vec![7, 1, 9, 4, 2];
+    let t = targets.len();
+
+    // Combined training objective: main CE + λ · aux CE on t+2.
+    let total_loss = |m: &DecoderTransformer| -> f32 {
+        let (logits, cache) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let ce_rows = |rows: &[f32], tgts: &[u32]| -> f32 {
+            let n = tgts.len();
+            let mut total = 0.0_f32;
+            for ti in 0..n {
+                let row = &rows[ti * v..(ti + 1) * v];
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+                total += -(row[tgts[ti] as usize] - max - sum.ln());
+            }
+            total / n as f32
+        };
+        let main = ce_rows(&logits, &targets);
+        let h_pre = &cache.h_final[..(t - 1) * m.config.d_model];
+        let logits2 = aurora::transformer::tied_lm_head_forward(
+            h_pre,
+            m.w_head2.as_deref().unwrap(),
+            v,
+            m.config.d_model,
+        );
+        main + lambda * ce_rows(&logits2, &targets[1..])
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    let mut grads = ModelGrads::zeros(&cfg);
+    let _ = model.backward(&cache, &logits, &targets, &mut grads);
+
+    for i in [0, 13, 41, 77] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.w_head2.as_mut().unwrap()[i] += EPS;
+        mm.w_head2.as_mut().unwrap()[i] -= EPS;
+        let g = (total_loss(&mp) - total_loss(&mm)) / (2.0 * EPS);
+        let err = rel_err(grads.embed.d_w_head2[i], g);
+        assert!(err < TOL, "d_w_head2[{i}]: analytic {} vs numeric {} (err {err})", grads.embed.d_w_head2[i], g);
+    }
+
+    // Trunk gradient includes the aux path (tied main head → d_w_tok).
+    for i in [0, 25, 60] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.embed.w_tok[i] += EPS;
+        mm.embed.w_tok[i] -= EPS;
+        let g = (total_loss(&mp) - total_loss(&mm)) / (2.0 * EPS);
+        let err = rel_err(grads.embed.d_w_tok[i], g);
+        assert!(err < TOL, "mtp d_w_tok[{i}]: analytic {} vs numeric {} (err {err})", grads.embed.d_w_tok[i], g);
+    }
+}
+
+#[test]
+fn windowed_attention_masks_and_backward_matches_numerical() {
+    use aurora::transformer::attention::causal_mha_forward_windowed;
+
+    let mut rng = StdRng::seed_from_u64(0x71D0);
+    let d_model = 8;
+    let n_head = 2;
+    let t = 6;
+    let window = 2;
+
+    let mut w = MhaWeights::new(d_model, n_head, &mut rng);
+    // w_o is zero-init by convention — randomize so the MHA output (and
+    // its gradients) are nontrivial.
+    w.w_o.w = random_vec(d_model * d_model, &mut rng);
+    let w = w;
+    let mut x = random_vec(t * d_model, &mut rng);
+
+    // Structural: position t-1 sees only the last `window` positions —
+    // perturbing position 0 must not change y[t-1]; perturbing t-2 must.
+    let (y0, _) = causal_mha_forward_windowed(&w, &x, window);
+    for c in 0..d_model {
+        x[c] += 3.0;
+    }
+    let (y1, _) = causal_mha_forward_windowed(&w, &x, window);
+    for c in 0..d_model {
+        let i = (t - 1) * d_model + c;
+        assert!(
+            (y0[i] - y1[i]).abs() < 1e-5,
+            "window leaked position 0 into y[t-1, {c}]"
+        );
+    }
+    for c in 0..d_model {
+        x[(t - 2) * d_model + c] += 3.0;
+    }
+    let (y2, _) = causal_mha_forward_windowed(&w, &x, window);
+    let changed = (0..d_model)
+        .any(|c| (y1[(t - 1) * d_model + c] - y2[(t - 1) * d_model + c]).abs() > 1e-4);
+    assert!(changed, "in-window position t-2 had no effect on y[t-1]");
+
+    // Gradient check with the window active (backward masks via
+    // probs == 0). Fresh x — the structural checks above shifted the
+    // old one by ±3, which saturates softmax and wrecks central diffs.
+    let x = random_vec(t * d_model, &mut rng);
+    let upstream = random_vec(t * d_model, &mut rng);
+    let (_y, cache) = causal_mha_forward_windowed(&w, &x, window);
+    let mut grads = MhaGrads::zeros(d_model);
+    let dx = causal_mha_backward(&w, &cache, &upstream, &mut grads);
+    for i in 0..x.len() {
+        let mut xp = x.clone();
+        let mut xm = x.clone();
+        xp[i] += EPS;
+        xm[i] -= EPS;
+        let (yp, _) = causal_mha_forward_windowed(&w, &xp, window);
+        let (ym, _) = causal_mha_forward_windowed(&w, &xm, window);
+        let g = (dot(&yp, &upstream) - dot(&ym, &upstream)) / (2.0 * EPS);
+        let err = rel_err(dx[i], g);
+        assert!(err < TOL, "window dx[{i}]: analytic {} vs numeric {} (err {err})", dx[i], g);
+    }
+}
+
+#[test]
+fn ngram_embed_backward_matches_numerical() {
+    use aurora::transformer::embedding::{ngram_hash, NGRAM_SENTINEL};
+
+    let mut rng = StdRng::seed_from_u64(0x96A4);
+    let vocab = 16;
+    let d_model = 6;
+    let seq_len_max = 8;
+    let rows = 32_usize;
+
+    let mut w = EmbedWeights::new(vocab, d_model, seq_len_max, &mut rng);
+    w.ngram_rows = rows;
+    w.w_ngram = random_vec(rows * d_model, &mut rng);
+
+    let tokens: Vec<u32> = vec![3, 1, 7, 3, 1];
+    let t = tokens.len();
+    let upstream = random_vec(t * d_model, &mut rng);
+
+    let (out, cache) = embed_forward(&w, &tokens);
+    let mut grads = EmbedGrads::zeros(vocab, d_model, seq_len_max);
+    grads.d_w_ngram = vec![0.0; rows * d_model];
+    embed_backward(&w, &cache, &upstream, &mut grads);
+
+    // Forward includes the hashed bigram row (position 0 uses the
+    // sentinel as `prev`).
+    for ti in 0..t {
+        let prev = if ti == 0 { NGRAM_SENTINEL } else { tokens[ti - 1] };
+        let idx = ngram_hash(prev, tokens[ti], rows as u32) as usize;
+        for c in 0..d_model {
+            let base = w.w_tok[tokens[ti] as usize * d_model + c] + w.w_pos[ti * d_model + c];
+            let expected = base + w.w_ngram[idx * d_model + c];
+            assert!(
+                (out[ti * d_model + c] - expected).abs() < 1e-5,
+                "ngram fwd mismatch at ({ti}, {c})"
+            );
+        }
+    }
+
+    // Numerical gradient on every touched table row.
+    let mut touched: Vec<usize> = (0..t)
+        .map(|ti| {
+            let prev = if ti == 0 { NGRAM_SENTINEL } else { tokens[ti - 1] };
+            ngram_hash(prev, tokens[ti], rows as u32) as usize
+        })
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    for &idx in &touched {
+        for c in 0..d_model {
+            let i = idx * d_model + c;
+            let mut wp = w.clone();
+            let mut wm = w.clone();
+            wp.w_ngram[i] += EPS;
+            wm.w_ngram[i] -= EPS;
+            let (op, _) = embed_forward(&wp, &tokens);
+            let (om, _) = embed_forward(&wm, &tokens);
+            let g = (dot(&op, &upstream) - dot(&om, &upstream)) / (2.0 * EPS);
+            let err = rel_err(grads.d_w_ngram[i], g);
+            assert!(err < TOL, "d_w_ngram[{i}]: analytic {} vs numeric {} (err {err})", grads.d_w_ngram[i], g);
+        }
+    }
+    // Untouched rows stay zero.
+    let touched_set: std::collections::HashSet<usize> = touched.into_iter().collect();
+    for idx in 0..rows {
+        if !touched_set.contains(&idx) {
+            for c in 0..d_model {
+                assert_eq!(grads.d_w_ngram[idx * d_model + c], 0.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn value_resid_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0x7A1E);
+    let cfg = TransformerConfig {
+        vocab: 12,
+        d_model: 8,
+        n_layer: 3,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        value_resid: true,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // w_o is zero-init — without it no gradient flows through the value
+    // path at all. Randomize it and the λs so the mix is nontrivial.
+    for (li, blk) in model.blocks.iter_mut().enumerate() {
+        blk.mha.w_o.w = random_vec(cfg.d_model * cfg.d_model, &mut rng)
+            .iter()
+            .map(|v| v * 0.3)
+            .collect();
+        if li > 0 {
+            blk.mha.lambda_v = [0.8, 0.5];
+        }
+    }
+    let model = model;
+
+    let tokens: Vec<u32> = vec![3, 7, 1, 9, 4];
+    let targets: Vec<u32> = vec![7, 1, 9, 4, 2];
+
+    let ce_loss = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            total += -(row[targets[ti] as usize] - max - sum.ln());
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    let mut grads = ModelGrads::zeros(&cfg);
+    let _ = model.backward(&cache, &logits, &targets, &mut grads);
+
+    // λ gradients for every mixing layer. λ is a scalar with a small
+    // gradient — perturb 10× more than the weight checks so the f32
+    // central difference resolves it above the loss-eval noise floor.
+    let eps_l = 1e-2_f32;
+    for li in 1..cfg.n_layer {
+        for k in 0..2 {
+            let mut mp = model.clone();
+            let mut mm = model.clone();
+            mp.blocks[li].mha.lambda_v[k] += eps_l;
+            mm.blocks[li].mha.lambda_v[k] -= eps_l;
+            let g = (ce_loss(&mp) - ce_loss(&mm)) / (2.0 * eps_l);
+            let a = grads.blocks[li].d_mha.d_lambda_v[k];
+            let err = rel_err(a, g);
+            assert!(err < TOL, "d_lambda[{li}][{k}]: analytic {a} vs numeric {g} (err {err})");
+        }
+    }
+
+    // Per-element W_v grads sit below the f32 central-difference noise
+    // floor on a model this small — check the directional derivative
+    // along a random direction instead (signal scales with the whole
+    // matrix). Layer 0 exercises the cross-layer d_v0 path, layer 2 the
+    // λa chain.
+    for li in [0, 2] {
+        let dir = random_vec(cfg.d_model * cfg.d_model, &mut rng);
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        for (i, &u) in dir.iter().enumerate() {
+            mp.blocks[li].mha.w_v.w[i] += EPS * u;
+            mm.blocks[li].mha.w_v.w[i] -= EPS * u;
+        }
+        let g = (ce_loss(&mp) - ce_loss(&mm)) / (2.0 * EPS);
+        let a = dot(&grads.blocks[li].d_mha.d_w_v.d_w, &dir);
+        let err = rel_err(a, g);
+        assert!(err < TOL, "vr dW_v[{li}]·u: analytic {a} vs numeric {g} (err {err})");
+    }
+}
+
+#[test]
+fn tie_layers_shares_one_block_and_accumulates_grads() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0xA1BE);
+    let cfg = TransformerConfig {
+        vocab: 12,
+        d_model: 8,
+        n_layer: 3,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        tie_layers: true,
+        ..TransformerConfig::default()
+    };
+    let model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    assert_eq!(model.blocks.len(), 1, "tie_layers must store one block");
+
+    let tokens: Vec<u32> = vec![3, 7, 1, 9, 4];
+    let targets: Vec<u32> = vec![7, 1, 9, 4, 2];
+
+    let ce_loss = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            total += -(row[targets[ti] as usize] - max - sum.ln());
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    assert_eq!(cache.blocks.len(), cfg.n_layer, "one activation cache per logical layer");
+    let mut grads = ModelGrads::zeros(&cfg);
+    assert_eq!(grads.blocks.len(), 1);
+    let _ = model.backward(&cache, &logits, &targets, &mut grads);
+
+    // Directional derivative of the SHARED W_q — the analytic gradient
+    // is the sum over all three logical layers.
+    let dir = random_vec(cfg.d_model * cfg.d_model, &mut rng);
+    let mut mp = model.clone();
+    let mut mm = model.clone();
+    for (i, &u) in dir.iter().enumerate() {
+        mp.blocks[0].mha.w_q.w[i] += EPS * u;
+        mm.blocks[0].mha.w_q.w[i] -= EPS * u;
+    }
+    let g = (ce_loss(&mp) - ce_loss(&mm)) / (2.0 * EPS);
+    let a = dot(&grads.blocks[0].d_mha.d_w_q.d_w, &dir);
+    let err = rel_err(a, g);
+    assert!(err < TOL, "tied dW_q·u: analytic {a} vs numeric {g} (err {err})");
+
+    // Same for the shared W_fc.
+    let dir = random_vec(cfg.d_model * cfg.d_ff, &mut rng);
+    let mut mp = model.clone();
+    let mut mm = model.clone();
+    for (i, &u) in dir.iter().enumerate() {
+        mp.blocks[0].ffn.w_fc.w[i] += EPS * u;
+        mm.blocks[0].ffn.w_fc.w[i] -= EPS * u;
+    }
+    let g = (ce_loss(&mp) - ce_loss(&mm)) / (2.0 * EPS);
+    let a = dot(&grads.blocks[0].d_ffn.d_w_fc.d_w, &dir);
+    let err = rel_err(a, g);
+    assert!(err < TOL, "tied dW_fc·u: analytic {a} vs numeric {g} (err {err})");
+}
+
+#[test]
 fn zero_ffn_proj_zeroes_only_proj_init() {
     use aurora::transformer::{DecoderTransformer, TransformerConfig};
     let mut rng = StdRng::seed_from_u64(0x0F);

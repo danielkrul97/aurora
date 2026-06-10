@@ -249,6 +249,7 @@ fn causal_mha_forward_matches_cpu() {
             t as u32,
             n_head as u32,
             d_head as u32,
+            0,
         );
         ctx.queue.submit(Some(enc.finish()));
         // Compare GPU heads_out vs CPU heads_out (before output projection).
@@ -301,7 +302,7 @@ fn causal_mha_backward_matches_cpu() {
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mha bwd") });
     fwd.dispatch_into(
         &ctx, &mut enc, &q_gpu, &k_gpu, &v_gpu, &out_gpu, &probs_gpu,
-        t as u32, n_head as u32, d_head as u32,
+        t as u32, n_head as u32, d_head as u32, 0,
     );
     bwd.dispatch_into(
         &ctx, &mut enc, &q_gpu, &k_gpu, &v_gpu, &probs_gpu, &dout_gpu,
@@ -761,6 +762,299 @@ fn full_transformer_tier1_forward_and_grads_match_cpu() {
             "tier1 NLL[{ti}] CPU {cpu_nll} vs GPU {g_nll}"
         );
     }
+}
+
+#[test]
+fn full_transformer_mtp_grads_match_cpu() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x347B);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        mtp_weight: 0.5,
+        ..TransformerConfig::default()
+    };
+    let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    if let Some(h) = cpu_model.w_head2.as_mut() {
+        for v in h.iter_mut() {
+            *v = rng.random::<f32>() * 0.4 - 0.2;
+        }
+    }
+    let cpu_model = cpu_model;
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..8u32).map(|i| (i * 3 + 1) % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let (cpu_logits, cpu_cache) = cpu_model.forward(&tokens);
+    let mut cpu_grads = ModelGrads::zeros(&cfg);
+    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &cpu_logits, &targets, &mut cpu_grads);
+
+    gpu_model.zero_grad();
+    let gpu_loss = gpu_model.train_step(&tokens, &targets);
+    assert!((cpu_loss - gpu_loss).abs() < 5e-2, "mtp loss CPU {cpu_loss} vs GPU {gpu_loss}");
+
+    let gpu_g_head2 = gpu_model
+        .p
+        .g_w_head2
+        .as_ref()
+        .expect("g_w_head2 missing")
+        .download(&gpu_model.ctx);
+    let err_h2 = max_rel_err(&cpu_grads.embed.d_w_head2, &gpu_g_head2);
+    assert!(err_h2 < 5e-2, "mtp g_w_head2 err {err_h2}");
+
+    // Trunk gradients must include the aux-path contribution.
+    let gpu_g_w_tok = gpu_model.p.g_w_tok.download(&gpu_model.ctx);
+    let err_tok = max_rel_err(&cpu_grads.embed.d_w_tok, &gpu_g_w_tok);
+    assert!(err_tok < 5e-2, "mtp g_w_tok err {err_tok}");
+    for li in 0..cfg.n_layer {
+        let gpu_g_w_fc = gpu_model.p.blocks[li].g_w_fc.download(&gpu_model.ctx);
+        let err_fc = max_rel_err(&cpu_grads.blocks[li].d_ffn.d_w_fc.d_w, &gpu_g_w_fc);
+        assert!(err_fc < 5e-2, "mtp g_w_fc layer {li} err {err_fc}");
+    }
+}
+
+#[test]
+fn full_transformer_ngram_grads_match_cpu() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x96A4);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        ngram_rows: 64,
+        ..TransformerConfig::default()
+    };
+    let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // Zero-init table would make the feature a forward no-op; randomize.
+    for v in cpu_model.embed.w_ngram.iter_mut() {
+        *v = rng.random::<f32>() * 0.2 - 0.1;
+    }
+    let cpu_model = cpu_model;
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..8u32).map(|i| (i * 7 + 2) % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let (cpu_logits, cpu_cache) = cpu_model.forward(&tokens);
+    let mut cpu_grads = ModelGrads::zeros(&cfg);
+    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &cpu_logits, &targets, &mut cpu_grads);
+
+    gpu_model.zero_grad();
+    let gpu_loss = gpu_model.train_step(&tokens, &targets);
+    assert!((cpu_loss - gpu_loss).abs() < 5e-2, "ngram loss CPU {cpu_loss} vs GPU {gpu_loss}");
+
+    let gpu_g_ngram = gpu_model
+        .p
+        .g_w_ngram
+        .as_ref()
+        .expect("g_w_ngram missing")
+        .download(&gpu_model.ctx);
+    let err_ng = max_rel_err(&cpu_grads.embed.d_w_ngram, &gpu_g_ngram);
+    assert!(err_ng < 5e-2, "g_w_ngram err {err_ng}");
+    let gpu_g_w_tok = gpu_model.p.g_w_tok.download(&gpu_model.ctx);
+    let err_tok = max_rel_err(&cpu_grads.embed.d_w_tok, &gpu_g_w_tok);
+    assert!(err_tok < 5e-2, "ngram g_w_tok err {err_tok}");
+}
+
+#[test]
+fn full_transformer_local_window_grads_match_cpu() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x71D0);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 3,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        // Layers 0–1 windowed, layer 2 full.
+        local_window: 3,
+        global_layers: 1,
+        ..TransformerConfig::default()
+    };
+    let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..12u32).map(|i| (i * 5 + 3) % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let (cpu_logits, cpu_cache) = cpu_model.forward(&tokens);
+    let mut cpu_grads = ModelGrads::zeros(&cfg);
+    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &cpu_logits, &targets, &mut cpu_grads);
+
+    gpu_model.zero_grad();
+    let gpu_loss = gpu_model.train_step(&tokens, &targets);
+    assert!(
+        (cpu_loss - gpu_loss).abs() < 5e-2,
+        "window loss CPU {cpu_loss} vs GPU {gpu_loss}"
+    );
+
+    for li in 0..cfg.n_layer {
+        let gpu_g_w_q = gpu_model.p.blocks[li].g_w_q.download(&gpu_model.ctx);
+        let gpu_g_w_v = gpu_model.p.blocks[li].g_w_v.download(&gpu_model.ctx);
+        let err_q = max_rel_err(&cpu_grads.blocks[li].d_mha.d_w_q.d_w, &gpu_g_w_q);
+        let err_v = max_rel_err(&cpu_grads.blocks[li].d_mha.d_w_v.d_w, &gpu_g_w_v);
+        assert!(err_q < 5e-2, "window g_w_q layer {li} err {err_q}");
+        assert!(err_v < 5e-2, "window g_w_v layer {li} err {err_v}");
+    }
+}
+
+#[test]
+fn full_transformer_value_resid_grads_match_cpu() {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x7A1E);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 3,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        value_resid: true,
+        ..TransformerConfig::default()
+    };
+    let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    for (li, blk) in cpu_model.blocks.iter_mut().enumerate() {
+        // Zero w_o would kill the whole value path — randomize.
+        for v in blk.mha.w_o.w.iter_mut() {
+            *v = rng.random::<f32>() * 0.2 - 0.1;
+        }
+        if li > 0 {
+            blk.mha.lambda_v = [0.8, 0.5];
+        }
+    }
+    let cpu_model = cpu_model;
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..8u32).map(|i| (i * 5 + 3) % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let (cpu_logits, cpu_cache) = cpu_model.forward(&tokens);
+    let mut cpu_grads = ModelGrads::zeros(&cfg);
+    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &cpu_logits, &targets, &mut cpu_grads);
+
+    gpu_model.zero_grad();
+    let gpu_loss = gpu_model.train_step(&tokens, &targets);
+    assert!((cpu_loss - gpu_loss).abs() < 5e-2, "vr loss CPU {cpu_loss} vs GPU {gpu_loss}");
+
+    for li in 0..cfg.n_layer {
+        let gpu_g_w_v = gpu_model.p.blocks[li].g_w_v.download(&gpu_model.ctx);
+        let err_v = max_rel_err(&cpu_grads.blocks[li].d_mha.d_w_v.d_w, &gpu_g_w_v);
+        assert!(err_v < 5e-2, "vr g_w_v layer {li} err {err_v}");
+        if li > 0 {
+            let gpu_g_lam = gpu_model.p.blocks[li].g_lambda_v.download(&gpu_model.ctx);
+            let err_lam = max_rel_err(&cpu_grads.blocks[li].d_mha.d_lambda_v, &gpu_g_lam);
+            assert!(err_lam < 5e-2, "vr g_lambda layer {li} err {err_lam}");
+        }
+    }
+}
+
+#[test]
+fn full_transformer_tier3_combo_grads_match_cpu() {
+    // Everything at once: tier1 pack + MTP + n-gram + local window +
+    // value residual + layer tying. The strongest single check that all
+    // the mode flags compose on both backends.
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x713C);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 3,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        rope: true,
+        rmsnorm: true,
+        relu2: true,
+        qk_norm: true,
+        untied_head: true,
+        softcap: 5.0,
+        mtp_weight: 0.5,
+        value_resid: true,
+        tie_layers: true,
+        local_window: 3,
+        global_layers: 1,
+        ngram_rows: 64,
+        ..TransformerConfig::default()
+    };
+    let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    assert_eq!(cpu_model.blocks.len(), 1);
+    if let Some(h) = cpu_model.w_head.as_mut() {
+        for v in h.iter_mut() {
+            *v = rng.random::<f32>() * 0.4 - 0.2;
+        }
+    }
+    if let Some(h) = cpu_model.w_head2.as_mut() {
+        for v in h.iter_mut() {
+            *v = rng.random::<f32>() * 0.4 - 0.2;
+        }
+    }
+    for v in cpu_model.embed.w_ngram.iter_mut() {
+        *v = rng.random::<f32>() * 0.2 - 0.1;
+    }
+    for v in cpu_model.blocks[0].mha.w_o.w.iter_mut() {
+        *v = rng.random::<f32>() * 0.2 - 0.1;
+    }
+    cpu_model.blocks[0].mha.lambda_v = [0.8, 0.5];
+    let cpu_model = cpu_model;
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..12u32).map(|i| (i * 7 + 2) % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let (cpu_logits, cpu_cache) = cpu_model.forward(&tokens);
+    let mut cpu_grads = ModelGrads::zeros(&cfg);
+    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &cpu_logits, &targets, &mut cpu_grads);
+
+    gpu_model.zero_grad();
+    let gpu_loss = gpu_model.train_step(&tokens, &targets);
+    assert!(
+        (cpu_loss - gpu_loss).abs() < 5e-2,
+        "tier3 combo loss CPU {cpu_loss} vs GPU {gpu_loss}"
+    );
+
+    // Shared-block grads (accumulated over the 3 logical layers).
+    let gb = &gpu_model.p.blocks[0];
+    let checks: [(&str, Vec<f32>, &[f32]); 5] = [
+        ("g_w_q", gb.g_w_q.download(&gpu_model.ctx), &cpu_grads.blocks[0].d_mha.d_w_q.d_w),
+        ("g_w_v", gb.g_w_v.download(&gpu_model.ctx), &cpu_grads.blocks[0].d_mha.d_w_v.d_w),
+        ("g_w_fc", gb.g_w_fc.download(&gpu_model.ctx), &cpu_grads.blocks[0].d_ffn.d_w_fc.d_w),
+        ("g_lambda", gb.g_lambda_v.download(&gpu_model.ctx), &cpu_grads.blocks[0].d_mha.d_lambda_v),
+        ("g_ln1_gamma", gb.g_ln1_gamma.download(&gpu_model.ctx), &cpu_grads.blocks[0].d_ln1.d_gamma),
+    ];
+    for (name, gpu_g, cpu_g) in &checks {
+        let err = max_rel_err(cpu_g, gpu_g);
+        assert!(err < 5e-2, "tier3 combo {name} err {err}");
+    }
+    let gpu_g_head = gpu_model.p.g_w_head.as_ref().unwrap().download(&gpu_model.ctx);
+    assert!(max_rel_err(&cpu_grads.embed.d_w_head, &gpu_g_head) < 5e-2, "combo g_w_head");
+    let gpu_g_head2 = gpu_model.p.g_w_head2.as_ref().unwrap().download(&gpu_model.ctx);
+    assert!(max_rel_err(&cpu_grads.embed.d_w_head2, &gpu_g_head2) < 5e-2, "combo g_w_head2");
+    let gpu_g_ngram = gpu_model.p.g_w_ngram.as_ref().unwrap().download(&gpu_model.ctx);
+    assert!(max_rel_err(&cpu_grads.embed.d_w_ngram, &gpu_g_ngram) < 5e-2, "combo g_w_ngram");
 }
 
 #[test]

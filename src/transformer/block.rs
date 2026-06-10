@@ -6,7 +6,7 @@ use crate::attention::{
     layer_norm_backward, layer_norm_forward, LayerNorm, LayerNormCache, LayerNormGrads,
 };
 use crate::transformer::attention::{
-    causal_mha_backward, causal_mha_forward, MhaCache, MhaGrads, MhaWeights,
+    causal_mha_backward_full, causal_mha_forward_full, MhaCache, MhaGrads, MhaWeights,
 };
 use crate::transformer::ffn::{ffn_backward, ffn_forward, FfnCache, FfnGrads, FfnWeights};
 
@@ -80,9 +80,16 @@ pub struct TransformerBlockCache {
 }
 
 /// PreLN block: `y = x + MHA(LN(x))`, `z = y + FFN(LN(y))`.
-pub fn block_forward(blk: &TransformerBlock, x: &[f32]) -> (Vec<f32>, TransformerBlockCache) {
+/// `window` is this layer's sliding-attention width (0 = full causal);
+/// `v0` is layer 0's value stream for the value residual.
+pub fn block_forward(
+    blk: &TransformerBlock,
+    x: &[f32],
+    window: usize,
+    v0: Option<&[f32]>,
+) -> (Vec<f32>, TransformerBlockCache) {
     let (ln1_out, ln1_cache) = layer_norm_forward(&blk.ln1, x);
-    let (mha_out, mha_cache) = causal_mha_forward(&blk.mha, &ln1_out);
+    let (mha_out, mha_cache) = causal_mha_forward_full(&blk.mha, &ln1_out, window, v0);
 
     let mut post_attn = vec![0.0_f32; x.len()];
     for i in 0..x.len() {
@@ -115,12 +122,17 @@ pub fn block_forward(blk: &TransformerBlock, x: &[f32]) -> (Vec<f32>, Transforme
     )
 }
 
-/// Backward through the block. Returns `dx`.
+/// Backward through the block. Returns `dx`. The value-residual
+/// plumbing (`v0`, `extra_d_v`, `d_v0_accum`) passes straight through
+/// to the MHA backward.
 pub fn block_backward(
     blk: &TransformerBlock,
     cache: &TransformerBlockCache,
     dz: &[f32],
     grads: &mut TransformerBlockGrads,
+    v0: Option<&[f32]>,
+    extra_d_v: Option<&[f32]>,
+    d_v0_accum: Option<&mut Vec<f32>>,
 ) -> Vec<f32> {
     // FFN branch: dz contributes to both `post_attn` (residual) and FFN input.
     let d_ffn_out = dz.to_vec();
@@ -135,7 +147,10 @@ pub fn block_backward(
 
     // MHA branch: d_post_attn → both `x_in` (residual) and MHA output.
     let d_mha_out = d_post_attn.clone();
-    let d_ln1_out = causal_mha_backward(&blk.mha, &cache.mha_cache, &d_mha_out, &mut grads.d_mha);
+    let d_ln1_out = causal_mha_backward_full(
+        &blk.mha, &cache.mha_cache, &d_mha_out, &mut grads.d_mha,
+        v0, extra_d_v, d_v0_accum,
+    );
     let d_x_from_mha =
         layer_norm_backward(&blk.ln1, &cache.ln1_cache, &d_ln1_out, &mut grads.d_ln1);
 

@@ -404,6 +404,22 @@ pub fn scaled_dot_product_attention(
     d_v: usize,
     causal: bool,
 ) -> (Vec<f32>, AttentionCache) {
+    scaled_dot_product_attention_windowed(q, k, v, d_k, d_v, causal, 0)
+}
+
+/// Causal attention with an optional sliding window: position `i`
+/// attends to `j ∈ [i−window+1, i]` (`window == 0` = full causal).
+/// The backward pass needs no window — masked positions have
+/// `probs == 0` and contribute nothing.
+pub fn scaled_dot_product_attention_windowed(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    d_k: usize,
+    d_v: usize,
+    causal: bool,
+    window: usize,
+) -> (Vec<f32>, AttentionCache) {
     let t_q = q.len() / d_k;
     let t_k = k.len() / d_k;
     debug_assert_eq!(v.len(), t_k * d_v);
@@ -420,7 +436,7 @@ pub fn scaled_dot_product_attention(
                 s += qr[c] * kr[c];
             }
             s *= scale;
-            if causal && j > i {
+            if causal && (j > i || (window > 0 && j + window <= i)) {
                 s = NEG_INF;
             }
             probs[i * t_k + j] = s;

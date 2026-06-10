@@ -17,10 +17,30 @@
 
 use rand::Rng;
 
+/// "Previous token" stand-in for the first position of a window.
+pub const NGRAM_SENTINEL: u32 = 0xFFFF_FFFF;
+
+/// Hash of a (prev, cur) token bigram into the n-gram table. u32
+/// wrapping arithmetic so the WGSL mirror is bit-identical.
+#[must_use]
+pub fn ngram_hash(prev: u32, cur: u32, rows: u32) -> u32 {
+    let mut h = prev.wrapping_mul(0x9E37_79B1) ^ cur.wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7FEB_352D);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846C_A68B);
+    h ^= h >> 16;
+    h % rows
+}
+
 #[derive(Clone, Debug)]
 pub struct EmbedWeights {
     pub w_tok: Vec<f32>,
     pub w_pos: Vec<f32>,
+    /// Hashed bigram table `[ngram_rows * d_model]`; empty = off.
+    /// Zero-init: the feature starts as an exact no-op.
+    pub w_ngram: Vec<f32>,
+    pub ngram_rows: usize,
     pub vocab: usize,
     pub d_model: usize,
     pub seq_len_max: usize,
@@ -44,6 +64,8 @@ impl EmbedWeights {
         Self {
             w_tok,
             w_pos,
+            w_ngram: Vec::new(),
+            ngram_rows: 0,
             vocab,
             d_model,
             seq_len_max,
@@ -58,6 +80,10 @@ pub struct EmbedGrads {
     pub d_w_pos: Vec<f32>,
     /// Untied LM head gradient; empty when the head is tied.
     pub d_w_head: Vec<f32>,
+    /// MTP auxiliary head gradient; empty when MTP is off.
+    pub d_w_head2: Vec<f32>,
+    /// N-gram table gradient; empty when the table is off.
+    pub d_w_ngram: Vec<f32>,
 }
 
 impl EmbedGrads {
@@ -67,6 +93,8 @@ impl EmbedGrads {
             d_w_tok: vec![0.0; vocab * d_model],
             d_w_pos: vec![0.0; seq_len_max * d_model],
             d_w_head: Vec::new(),
+            d_w_head2: Vec::new(),
+            d_w_ngram: Vec::new(),
         }
     }
 
@@ -74,6 +102,8 @@ impl EmbedGrads {
         self.d_w_tok.fill(0.0);
         self.d_w_pos.fill(0.0);
         self.d_w_head.fill(0.0);
+        self.d_w_head2.fill(0.0);
+        self.d_w_ngram.fill(0.0);
     }
 }
 
@@ -102,6 +132,14 @@ pub fn embed_forward(w: &EmbedWeights, tokens: &[u32]) -> (Vec<f32>, EmbedCache)
         } else {
             dst.copy_from_slice(tok_row);
         }
+        if w.ngram_rows > 0 {
+            let prev = if ti > 0 { tokens[ti - 1] } else { NGRAM_SENTINEL };
+            let idx = ngram_hash(prev, tokens[ti], w.ngram_rows as u32) as usize;
+            let ng_row = &w.w_ngram[idx * d..(idx + 1) * d];
+            for c in 0..d {
+                dst[c] += ng_row[c];
+            }
+        }
     }
     (
         out,
@@ -128,6 +166,14 @@ pub fn embed_backward(w: &EmbedWeights, cache: &EmbedCache, dy: &[f32], grads: &
             let pos_row = &mut grads.d_w_pos[ti * d..(ti + 1) * d];
             for c in 0..d {
                 pos_row[c] += dy_row[c];
+            }
+        }
+        if w.ngram_rows > 0 {
+            let prev = if ti > 0 { cache.tokens[ti - 1] } else { NGRAM_SENTINEL };
+            let idx = ngram_hash(prev, cache.tokens[ti], w.ngram_rows as u32) as usize;
+            let ng_row = &mut grads.d_w_ngram[idx * d..(idx + 1) * d];
+            for c in 0..d {
+                ng_row[c] += dy_row[c];
             }
         }
     }

@@ -683,6 +683,62 @@ prohraje (noise floor ~0.035 BPB).
 
 ---
 
+## Sprint 66 — Tier-3 experimentální balík (branch `tier3`)
+
+**Cíl:** experimentální sázky nad Tier-1 packem, každá za vlastním CLI
+flagem, CPU + GPU parita, default chování beze změny. Hybrid
+spacetime+attention (Tier-3 bod 1) záměrně vynechán — zůstává jako
+samostatný budoucí sprint.
+
+1. **MTP** (`--mtp-weight λ`) — auxiliary zero-init head predikuje t+2
+   z pozic 0..T-2, loss += λ·CE₂ (gradient-only; reportovaná loss je
+   main CE na obou backendech). Bez softcapu na aux logitech.
+2. **Value residual** (`--value-resid`) — v_ℓ = λa·v_ℓ + λb·v₀
+   (learnable per-layer skaláry, init [1,0], AdamW bez WD). Cross-layer
+   backward: vrstvy >0 akumulují λb·dv do `d_v0_accum`, vrstva 0 ho
+   injektuje do svého dv. GPU: `value_resid.rs` (VMix fwd + fused bwd
+   s atomic λ-dot redukcí).
+3. **N-gram paměť** (`--ngram-rows N`) — hashovaná bigram tabulka
+   přičtená k token embeddingu (zero-init = přesný no-op na startu).
+   u32 hash bit-identický CPU/WGSL; pozice 0 okna používá sentinel.
+   KV cache nese `last_token` pro inference bigram.
+4. **Local/global attention** (`--local-window W --global-layers G`) —
+   spodní vrstvy sliding-window kauzální, posledních G vrstev plných.
+   Window je parametr dispatche (vlastnost pozice vrstvy, ne vah) —
+   kompatibilní s tie-layers. Backward beze změny (maska implicitní
+   v probs == 0).
+5. **Layer tying** (`--tie-layers`) — ALBERT-style: 1 sdílený blok ×
+   n_layer průchodů. Gradienty akumulují přirozeně (linear_backward
+   je +=); checkpoint ukládá jen unikátní bloky.
+6. **Seq-len curriculum** (`--seq-curriculum`) — per-epoch: seq/4,
+   seq/2, plná délka; LR schedule total s tím počítá.
+7. **Muon momentum warmup** (`--muon-momentum-warmup S`) — 0.85 →
+   target přes prvních S kroků (modded-nanogpt).
+
+**Checkpoint AURORA06:** header + softcap nově `mtp_weight` f32,
+`local_window`/`global_layers`/`ngram_rows` u32; flags bity 5–6
+(value_resid, tie_layers); podmíněné tensory `w_head2`, `w_ngram`,
+`lambda_v`. Žádný backward compat s AURORA05.
+
+**Testy (+12, celkem 82):** numerické gradient checky pro každou
+feature (MTP vs kombinovaný loss, λ + cross-layer W_v směrové derivace,
+n-gram scatter, window mask + grad, tied-block akumulace), GPU parity
+per feature + **tier3 combo test** (všech 11 flagů najednou), KV-cache
+parity tier3, checkpoint round-trip tier3. LESSON: per-element f32
+centrální diference nestačí na malé gradienty (λ, W_v) — směrové
+derivace přes celou matici mají o řády lepší SNR.
+
+**Smoke (tiny_200k, GTX 1650):** plný stack `--gpu --tier1 --mtp-weight
+0.3 --value-resid --local-window 32 --ngram-rows 8192 --seq-curriculum
+--muon-momentum-warmup 100` → val 3.056 (seq16) → 2.889 (seq32) →
+2.841 po AURORA06 resume. CPU + `--tie-layers` (412K params) trénuje.
+
+**Pozn. k experimentům:** každý flag se měří samostatně proti Tier-1
+rekordu na fixním wall-clock budgetu (noise floor ~0.035 BPB ⇒ 3
+párované seedy pro deltas < 0.05). Kombinace až po per-flag výsledcích.
+
+---
+
 ## Sprint 60+ — otevřená pole
 
 | Větev | Co odemyká | Effort |

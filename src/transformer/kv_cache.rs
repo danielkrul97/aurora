@@ -16,7 +16,7 @@
 use crate::attention::{linear_forward, qk_norm_forward};
 use crate::linalg::{gelu, relu2};
 use crate::transformer::block::TransformerBlock;
-use crate::transformer::embedding::tied_lm_head_forward;
+use crate::transformer::embedding::{ngram_hash, tied_lm_head_forward, NGRAM_SENTINEL};
 use crate::transformer::model::DecoderTransformer;
 
 #[derive(Clone, Debug)]
@@ -44,6 +44,9 @@ pub struct KvCache {
     pub blocks: Vec<KvBlock>,
     pub d_model: usize,
     pub current_len: usize,
+    /// Most recent token in the cache — the n-gram table needs the
+    /// (prev, cur) bigram when embedding the next token.
+    pub last_token: Option<u32>,
 }
 
 impl KvCache {
@@ -53,6 +56,7 @@ impl KvCache {
             blocks: (0..n_layer).map(|_| KvBlock::empty()).collect(),
             d_model,
             current_len: 0,
+            last_token: None,
         }
     }
 
@@ -63,6 +67,7 @@ impl KvCache {
             b.current_len = 0;
         }
         self.current_len = 0;
+        self.last_token = None;
     }
 
     /// Pre-fill the cache by running the full sequence up through each
@@ -74,13 +79,14 @@ impl KvCache {
         // Run full forward once (cheaper than incremental for cold start).
         let (_logits, cache) = model.forward(tokens);
         // Extract per-block K and V from `cache.blocks`.
-        for li in 0..model.blocks.len() {
+        for li in 0..model.config.n_layer {
             let bc = &cache.blocks[li];
             self.blocks[li].k_history = bc.mha_cache.k.clone();
             self.blocks[li].v_history = bc.mha_cache.v.clone();
             self.blocks[li].current_len = t;
         }
         self.current_len = t;
+        self.last_token = tokens.last().copied();
         // Return last position's h_final.
         cache.h_final[(t - 1) * d..t * d].to_vec()
     }
@@ -108,12 +114,26 @@ pub fn generate_step(
             h[c] += pos_row[c];
         }
     }
+    if model.embed.ngram_rows > 0 {
+        let prev = cache.last_token.unwrap_or(NGRAM_SENTINEL);
+        let idx = ngram_hash(prev, new_token, model.embed.ngram_rows as u32) as usize;
+        let ng_row = &model.embed.w_ngram[idx * d..(idx + 1) * d];
+        for c in 0..d {
+            h[c] += ng_row[c];
+        }
+    }
 
     // 2. Run through each block with single-query attention against history.
-    for li in 0..model.blocks.len() {
-        let blk = &model.blocks[li];
+    let mut v0: Option<Vec<f32>> = None;
+    for li in 0..model.config.n_layer {
+        let blk = &model.blocks[model.config.block_index(li)];
         let kv = &mut cache.blocks[li];
-        h = block_step(blk, kv, &h, t_new_pos);
+        let v0_ref = if li > 0 { v0.as_deref() } else { None };
+        let (z, v_new) = block_step(blk, kv, &h, t_new_pos, model.config.layer_window(li), v0_ref);
+        if li == 0 && model.config.value_resid {
+            v0 = Some(v_new);
+        }
+        h = z;
     }
 
     // 3. Final LN + LM head over single position.
@@ -128,6 +148,7 @@ pub fn generate_step(
     }
 
     cache.current_len += 1;
+    cache.last_token = Some(new_token);
     logits
 }
 
@@ -138,7 +159,9 @@ fn block_step(
     kv: &mut KvBlock,
     h_in: &[f32],
     t_new_pos: usize,
-) -> Vec<f32> {
+    window: usize,
+    v0: Option<&[f32]>,
+) -> (Vec<f32>, Vec<f32>) {
     let d = blk.d_model;
     let n_head = blk.mha.n_head;
     let d_head = blk.mha.d_head;
@@ -148,7 +171,13 @@ fn block_step(
     // Project new q/k/v (single token, so each is length D)
     let mut q_new = linear_forward(&blk.mha.w_q, &ln1_out);
     let mut k_new = linear_forward(&blk.mha.w_k, &ln1_out);
-    let v_new = linear_forward(&blk.mha.w_v, &ln1_out);
+    let mut v_new = linear_forward(&blk.mha.w_v, &ln1_out);
+    if let (true, Some(v0)) = (blk.mha.value_resid, v0) {
+        let [la, lb] = blk.mha.lambda_v;
+        for (vi, &v0i) in v_new.iter_mut().zip(v0) {
+            *vi = la * *vi + lb * v0i;
+        }
+    }
     if blk.mha.qk_norm {
         qk_norm_forward(&mut q_new, n_head, d_head);
         qk_norm_forward(&mut k_new, n_head, d_head);
@@ -164,16 +193,22 @@ fn block_step(
     kv.current_len = t_new_pos + 1;
     let t_total = kv.current_len;
 
-    // For each head, run scaled dot-product against full K/V history.
+    // For each head, run scaled dot-product against the K/V history
+    // (windowed layers only see the last `window` positions).
+    let j_start = if window > 0 { t_total.saturating_sub(window) } else { 0 };
     let mut heads_out = vec![0.0_f32; d];
     let scale = (d_head as f32).sqrt().recip();
     for h in 0..n_head {
         let h_off = h * d_head;
         let q_h = &q_new[h_off..h_off + d_head];
-        // Compute s[j] for j in 0..t_total
+        // Compute s[j] for visible j
         let mut scores = vec![0.0_f32; t_total];
         let mut row_max = f32::NEG_INFINITY;
         for j in 0..t_total {
+            if j < j_start {
+                scores[j] = f32::NEG_INFINITY;
+                continue;
+            }
             let k_row = &kv.k_history[j * d + h_off..j * d + h_off + d_head];
             let mut s = 0.0_f32;
             for c in 0..d_head {
@@ -230,6 +265,6 @@ fn block_step(
     for i in 0..d {
         z[i] = post_attn[i] + ffn_out[i];
     }
-    z
+    (z, v_new)
 }
 

@@ -32,13 +32,16 @@ pub mod qk_norm;
 pub mod reduce;
 pub mod rope;
 pub mod softcap;
+pub mod value_resid;
 pub mod softmax_ce;
 pub mod transformer;
 
 pub use attention::{CausalMhaBackwardKernel, CausalMhaForwardKernel};
 pub use context::GpuContext;
-pub use elementwise::{VectorAddKernel, ZeroBufferKernel};
-pub use embedding::{EmbedScatterAddKernel, TokenPosEmbedKernel};
+pub use elementwise::{AddAssignKernel, VectorAddKernel, ZeroBufferKernel};
+pub use embedding::{
+    EmbedScatterAddKernel, NgramEmbedAddKernel, NgramScatterAddKernel, TokenPosEmbedKernel,
+};
 pub use gelu::{GeluBackwardKernel, GeluKernel};
 pub use kv_cache::{KvBlockGpu, KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
 pub use layer_norm::{LayerNormBackwardKernel, LayerNormForwardKernel};
@@ -55,5 +58,6 @@ pub use reduce::{
 };
 pub use rope::RopeKernel;
 pub use softcap::{SoftcapBackwardKernel, SoftcapKernel};
+pub use value_resid::{VMixBackwardKernel, VMixKernel};
 pub use softmax_ce::SoftmaxCrossEntropyKernel;
 pub use transformer::DecoderTransformerGpu;

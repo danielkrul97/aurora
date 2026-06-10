@@ -23,12 +23,16 @@ struct P {
     t: u32,
     d_head: u32,
     n_head: u32,
-    _pad0: u32,
+    wnd: u32,
     scale: f32,
     _p0: u32,
     _p1: u32,
     _p2: u32,
 };
+
+fn visible(j: u32, i: u32, wnd: u32) -> bool {
+    return j <= i && (wnd == 0u || j + wnd > i);
+}
 
 @group(0) @binding(0) var<storage, read>       q: array<f32>;
 @group(0) @binding(1) var<storage, read>       k: array<f32>;
@@ -60,12 +64,13 @@ fn main(
     let row_base = probs_head_base + i * p.t;
     let q_base = i * d_model + h_off;
 
-    // Phase 1: scores live in shared. Causal: j > i → 0 in shared.
+    // Phase 1: scores live in shared. Causal + sliding window:
+    // invisible j → 0 in shared.
     var local_max: f32 = -3.4028235e38;
     var j: u32 = tid;
     loop {
         if (j >= p.t) { break; }
-        if (j > i) {
+        if (!visible(j, i, p.wnd)) {
             sh_probs[j] = 0.0;
         } else {
             var s: f32 = 0.0;
@@ -93,12 +98,12 @@ fn main(
     workgroupBarrier();
     let row_max = sh_row_max;
 
-    // Phase 2: exp + per-thread sum, write back into shared (only j ≤ i).
+    // Phase 2: exp + per-thread sum, write back into shared (visible j only).
     var local_sum: f32 = 0.0;
     j = tid;
     loop {
         if (j >= p.t) { break; }
-        if (j <= i) {
+        if (visible(j, i, p.wnd)) {
             let e = exp(sh_probs[j] - row_max);
             sh_probs[j] = e;
             local_sum = local_sum + e;
@@ -126,7 +131,7 @@ fn main(
     j = tid;
     loop {
         if (j >= p.t) { break; }
-        if (j <= i) {
+        if (visible(j, i, p.wnd)) {
             let v_norm = sh_probs[j] * inv;
             sh_probs[j] = v_norm;
             probs[row_base + j] = v_norm;
@@ -336,7 +341,9 @@ struct AttnParams {
     t: u32,
     d_head: u32,
     n_head: u32,
-    _pad0: u32,
+    /// Sliding-window width for the forward kernel (0 = full causal);
+    /// backward kernels ignore it (masking is implicit in probs == 0).
+    wnd: u32,
     scale: f32,
     _p0: u32,
     _p1: u32,
@@ -409,13 +416,14 @@ impl CausalMhaForwardKernel {
         t: u32,
         n_head: u32,
         d_head: u32,
+        window: u32,
     ) {
         let scale = (d_head as f32).sqrt().recip();
         let p = AttnParams {
             t,
             d_head,
             n_head,
-            _pad0: 0,
+            wnd: window,
             scale,
             _p0: 0,
             _p1: 0,
@@ -471,10 +479,11 @@ impl CausalMhaForwardKernel {
         t: u32,
         n_head: u32,
         d_head: u32,
+        window: u32,
     ) {
         let scale = (d_head as f32).sqrt().recip();
         let p = AttnParams {
-            t, d_head, n_head, _pad0: 0, scale, _p0: 0, _p1: 0, _p2: 0,
+            t, d_head, n_head, wnd: window, scale, _p0: 0, _p1: 0, _p2: 0,
         };
         pass.set_bind_group(0, bind, &[]);
         pass.set_push_constants(0, bytemuck::bytes_of(&p));
@@ -599,7 +608,7 @@ impl CausalMhaBackwardKernel {
             t,
             d_head,
             n_head,
-            _pad0: 0,
+            wnd: 0,
             scale,
             _p0: 0,
             _p1: 0,
@@ -764,7 +773,7 @@ impl CausalMhaBackwardKernel {
     ) {
         let scale = (d_head as f32).sqrt().recip();
         let p = AttnParams {
-            t, d_head, n_head, _pad0: 0, scale, _p0: 0, _p1: 0, _p2: 0,
+            t, d_head, n_head, wnd: 0, scale, _p0: 0, _p1: 0, _p2: 0,
         };
         let pc = bytemuck::bytes_of(&p);
         {

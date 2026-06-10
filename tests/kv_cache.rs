@@ -48,6 +48,30 @@ fn kv_cache_generate_step_matches_full_forward_tier1() {
     });
 }
 
+#[test]
+fn kv_cache_generate_step_matches_full_forward_tier3() {
+    kv_cache_parity_cfg(TransformerConfig {
+        vocab: 32,
+        d_model: 32,
+        n_layer: 3,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 32,
+        rope: true,
+        rmsnorm: true,
+        relu2: true,
+        qk_norm: true,
+        untied_head: true,
+        softcap: 5.0,
+        value_resid: true,
+        tie_layers: true,
+        local_window: 4,
+        global_layers: 1,
+        ngram_rows: 64,
+        ..TransformerConfig::default()
+    });
+}
+
 fn kv_cache_parity_for(rope: bool) {
     kv_cache_parity_cfg(TransformerConfig {
         vocab: 32,
@@ -65,10 +89,23 @@ fn kv_cache_parity_cfg(cfg: TransformerConfig) {
     use rand::Rng;
     let mut rng = StdRng::seed_from_u64(0xCACE);
     let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
-    // Production zero-inits the untied head; randomize so logits differ.
+    // Production zero-inits the untied head / n-gram table / w_o and
+    // defaults λ to [1, 0]; randomize them all so every inference branch
+    // produces nontrivial values.
     if let Some(h) = model.w_head.as_mut() {
         for v in h.iter_mut() {
             *v = rng.random::<f32>() * 2.0 - 1.0;
+        }
+    }
+    for v in model.embed.w_ngram.iter_mut() {
+        *v = rng.random::<f32>() * 0.2 - 0.1;
+    }
+    for blk in model.blocks.iter_mut() {
+        for v in blk.mha.w_o.w.iter_mut() {
+            *v = rng.random::<f32>() * 0.2 - 0.1;
+        }
+        if cfg.value_resid {
+            blk.mha.lambda_v = [0.8, 0.5];
         }
     }
     let model = model;

@@ -6,28 +6,36 @@
     clippy::too_many_lines
 )]
 
-//! AURORA05 checkpoint format for the decoder-only transformer.
+//! AURORA06 checkpoint format for the decoder-only transformer.
 //!
 //! Binary layout (little-endian):
 //! ```text
-//! magic       : [u8; 8] = b"AURORA05"
-//! vocab       : u32
-//! d_model     : u32
-//! n_layer     : u32
-//! n_head      : u32
-//! d_ff        : u32
-//! seq_len_max : u32
-//! flags       : u32   (bit 0 = rope; bit 1 = rmsnorm; bit 2 = relu2;
-//!                      bit 3 = qk_norm; bit 4 = untied_head.
-//!                      w_pos and LN β are stored either way)
-//! softcap     : f32   (0.0 = off)
-//! epoch       : u32
-//! step        : u64
+//! magic        : [u8; 8] = b"AURORA06"
+//! vocab        : u32
+//! d_model      : u32
+//! n_layer      : u32   (logical depth; tie_layers stores 1 block)
+//! n_head       : u32
+//! d_ff         : u32
+//! seq_len_max  : u32
+//! flags        : u32   (bit 0 = rope; bit 1 = rmsnorm; bit 2 = relu2;
+//!                       bit 3 = qk_norm; bit 4 = untied_head;
+//!                       bit 5 = value_resid; bit 6 = tie_layers.
+//!                       w_pos and LN β are stored either way)
+//! softcap      : f32   (0.0 = off)
+//! mtp_weight   : f32   (0.0 = off; > 0 ⇒ w_head2 tensor present)
+//! local_window : u32   (0 = full attention)
+//! global_layers: u32
+//! ngram_rows   : u32   (0 = off; > 0 ⇒ w_ngram tensor present)
+//! epoch        : u32
+//! step         : u64
 //!
 //! w_tok       : f32[vocab * d_model]
 //! w_pos       : f32[seq_len_max * d_model]
 //! w_head      : f32[vocab * d_model]   (only when untied_head)
-//! per block (× n_layer):
+//! w_head2     : f32[vocab * d_model]   (only when mtp_weight > 0)
+//! w_ngram     : f32[ngram_rows * d_model] (only when ngram_rows > 0)
+//! lambda_v    : f32[2 * blocks]        (only when value_resid)
+//! per block (× n_layer, or × 1 when tie_layers):
 //!   ln1_gamma : f32[d_model]
 //!   ln1_beta  : f32[d_model]
 //!   w_q       : f32[d_model * d_model]
@@ -54,13 +62,15 @@ use rand::SeedableRng;
 
 use crate::transformer::{DecoderTransformer, TransformerConfig};
 
-const MAGIC: &[u8; 8] = b"AURORA05";
+const MAGIC: &[u8; 8] = b"AURORA06";
 
 const FLAG_ROPE: u32 = 1;
 const FLAG_RMSNORM: u32 = 1 << 1;
 const FLAG_RELU2: u32 = 1 << 2;
 const FLAG_QK_NORM: u32 = 1 << 3;
 const FLAG_UNTIED_HEAD: u32 = 1 << 4;
+const FLAG_VALUE_RESID: u32 = 1 << 5;
+const FLAG_TIE_LAYERS: u32 = 1 << 6;
 
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
@@ -102,8 +112,18 @@ pub fn save<P: AsRef<Path>>(
     if model.config.untied_head {
         flags |= FLAG_UNTIED_HEAD;
     }
+    if model.config.value_resid {
+        flags |= FLAG_VALUE_RESID;
+    }
+    if model.config.tie_layers {
+        flags |= FLAG_TIE_LAYERS;
+    }
     write_u32(&mut w, flags)?;
     write_f32(&mut w, model.config.softcap)?;
+    write_f32(&mut w, model.config.mtp_weight)?;
+    write_u32(&mut w, model.config.local_window as u32)?;
+    write_u32(&mut w, model.config.global_layers as u32)?;
+    write_u32(&mut w, model.config.ngram_rows as u32)?;
     write_u32(&mut w, epoch)?;
     write_u64(&mut w, step)?;
 
@@ -111,6 +131,16 @@ pub fn save<P: AsRef<Path>>(
     write_f32_slice(&mut w, &model.embed.w_pos)?;
     if let Some(w_head) = model.w_head.as_ref() {
         write_f32_slice(&mut w, w_head)?;
+    }
+    if let Some(w_head2) = model.w_head2.as_ref() {
+        write_f32_slice(&mut w, w_head2)?;
+    }
+    if model.config.ngram_rows > 0 {
+        write_f32_slice(&mut w, &model.embed.w_ngram)?;
+    }
+    if model.config.value_resid {
+        let lambdas: Vec<f32> = model.blocks.iter().flat_map(|b| b.mha.lambda_v).collect();
+        write_f32_slice(&mut w, &lambdas)?;
     }
     for blk in &model.blocks {
         write_f32_slice(&mut w, &blk.ln1.gamma)?;
@@ -139,7 +169,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     if &magic != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bad checkpoint magic — expected AURORA05",
+            "bad checkpoint magic — expected AURORA06",
         ));
     }
     let vocab = read_u32(&mut r)? as usize;
@@ -150,6 +180,10 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     let seq_len_max = read_u32(&mut r)? as usize;
     let flags = read_u32(&mut r)?;
     let softcap = read_f32(&mut r)?;
+    let mtp_weight = read_f32(&mut r)?;
+    let local_window = read_u32(&mut r)? as usize;
+    let global_layers = read_u32(&mut r)? as usize;
+    let ngram_rows = read_u32(&mut r)? as usize;
     let epoch = read_u32(&mut r)?;
     let step = read_u64(&mut r)?;
 
@@ -167,6 +201,12 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
         untied_head: flags & FLAG_UNTIED_HEAD != 0,
         softcap,
         zero_ffn_proj: false,
+        mtp_weight,
+        value_resid: flags & FLAG_VALUE_RESID != 0,
+        tie_layers: flags & FLAG_TIE_LAYERS != 0,
+        local_window,
+        global_layers,
+        ngram_rows,
     };
 
     let mut rng = StdRng::seed_from_u64(0);
@@ -176,6 +216,18 @@ pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Checkpoint> {
     model.embed.w_pos = read_f32_vec(&mut r, seq_len_max * d_model)?;
     if cfg.untied_head {
         model.w_head = Some(read_f32_vec(&mut r, vocab * d_model)?);
+    }
+    if cfg.mtp_weight > 0.0 {
+        model.w_head2 = Some(read_f32_vec(&mut r, vocab * d_model)?);
+    }
+    if cfg.ngram_rows > 0 {
+        model.embed.w_ngram = read_f32_vec(&mut r, cfg.ngram_rows * d_model)?;
+    }
+    if cfg.value_resid {
+        let lam = read_f32_vec(&mut r, 2 * model.blocks.len())?;
+        for (bi, blk) in model.blocks.iter_mut().enumerate() {
+            blk.mha.lambda_v = [lam[2 * bi], lam[2 * bi + 1]];
+        }
     }
     for blk in &mut model.blocks {
         blk.ln1.gamma = read_f32_vec(&mut r, d_model)?;
