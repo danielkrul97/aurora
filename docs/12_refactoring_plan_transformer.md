@@ -742,9 +742,37 @@ exekuční strategie). `from_cpu_with_opts`; trainer flagy `--flash`
 T=200 (přes tile hranici), full-model flash/f16/combo parity, f16 GEMM
 unit test, cast roundtrip (≤1 ULP). Vše zelené na GTX 1650.
 
-**Pending:** perf bench (cool-GPU per thermo lesson) + T=1024 smoke —
-GPU drží iso-FLOP sweep; doměřit po jeho doběhnutí. Inference cesty
-(generate/prefill) zůstávají f32 cached-probs — dokumentovaný scope.
+**Bench výsledek (cool GPU, in-process, production-shape kroky
+batch+clip+muon, `gpu_opts_bench`):**
+
+| varianta | T=256 B=16 | T=1024 B=2 |
+|---|---|---|
+| base | 1161 ms/step (0.260 TFLOPS) | 1132 ms/step (0.137 TFLOPS) |
+| f16 | 1200 ms (−3 %) | 1125 ms (±0 %) |
+| flash | 1481 ms (−28 %) | 1780 ms (−57 %) |
+| flash+f16 | ≈flash | ≈flash |
+
+**Verdikt: obě páky na téhle škále NEPOMÁHAJÍ** (correctness ✓, perf ✗):
+
+1. **f16-weights ≈ neutrální** — GEMM není weight-bandwidth-bound
+   (thermo roofline lesson potvrzen i tady). Cesta k f16 zisku na
+   Turingu = f16 COMPUTE (vec2<f16> FMA inner loop, 2× ALU rate), ne
+   IO. Follow-up kandidát.
+2. **flash = čistá ztráta na T≤1024** — backward recompute zdvojuje
+   attention FLOPs a we're compute-bound, ne memory-bound. Hodnota
+   flash je až memory unlock na T≥2048 (probs 1.2 GB+) nebo větších
+   modelech.
+3. **Klíčový pozitivní nález: T=1024 běží UŽ DNES na cached-probs
+   cestě** (probs jen ~151 MB na nano) — 1810 tok/s. Dlouhý kontext
+   pro BPB experiment nepotřebuje flash; stačí `--seq-len 1024` na
+   stávajícím mainu. Domnělý OOM blocker z tabulky „Sprint 60+" na
+   nano škále neexistoval.
+4. MFU drop T=256→1024 (0.26→0.14) říká, že na dlouhém T dominuje
+   attention kernel — příští MFU lever je attention (register tiling,
+   méně globálních čtení), ne GEMM.
+
+Obojí zůstává za flagy (`--flash --f16`) pro budoucí škály; default
+off. Inference cesty (generate/prefill) zůstávají f32 cached-probs.
 
 ---
 

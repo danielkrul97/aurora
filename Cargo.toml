@@ -54,3 +54,7 @@ name = "aurora_train"
 [[example]]
 name = "gpu_perf_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "gpu_opts_bench"
+required-features = ["gpu"]
