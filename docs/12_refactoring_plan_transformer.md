@@ -681,6 +681,32 @@ vs pack `--gpu --tier1 --muon-wd 0.05`, plný enwik8, stejný seed a
 wall-clock budget. Pack se přijímá/odmítá jako celek; ablace jen pokud
 prohraje (noise floor ~0.035 BPB).
 
+### Výsledek overnight A/B (2026-06-10/11)
+
+Plný enwik8 (95 MB, 29.9M tokenů, BPE 4096 z 10MB prefixu), nano
+d384/L6, seq 256, batch 16, **2 epochy/arm**, warmup 1000, seed
+0xC0FFEE, sekvenčně na GTX 1650 (~4h12m/arm, wall-clock parita 0.3 %):
+
+| arm | val e0 | val e1 (final) | train e1 |
+|---|---|---|---|
+| baseline (rope + muon-wd 0.05) | 1.591 | **1.375** | 1.478 |
+| tier1 pack | 1.640 | **1.388** | 1.536 |
+
+**Závěry:**
+
+1. **Cíl BPB < 1.5 SPLNĚN** — baseline 1.375 po 2 epochách. Scale
+   (plný korpus) byl podle predikce dominantní páka (~−0.5 vs 10MB runy).
+   Rekord = 1.375.
+2. **Pack na 2-epochovém budgetu nevyhrál:** Δ = +0.013 proti baseline,
+   hluboko pod noise floorem ~0.035 ⇒ statistická remíza, žádný důkaz
+   zisku. Per protokol se pack nepřijímá; rekordní konfigurace zůstává
+   baseline.
+3. **Trajektorie packu je strmější** (e0→e1: −0.252 vs −0.216; zero-init
+   untied head + WSD stable fáze startují pomaleji, ale dohánějí).
+   Hypotéza: na 4+ epochách se pořadí otočí. Než ablace jednotlivých
+   členů (drahá, 6 nocí), správný další krok je **4-epochový re-run
+   obou arms** — levnější a testuje budget-limited vysvětlení přímo.
+
 ---
 
 ## Sprint 60+ — otevřená pole
