@@ -707,6 +707,38 @@ d384/L6, seq 256, batch 16, **2 epochy/arm**, warmup 1000, seed
    členů (drahá, 6 nocí), správný další krok je **4-epochový re-run
    obou arms** — levnější a testuje budget-limited vysvětlení přímo.
 
+### Dlouhokontextový experiment T=1024 (2026-06-11/12)
+
+Stejný protokol jako rekord, jediná změna kontext: **B=4 × T=1024 =
+4096 tok/krok** (= tokenový batch rekordu ⇒ identických 6569
+kroků/epochu, stejný schedule/warmup/seed/binárka). 2 epochy, 7.9 h
+(1.79× pomalejší na token), cached-probs attention (flash je na T≤1024
+pomalejší, viz Sprint 67). Trainer val: e0 1.561, e1 **1.337**.
+
+**Dekompozice evalem `eval_ckpt`** (harness reprodukuje rekord 1.3752):
+
+| eval okna | ctx1024 ckpt | baseline ckpt |
+|---|---|---|
+| 256 | 1.3733 | 1.3752 |
+| 512 | 1.3490 | — |
+| 1024 | **1.3374** | — (arena 256) |
+
+**Závěry:**
+
+1. **Nový rekord 1.337** — ale celý zisk je **deployment-time kontext**,
+   ne lepší natrénování: při identickém 256-okenním evalu jsou oba
+   modely statisticky shodné (Δ 0.002). Trénink na dlouhém kontextu
+   per-token kvalitu nezlepšil; **umožnil** ale dlouhý kontext při
+   inferenci, a ten je hodný −0.036 BPB (a škáluje: 256→512→1024 dává
+   −0.024 → −0.012, ještě nesaturováno).
+2. **Praktický důsledek: tier3 `--seq-curriculum` je přesně správný
+   nástroj** — trénovat převážně na T=256 (1.79× levnější token) a
+   prodloužit na 1024 jen ke konci; deployment zisk zůstane, trénovací
+   cena klesne téměř na úroveň T=256. Kandidát na příští overnight.
+3. Wall-clock srovnání zůstává otevřené: 2 ep × T=1024 (7.9 h) vs
+   4-epochový baseline (≈8.4 h) nikdo neměřil — spojit s plánovaným
+   4-epochovým re-runem.
+
 ---
 
 ## Sprint 60+ — otevřená pole
