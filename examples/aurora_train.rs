@@ -90,6 +90,9 @@ struct Cli {
     zero_ffn_proj: bool,
     lr_schedule: LrSchedule,
     decay_frac: f32,
+    /// Hard cap on global optimizer steps (0 = epochs decide). For
+    /// token-budgeted runs (iso-FLOP sweeps): tokens = max_steps · B · T.
+    max_steps: usize,
 }
 
 impl Cli {
@@ -129,6 +132,7 @@ impl Cli {
         let mut lr_schedule: Option<LrSchedule> = None;
         let mut decay_frac: f32 = 0.4;
         let mut tier1: bool = false;
+        let mut max_steps: usize = 0;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -285,6 +289,10 @@ impl Cli {
                     decay_frac = val(i, arg)?.parse().map_err(|e| format!("--decay-frac: {e}"))?;
                     i += 2;
                 }
+                "--max-steps" => {
+                    max_steps = val(i, arg)?.parse().map_err(|e| format!("--max-steps: {e}"))?;
+                    i += 2;
+                }
                 // Tier-1 modernization pack: rope + rmsnorm + relu2 +
                 // qk-norm + untied head + softcap 30 + zero ffn proj + WSD.
                 "--tier1" => {
@@ -358,6 +366,7 @@ impl Cli {
             zero_ffn_proj,
             lr_schedule,
             decay_frac,
+            max_steps,
         })
     }
 }
@@ -659,7 +668,10 @@ fn run_training_loop(mut ctx: TrainCtx) {
     let n_chunks_per_stream = stream_len.saturating_sub(1) / max_chunk_advance;
     let total_steps_planned =
         (ctx.cli.epochs - ctx.start_epoch as usize) * n_chunks_per_stream;
-    let total_steps_for_lr = (ctx.cli.epochs * n_chunks_per_stream).max(1);
+    let mut total_steps_for_lr = (ctx.cli.epochs * n_chunks_per_stream).max(1);
+    if ctx.cli.max_steps > 0 {
+        total_steps_for_lr = total_steps_for_lr.min(ctx.cli.max_steps);
+    }
 
     if let Some(m) = metrics.as_mut() {
         m.run_meta(
@@ -705,6 +717,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
         ctx.cli.muon_lr * 0.1
     };
 
+    let mut capped = false;
     for epoch in ctx.start_epoch..ctx.cli.epochs as u32 {
         let epoch_start = Instant::now();
         println!("\n── epoch {epoch} ───────────────────────────────");
@@ -927,6 +940,11 @@ fn run_training_loop(mut ctx: TrainCtx) {
                     m.step(epoch, ctx.step, avg_loss, bpb, lr_t, grad_norm, elapsed);
                 }
             }
+
+            if ctx.cli.max_steps > 0 && ctx.step as usize >= ctx.cli.max_steps {
+                capped = true;
+                break;
+            }
         }
 
         // If GPU backend is active, snapshot weights back to CPU model
@@ -983,6 +1001,11 @@ fn run_training_loop(mut ctx: TrainCtx) {
             String::from_utf8_lossy(&seed_text),
             String::from_utf8_lossy(&sample_text)
         );
+
+        if capped {
+            println!("  max-steps {} reached — stopping", ctx.cli.max_steps);
+            break;
+        }
     }
 
     let total_elapsed = total_start.elapsed().as_secs_f64();
@@ -1368,7 +1391,7 @@ impl MetricsWriter {
         params: usize,
     ) {
         let line = format!(
-            "{{\"event\":\"run\",\"corpus\":\"{}\",\"corpus_bytes\":{corpus_bytes},\"tokens\":{n_tokens},\"vocab\":{actual_vocab},\"d_model\":{},\"n_layer\":{},\"n_head\":{},\"d_ff\":{},\"seq_len\":{},\"batch_size\":{},\"epochs\":{},\"start_epoch\":{start_epoch},\"lr\":{:.6e},\"min_lr\":{:.6e},\"warmup_steps\":{},\"weight_decay\":{},\"grad_clip\":{},\"seed\":{},\"backend\":\"{backend}\",\"params\":{params},\"optimizer\":\"muon\",\"muon_lr\":{:.6e},\"muon_momentum\":{},\"muon_wd\":{},\"rope\":{},\"rmsnorm\":{},\"relu2\":{},\"qk_norm\":{},\"untied_head\":{},\"softcap\":{},\"zero_ffn_proj\":{},\"lr_schedule\":\"{}\",\"decay_frac\":{}}}\n",
+            "{{\"event\":\"run\",\"corpus\":\"{}\",\"corpus_bytes\":{corpus_bytes},\"tokens\":{n_tokens},\"vocab\":{actual_vocab},\"d_model\":{},\"n_layer\":{},\"n_head\":{},\"d_ff\":{},\"seq_len\":{},\"batch_size\":{},\"epochs\":{},\"start_epoch\":{start_epoch},\"lr\":{:.6e},\"min_lr\":{:.6e},\"warmup_steps\":{},\"weight_decay\":{},\"grad_clip\":{},\"seed\":{},\"backend\":\"{backend}\",\"params\":{params},\"optimizer\":\"muon\",\"muon_lr\":{:.6e},\"muon_momentum\":{},\"muon_wd\":{},\"rope\":{},\"rmsnorm\":{},\"relu2\":{},\"qk_norm\":{},\"untied_head\":{},\"softcap\":{},\"zero_ffn_proj\":{},\"lr_schedule\":\"{}\",\"decay_frac\":{},\"max_steps\":{}}}\n",
             cli.corpus.display(),
             cli.d_model, cli.n_layer, cli.n_head, cli.d_ff, cli.seq_len,
             cli.batch_size, cli.epochs, cli.lr, cli.min_lr, cli.warmup_steps,
@@ -1381,6 +1404,7 @@ impl MetricsWriter {
                 LrSchedule::Wsd => "wsd",
             },
             cli.decay_frac,
+            cli.max_steps,
         );
         let _ = self.inner.write_all(line.as_bytes());
         self.flush();
