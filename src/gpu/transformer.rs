@@ -13,6 +13,7 @@
 
 use super::buffers::GpuBuffer;
 use super::kv_cache::{KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
+use super::{CastF16Kernel, FlashAttnBackwardKernel, FlashAttnForwardKernel};
 use super::{
     AdamWKernel, CausalMhaBackwardKernel, CausalMhaForwardKernel, EmbedScatterAddKernel,
     EmbedScatterReduceKernel, GeluBackwardKernel, GeluKernel, GemmKernel, GemmTransposeBKernel,
@@ -28,9 +29,21 @@ use crate::transformer::{DecoderTransformer, TransformerConfig};
 
 const GN_GROUPS_PER_TENSOR: u32 = 8;
 
+/// Backend execution options — numerics-equivalent strategies, not
+/// architecture (deliberately NOT in TransformerConfig / checkpoints).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuOpts {
+    /// Flash-style attention: no O(T²) probs buffers, backward
+    /// recomputes probabilities from per-row stats. Unlocks long T.
+    pub flash: bool,
+    /// Half-precision shadow weights for the GEMM hot path.
+    pub f16_weights: bool,
+}
+
 pub struct DecoderTransformerGpu {
     pub ctx: GpuContext,
     pub config: TransformerConfig,
+    pub opts: GpuOpts,
     pub step: u64,
     /// Capacity of the shared B·T token/target/loss buffers — the max
     /// number of sequences `train_step_batch` / `eval_step_batch` can
@@ -71,6 +84,17 @@ pub struct DecoderTransformerGpu {
     pub qknorm_bwd: QkNormBackwardKernel,
     pub softcap_fwd: SoftcapKernel,
     pub softcap_bwd: SoftcapBackwardKernel,
+    pub flash_fwd: FlashAttnForwardKernel,
+    pub flash_bwd: FlashAttnBackwardKernel,
+    /// f16-weight GEMM variants + the f32→f16 shadow refresh (None when
+    /// the f16 path is off or unsupported).
+    pub gemm_f16b: Option<GemmKernel>,
+    pub gemm_t_f16b: Option<GemmTransposeBKernel>,
+    pub cast_f16: Option<CastF16Kernel>,
+
+    // f16 shadow refresh: (bind, n) per shadowed matrix, encoded after
+    // every optimizer step.
+    pub(crate) cast_ops: Vec<(wgpu::BindGroup, u32)>,
 
     // Pure-GPU clip_grads scratch:
     //   gn_partials_flat — concatenated per-tensor partial sums of squares
@@ -137,6 +161,8 @@ pub(crate) struct LayerForwardOps {
     pub rope_q: wgpu::BindGroup,
     pub rope_k: wgpu::BindGroup,
     pub mha: wgpu::BindGroup,
+    /// Flash forward bind (None on the cached-probs path).
+    pub flash: Option<wgpu::BindGroup>,
     pub gemm_o: wgpu::BindGroup,
     pub vadd_post_attn: wgpu::BindGroup,
     pub ln2: wgpu::BindGroup,
@@ -179,6 +205,10 @@ pub(crate) struct LayerBackwardOps {
     pub mha_bwd_dscores: wgpu::BindGroup,
     pub mha_bwd_dq: wgpu::BindGroup,
     pub mha_bwd_dkv: wgpu::BindGroup,
+    /// Flash backward binds (None on the cached-probs path).
+    pub flash_dpre: Option<wgpu::BindGroup>,
+    pub flash_dq: Option<wgpu::BindGroup>,
+    pub flash_dkv: Option<wgpu::BindGroup>,
     /// In-place qk-norm backward on dq/dk against this layer's cached
     /// q_raw/k_raw (None when qk_norm off).
     pub qknorm_dq: Option<wgpu::BindGroup>,
@@ -224,6 +254,9 @@ pub(crate) struct LayerCache {
     /// when qk_norm is off).
     pub q_raw: GpuBuffer,
     pub k_raw: GpuBuffer,
+    /// Flash attention per-row softmax stats (m, l) — `[n_head·T·2]`
+    /// (1-element dummy on the cached-probs path).
+    pub ml: GpuBuffer,
     pub heads_out: GpuBuffer,
     pub head_probs: GpuBuffer,
     pub ln2_out: GpuBuffer,
@@ -273,6 +306,8 @@ pub(crate) struct Activations {
     pub dk: GpuBuffer,
     pub dv: GpuBuffer,
     pub d_scores_scratch: GpuBuffer,
+    /// Flash backward D_i row-dots scratch `[n_head·T]` (dummy when off).
+    pub d_row_scratch: GpuBuffer,
     pub dx_q: GpuBuffer,
     pub dx_k: GpuBuffer,
     pub dx_v: GpuBuffer,
@@ -284,7 +319,7 @@ pub(crate) struct Activations {
 }
 
 impl Activations {
-    fn new(ctx: &GpuContext, cfg: &TransformerConfig, max_batch: usize) -> Self {
+    fn new(ctx: &GpuContext, cfg: &TransformerConfig, max_batch: usize, opts: GpuOpts) -> Self {
         let t = cfg.seq_len_max;
         let d = cfg.d_model;
         let d_ff = cfg.d_ff;
@@ -292,7 +327,9 @@ impl Activations {
         let v = cfg.vocab;
         let td = t * d;
         let td_ff = t * d_ff;
-        let probs_cap = n_head * t * t;
+        // Flash attention never materializes the T² probs (or its
+        // d_scores mirror) — the whole point of the path.
+        let probs_cap = if opts.flash { 1 } else { n_head * t * t };
         // Token / target / per-token-loss buffers hold the whole batch
         // (B sequences laid out contiguously) so `train_step_batch` can
         // run all sequences in one submission with a single readback.
@@ -309,6 +346,7 @@ impl Activations {
                 v: GpuBuffer::empty(ctx, "v", td),
                 q_raw: GpuBuffer::empty(ctx, "q_raw", qk_raw_len),
                 k_raw: GpuBuffer::empty(ctx, "k_raw", qk_raw_len),
+                ml: GpuBuffer::empty(ctx, "ml", if opts.flash { n_head * t * 2 } else { 1 }),
                 heads_out: GpuBuffer::empty(ctx, "heads", td),
                 head_probs: GpuBuffer::empty(ctx, "probs", probs_cap),
                 ln2_out: GpuBuffer::empty(ctx, "ln2_out", td),
@@ -352,6 +390,11 @@ impl Activations {
             dk: GpuBuffer::empty(ctx, "dk", td),
             dv: GpuBuffer::empty(ctx, "dv", td),
             d_scores_scratch: GpuBuffer::empty(ctx, "d_scores", probs_cap),
+            d_row_scratch: GpuBuffer::empty(
+                ctx,
+                "d_row",
+                if opts.flash { n_head * t } else { 1 },
+            ),
             dx_q: GpuBuffer::empty(ctx, "dx_q", td),
             dx_k: GpuBuffer::empty(ctx, "dx_k", td),
             dx_v: GpuBuffer::empty(ctx, "dx_v", td),
@@ -372,6 +415,9 @@ pub struct GpuParams {
     pub blocks: Vec<GpuBlock>,
     pub final_gamma: GpuBuffer,
     pub final_beta: GpuBuffer,
+
+    /// f16 shadow of the LM-head weight (w_head when untied, else w_tok).
+    pub head16: Option<GpuBuffer>,
 
     pub g_w_tok: GpuBuffer,
     pub g_w_pos: GpuBuffer,
@@ -402,6 +448,14 @@ pub struct GpuBlock {
     pub ln2_beta: GpuBuffer,
     pub w_fc: GpuBuffer,
     pub w_proj: GpuBuffer,
+
+    /// f16 shadow copies of the six matrix params (None when off).
+    pub w_q16: Option<GpuBuffer>,
+    pub w_k16: Option<GpuBuffer>,
+    pub w_v16: Option<GpuBuffer>,
+    pub w_o16: Option<GpuBuffer>,
+    pub w_fc16: Option<GpuBuffer>,
+    pub w_proj16: Option<GpuBuffer>,
 
     pub g_ln1_gamma: GpuBuffer,
     pub g_ln1_beta: GpuBuffer,
@@ -501,7 +555,17 @@ fn build_forward_ops(
     rope: &RopeKernel,
     qknorm_fwd: &QkNormKernel,
     softcap_fwd: &SoftcapKernel,
+    flash_fwd: &FlashAttnForwardKernel,
+    gemm_t_f16: Option<&GemmTransposeBKernel>,
+    opts: GpuOpts,
 ) -> ForwardOps {
+    // Weight-B gemm bind: f16 shadow when the half path is on.
+    let wbind = |x: &GpuBuffer, w: &GpuBuffer, w16: &Option<GpuBuffer>, out: &GpuBuffer| {
+        match (w16, gemm_t_f16) {
+            (Some(s16), Some(kf)) => kf.build_bind(ctx, x, s16, out),
+            _ => gemm_t.build_bind(ctx, x, w, out),
+        }
+    };
     let embed = embed_fwd.build_bind(ctx, &a.tok_buf, &p.w_tok, &p.w_pos, &a.h0);
     let layers: Vec<LayerForwardOps> = (0..cfg.n_layer)
         .map(|li| {
@@ -520,9 +584,9 @@ fn build_forward_ops(
                     ctx, x, &blk.ln1_gamma, &blk.ln1_beta, &lc.ln1_out, &a.ln1_mean,
                     &lc.ln1_inv, &lc.ln1_xhat,
                 ),
-                gemm_q: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_q, q_dst),
-                gemm_k: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_k, k_dst),
-                gemm_v: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_v, &lc.v),
+                gemm_q: wbind(&lc.ln1_out, &blk.w_q, &blk.w_q16, q_dst),
+                gemm_k: wbind(&lc.ln1_out, &blk.w_k, &blk.w_k16, k_dst),
+                gemm_v: wbind(&lc.ln1_out, &blk.w_v, &blk.w_v16, &lc.v),
                 qknorm_q: cfg
                     .qk_norm
                     .then(|| qknorm_fwd.build_bind(ctx, &lc.q_raw, &lc.q)),
@@ -532,15 +596,18 @@ fn build_forward_ops(
                 rope_q: rope.build_bind(ctx, &lc.q),
                 rope_k: rope.build_bind(ctx, &lc.k),
                 mha: mha_fwd.build_bind(ctx, &lc.q, &lc.k, &lc.v, &lc.heads_out, &lc.head_probs),
-                gemm_o: gemm_t.build_bind(ctx, &lc.heads_out, &blk.w_o, &a.mha_out),
+                flash: opts.flash.then(|| {
+                    flash_fwd.build_bind(ctx, &lc.q, &lc.k, &lc.v, &lc.heads_out, &lc.ml)
+                }),
+                gemm_o: wbind(&lc.heads_out, &blk.w_o, &blk.w_o16, &a.mha_out),
                 vadd_post_attn: vadd.build_bind(ctx, x, &a.mha_out, &a.post_attn),
                 ln2: ln_fwd.build_bind(
                     ctx, &a.post_attn, &blk.ln2_gamma, &blk.ln2_beta, &lc.ln2_out, &a.ln2_mean,
                     &lc.ln2_inv, &lc.ln2_xhat,
                 ),
-                gemm_fc: gemm_t.build_bind(ctx, &lc.ln2_out, &blk.w_fc, &lc.h_pre),
+                gemm_fc: wbind(&lc.ln2_out, &blk.w_fc, &blk.w_fc16, &lc.h_pre),
                 gelu: gelu_fwd.build_bind(ctx, &lc.h_pre, &lc.h_post),
-                gemm_proj: gemm_t.build_bind(ctx, &lc.h_post, &blk.w_proj, &a.ffn_out),
+                gemm_proj: wbind(&lc.h_post, &blk.w_proj, &blk.w_proj16, &a.ffn_out),
                 vadd_z: vadd.build_bind(ctx, &a.post_attn, &a.ffn_out, &a.z_chain[li]),
             }
         })
@@ -550,7 +617,7 @@ fn build_forward_ops(
         &a.h_final, &a.f_mean, &a.f_inv, &a.f_xhat,
     );
     let head_w = p.w_head.as_ref().unwrap_or(&p.w_tok);
-    let final_gemm = gemm_t.build_bind(ctx, &a.h_final, head_w, &a.logits_buf);
+    let final_gemm = wbind(&a.h_final, head_w, &p.head16, &a.logits_buf);
     let softcap = (cfg.softcap > 0.0).then(|| softcap_fwd.build_bind(ctx, &a.logits_buf));
     ForwardOps { embed, layers, final_ln, final_gemm, softcap }
 }
@@ -573,10 +640,20 @@ fn build_backward_ops(
     rope: &RopeKernel,
     qknorm_bwd: &QkNormBackwardKernel,
     softcap_bwd: &SoftcapBackwardKernel,
+    flash_bwd: &FlashAttnBackwardKernel,
+    gemm_f16: Option<&GemmKernel>,
+    opts: GpuOpts,
 ) -> BackwardOps {
+    // Weight-B gemm bind (non-transposed): f16 shadow when on.
+    let wbind = |x: &GpuBuffer, w: &GpuBuffer, w16: &Option<GpuBuffer>, out: &GpuBuffer| {
+        match (w16, gemm_f16) {
+            (Some(s16), Some(kf)) => kf.build_bind(ctx, x, s16, out),
+            _ => gemm.build_bind(ctx, x, w, out),
+        }
+    };
     let head_w = p.w_head.as_ref().unwrap_or(&p.w_tok);
     let g_head = p.g_w_head.as_ref().unwrap_or(&p.g_w_tok);
-    let gemm_d_h_final = gemm.build_bind(ctx, &a.d_logits_buf, head_w, &a.d_h_final);
+    let gemm_d_h_final = wbind(&a.d_logits_buf, head_w, &p.head16, &a.d_h_final);
     let outer_g_w_tok = outer_accum.build_bind(ctx, &a.h_final, &a.d_logits_buf, g_head);
     let final_ln_bwd = ln_bwd.build_bind(
         ctx, &a.d_h_final, &p.final_gamma, &a.f_xhat, &a.f_inv,
@@ -592,17 +669,17 @@ fn build_backward_ops(
             // (which is li = n-1 since we iterate in reverse).
             let d_z = if li == n - 1 { &a.d_pre_final } else { &a.dx };
             LayerBackwardOps {
-                gemm_d_h_post: gemm.build_bind(ctx, d_z, &blk.w_proj, &a.d_h_post),
+                gemm_d_h_post: wbind(d_z, &blk.w_proj, &blk.w_proj16, &a.d_h_post),
                 outer_g_proj: outer_accum.build_bind(ctx, &lc.h_post, d_z, &blk.g_w_proj),
                 gelu_bwd: gelu_bwd.build_bind(ctx, &lc.h_pre, &a.d_h_post, &a.d_h_pre),
-                gemm_d_ln2: gemm.build_bind(ctx, &a.d_h_pre, &blk.w_fc, &a.d_ln2_out),
+                gemm_d_ln2: wbind(&a.d_h_pre, &blk.w_fc, &blk.w_fc16, &a.d_ln2_out),
                 outer_g_fc: outer_accum.build_bind(ctx, &lc.ln2_out, &a.d_h_pre, &blk.g_w_fc),
                 ln2_bwd: ln_bwd.build_bind(
                     ctx, &a.d_ln2_out, &blk.ln2_gamma, &lc.ln2_xhat, &lc.ln2_inv,
                     &a.d_post_attn_ffn, &blk.g_ln2_gamma, &blk.g_ln2_beta,
                 ),
                 vadd_d_post_attn: vadd.build_bind(ctx, d_z, &a.d_post_attn_ffn, &a.d_post_attn),
-                gemm_d_heads_out: gemm.build_bind(ctx, &a.d_post_attn, &blk.w_o, &a.d_heads_out),
+                gemm_d_heads_out: wbind(&a.d_post_attn, &blk.w_o, &blk.w_o16, &a.d_heads_out),
                 outer_g_o: outer_accum.build_bind(ctx, &lc.heads_out, &a.d_post_attn, &blk.g_w_o),
                 zerob_dq: zerob.build_bind(ctx, &a.dq),
                 zerob_dk: zerob.build_bind(ctx, &a.dk),
@@ -615,15 +692,29 @@ fn build_backward_ops(
                     ctx, &lc.q, &lc.head_probs, &a.d_heads_out, &a.d_scores_scratch,
                     &a.dk, &a.dv,
                 ),
+                flash_dpre: opts.flash.then(|| {
+                    flash_bwd.build_bind_dpre(ctx, &a.d_heads_out, &lc.heads_out, &a.d_row_scratch)
+                }),
+                flash_dq: opts.flash.then(|| {
+                    flash_bwd.build_bind_dq(
+                        ctx, &lc.q, &lc.k, &lc.v, &a.d_heads_out, &lc.ml, &a.d_row_scratch, &a.dq,
+                    )
+                }),
+                flash_dkv: opts.flash.then(|| {
+                    flash_bwd.build_bind_dkv(
+                        ctx, &lc.q, &lc.k, &lc.v, &a.d_heads_out, &lc.ml, &a.d_row_scratch,
+                        &a.dk, &a.dv,
+                    )
+                }),
                 qknorm_dq: cfg
                     .qk_norm
                     .then(|| qknorm_bwd.build_bind(ctx, &lc.q_raw, &a.dq)),
                 qknorm_dk: cfg
                     .qk_norm
                     .then(|| qknorm_bwd.build_bind(ctx, &lc.k_raw, &a.dk)),
-                gemm_dx_q: gemm.build_bind(ctx, &a.dq, &blk.w_q, &a.dx_q),
-                gemm_dx_k: gemm.build_bind(ctx, &a.dk, &blk.w_k, &a.dx_k),
-                gemm_dx_v: gemm.build_bind(ctx, &a.dv, &blk.w_v, &a.dx_v),
+                gemm_dx_q: wbind(&a.dq, &blk.w_q, &blk.w_q16, &a.dx_q),
+                gemm_dx_k: wbind(&a.dk, &blk.w_k, &blk.w_k16, &a.dx_k),
+                gemm_dx_v: wbind(&a.dv, &blk.w_v, &blk.w_v16, &a.dx_v),
                 vadd_qk: vadd.build_bind(ctx, &a.dx_q, &a.dx_k, &a.d_ln1_qk),
                 vadd_qkv: vadd.build_bind(ctx, &a.d_ln1_qk, &a.dx_v, &a.d_ln1_out),
                 outer_g_q: outer_accum.build_bind(ctx, &lc.ln1_out, &a.dq, &blk.g_w_q),
@@ -804,9 +895,14 @@ fn build_muon_ops(
     ops
 }
 
-fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) -> GpuBlock {
+fn upload_block(
+    ctx: &GpuContext,
+    cpu: &crate::transformer::TransformerBlock,
+    f16: bool,
+) -> GpuBlock {
     let d = cpu.d_model;
     let d_ff = cpu.ffn.d_ff;
+    let sh = |label: &str, n: usize| f16.then(|| GpuBuffer::empty_f16(ctx, label, n));
     let zeros_d = || GpuBuffer::zeros(ctx, "z", d);
     let zeros_dd = || GpuBuffer::zeros(ctx, "z", d * d);
     let zeros_dff = || GpuBuffer::zeros(ctx, "z", d * d_ff);
@@ -843,6 +939,12 @@ fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) ->
         w_proj: zeros_dff(),
     };
     GpuBlock {
+        w_q16: sh("wq16", d * d),
+        w_k16: sh("wk16", d * d),
+        w_v16: sh("wv16", d * d),
+        w_o16: sh("wo16", d * d),
+        w_fc16: sh("wfc16", d * d_ff),
+        w_proj16: sh("wp16", d * d_ff),
         ln1_gamma: GpuBuffer::from_slice(ctx, "ln1_g", &cpu.ln1.gamma),
         ln1_beta: GpuBuffer::from_slice(ctx, "ln1_b", &cpu.ln1.beta),
         w_q: GpuBuffer::from_slice(ctx, "wq", &cpu.mha.w_q.w),
@@ -873,6 +975,22 @@ impl DecoderTransformerGpu {
     /// Upload a CPU `DecoderTransformer` to the GPU. The two then run
     /// in parallel; `to_cpu()` snapshots the GPU back.
     pub fn from_cpu(cpu: &DecoderTransformer, ctx: GpuContext, max_batch: usize) -> Self {
+        Self::from_cpu_with_opts(cpu, ctx, max_batch, GpuOpts::default())
+    }
+
+    /// `from_cpu` with backend options (flash attention, f16 weights).
+    pub fn from_cpu_with_opts(
+        cpu: &DecoderTransformer,
+        ctx: GpuContext,
+        max_batch: usize,
+        opts: GpuOpts,
+    ) -> Self {
+        let mut opts = opts;
+        if opts.f16_weights && !ctx.shader_f16 {
+            eprintln!("⚠ SHADER_F16 not supported by this adapter; --f16 disabled");
+            opts.f16_weights = false;
+        }
+        let f16 = opts.f16_weights;
         let cfg = cpu.config.clone();
         let v = cfg.vocab;
         let d = cfg.d_model;
@@ -885,7 +1003,8 @@ impl DecoderTransformerGpu {
                 .w_head
                 .as_ref()
                 .map(|h| GpuBuffer::from_slice(&ctx, "w_head", h)),
-            blocks: cpu.blocks.iter().map(|b| upload_block(&ctx, b)).collect(),
+            head16: f16.then(|| GpuBuffer::empty_f16(&ctx, "head16", v * d)),
+            blocks: cpu.blocks.iter().map(|b| upload_block(&ctx, b, f16)).collect(),
             final_gamma: GpuBuffer::from_slice(&ctx, "f_g", &cpu.final_ln.gamma),
             final_beta: GpuBuffer::from_slice(&ctx, "f_b", &cpu.final_ln.beta),
 
@@ -955,6 +1074,11 @@ impl DecoderTransformerGpu {
         let qknorm_bwd = QkNormBackwardKernel::new(&ctx);
         let softcap_fwd = SoftcapKernel::new(&ctx);
         let softcap_bwd = SoftcapBackwardKernel::new(&ctx);
+        let flash_fwd = FlashAttnForwardKernel::new(&ctx);
+        let flash_bwd = FlashAttnBackwardKernel::new(&ctx);
+        let gemm_f16b = f16.then(|| GemmKernel::new_f16b(&ctx));
+        let gemm_t_f16b = f16.then(|| GemmTransposeBKernel::new_f16b(&ctx));
+        let cast_f16 = f16.then(|| CastF16Kernel::new(&ctx));
 
         let grad_ops =
             build_grad_ops(&ctx, &p, &cfg, &zerob, &adamw, &gn_sq, &scaleb_buf,
@@ -967,20 +1091,43 @@ impl DecoderTransformerGpu {
             &gemm, &gemm_t, &muon_combine_b, &muon_step_x,
         );
         let muon_ops = build_muon_ops(&ctx, &p, &cfg, &muon_momentum, &muon_apply, &muon_scratch);
-        let acts = Activations::new(&ctx, &cfg, max_batch);
+        let acts = Activations::new(&ctx, &cfg, max_batch, opts);
         let fwd_ops = build_forward_ops(
             &ctx, &p, &acts, &cfg,
             &embed_fwd, &ln_fwd, &gemm_t, &mha_fwd, &gelu_fwd, &vadd, &rope,
-            &qknorm_fwd, &softcap_fwd,
+            &qknorm_fwd, &softcap_fwd, &flash_fwd, gemm_t_f16b.as_ref(), opts,
         );
         let bwd_ops = build_backward_ops(
             &ctx, &p, &acts, &cfg,
             &gemm, &ln_bwd, &mha_bwd, &gelu_bwd, &vadd, &outer_accum,
             &embed_bwd, &embed_scatter_reduce, &zerob, &rope,
-            &qknorm_bwd, &softcap_bwd,
+            &qknorm_bwd, &softcap_bwd, &flash_bwd, gemm_f16b.as_ref(), opts,
         );
 
-        Self {
+        // f16 shadow refresh binds: one cast per shadowed matrix.
+        let mut cast_ops: Vec<(wgpu::BindGroup, u32)> = Vec::new();
+        if let Some(ck) = &cast_f16 {
+            for blk in &p.blocks {
+                for (w, s16) in [
+                    (&blk.w_q, &blk.w_q16),
+                    (&blk.w_k, &blk.w_k16),
+                    (&blk.w_v, &blk.w_v16),
+                    (&blk.w_o, &blk.w_o16),
+                    (&blk.w_fc, &blk.w_fc16),
+                    (&blk.w_proj, &blk.w_proj16),
+                ] {
+                    if let Some(s16) = s16 {
+                        cast_ops.push((ck.build_bind(&ctx, w, s16), w.len as u32));
+                    }
+                }
+            }
+            let head_w = p.w_head.as_ref().unwrap_or(&p.w_tok);
+            if let Some(h16) = &p.head16 {
+                cast_ops.push((ck.build_bind(&ctx, head_w, h16), head_w.len as u32));
+            }
+        }
+
+        let model = Self {
             gemm,
             gemm_t,
             gelu_fwd,
@@ -1014,10 +1161,17 @@ impl DecoderTransformerGpu {
             qknorm_bwd,
             softcap_fwd,
             softcap_bwd,
+            flash_fwd,
+            flash_bwd,
+            gemm_f16b,
+            gemm_t_f16b,
+            cast_f16,
+            cast_ops,
             gn_partials_flat,
             gn_result,
             ctx,
             config: cfg,
+            opts,
             step: cpu.step,
             max_batch: max_batch.max(1),
             p,
@@ -1030,6 +1184,45 @@ impl DecoderTransformerGpu {
             acts,
             fwd_ops,
             bwd_ops,
+        };
+        // Fill the f16 shadows from the freshly uploaded f32 weights.
+        if !model.cast_ops.is_empty() {
+            let mut enc = model.ctx.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("f16 shadow init") },
+            );
+            model.encode_shadow_refresh(&mut enc);
+            model.ctx.queue.submit(Some(enc.finish()));
+        }
+        model
+    }
+
+    /// Pipeline for weight-B gemms (`d = g @ W`): f16 variant when on.
+    fn gemm_w_pipeline(&self) -> &wgpu::ComputePipeline {
+        self.gemm_f16b.as_ref().map_or(&self.gemm.pipeline, |k| &k.pipeline)
+    }
+
+    /// Pipeline for weight-Bᵀ gemms (`y = x @ Wᵀ`): f16 variant when on.
+    fn gemm_t_w_pipeline(&self) -> &wgpu::ComputePipeline {
+        self.gemm_t_f16b
+            .as_ref()
+            .map_or_else(|| self.gemm_t.pipeline(), |k| k.pipeline())
+    }
+
+    /// Re-cast all f16 weight shadows from the f32 masters. Encoded
+    /// after every optimizer step (same encoder — hazard tracking orders
+    /// it after the weight updates).
+    fn encode_shadow_refresh(&self, enc: &mut wgpu::CommandEncoder) {
+        let Some(ck) = &self.cast_f16 else { return };
+        if self.cast_ops.is_empty() {
+            return;
+        }
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("f16 shadow refresh"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&ck.pipeline);
+        for (bind, n) in &self.cast_ops {
+            ck.dispatch_with_bind(&mut pass, bind, *n);
         }
     }
 
@@ -1208,7 +1401,7 @@ impl DecoderTransformerGpu {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("qkv"), timestamp_writes: None,
                 });
-                pass.set_pipeline(self.gemm_t.pipeline());
+                pass.set_pipeline(self.gemm_t_w_pipeline());
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_q, t_u, d_u, d_u);
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_k, t_u, d_u, d_u);
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_v, t_u, d_u, d_u);
@@ -1239,8 +1432,16 @@ impl DecoderTransformerGpu {
                     &mut pass, &fop.rope_k, t_u, n_head as u32, d_head as u32, 0, false,
                 );
             }
-            // mha
-            {
+            // mha — flash (no probs materialization) or cached-probs path.
+            if let Some(fl) = &fop.flash {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("flash mha"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.flash_fwd.pipeline);
+                self.flash_fwd.dispatch_with_bind(
+                    &mut pass, fl, t_u, n_head as u32, d_head as u32, 0,
+                );
+            } else {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("mha"), timestamp_writes: None,
                 });
@@ -1254,7 +1455,7 @@ impl DecoderTransformerGpu {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("wo"), timestamp_writes: None,
                 });
-                pass.set_pipeline(self.gemm_t.pipeline());
+                pass.set_pipeline(self.gemm_t_w_pipeline());
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_o, t_u, d_u, d_u);
             }
             // residual: post_attn = x + mha_out
@@ -1278,7 +1479,7 @@ impl DecoderTransformerGpu {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("fc"), timestamp_writes: None,
                 });
-                pass.set_pipeline(self.gemm_t.pipeline());
+                pass.set_pipeline(self.gemm_t_w_pipeline());
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_fc, t_u, d_ff_u, d_u);
             }
             {
@@ -1294,7 +1495,7 @@ impl DecoderTransformerGpu {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("proj"), timestamp_writes: None,
                 });
-                pass.set_pipeline(self.gemm_t.pipeline());
+                pass.set_pipeline(self.gemm_t_w_pipeline());
                 self.gemm_t.dispatch_with_bind(&mut pass, &fop.gemm_proj, t_u, d_u, d_ff_u);
             }
             // z = post_attn + ffn_out
@@ -1322,7 +1523,7 @@ impl DecoderTransformerGpu {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("lm head"), timestamp_writes: None,
             });
-            pass.set_pipeline(self.gemm_t.pipeline());
+            pass.set_pipeline(self.gemm_t_w_pipeline());
             self.gemm_t.dispatch_with_bind(&mut pass, &self.fwd_ops.final_gemm, t_u, v as u32, d_u);
         }
         // Logit softcap (in place on the logits buffer).
@@ -1480,7 +1681,7 @@ impl DecoderTransformerGpu {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("lm head bwd"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.gemm.pipeline);
+            pass.set_pipeline(self.gemm_w_pipeline());
             self.gemm.dispatch_with_bind(
                 &mut pass, &self.bwd_ops.gemm_d_h_final, t_u, d_u, v as u32,
             );
@@ -1659,7 +1860,7 @@ impl DecoderTransformerGpu {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("bwd ffn proj"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.gemm.pipeline);
+            pass.set_pipeline(self.gemm_w_pipeline());
             self.gemm.dispatch_with_bind(&mut pass, &bop.gemm_d_h_post, t_u, d_ff_u, d_u);
             pass.set_pipeline(&self.outer_accum.pipeline);
             self.outer_accum.dispatch_with_bind(&mut pass, &bop.outer_g_proj, d_u, d_ff_u, t_u);
@@ -1675,7 +1876,7 @@ impl DecoderTransformerGpu {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("bwd fc"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.gemm.pipeline);
+            pass.set_pipeline(self.gemm_w_pipeline());
             self.gemm.dispatch_with_bind(&mut pass, &bop.gemm_d_ln2, t_u, d_u, d_ff_u);
             pass.set_pipeline(&self.outer_accum.pipeline);
             self.outer_accum.dispatch_with_bind(&mut pass, &bop.outer_g_fc, d_ff_u, d_u, t_u);
@@ -1698,27 +1899,36 @@ impl DecoderTransformerGpu {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("bwd o"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.gemm.pipeline);
+            pass.set_pipeline(self.gemm_w_pipeline());
             self.gemm.dispatch_with_bind(&mut pass, &bop.gemm_d_heads_out, t_u, d_u, d_u);
             pass.set_pipeline(&self.outer_accum.pipeline);
             self.outer_accum.dispatch_with_bind(&mut pass, &bop.outer_g_o, d_u, d_u, t_u);
         }
 
-        // Zero dq/dk/dv in one pass (disjoint outputs, no dep).
+        // mha bwd: flash recompute path writes dq/dk/dv directly (no
+        // zeroing needed); the cached-probs path accumulates and needs
+        // the zero pass first.
+        if let (Some(dpre), Some(dq), Some(dkv)) =
+            (&bop.flash_dpre, &bop.flash_dq, &bop.flash_dkv)
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("zero dqkv"), timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.zerob.pipeline);
-            self.zerob.dispatch_with_bind(&mut pass, &bop.zerob_dq, td);
-            self.zerob.dispatch_with_bind(&mut pass, &bop.zerob_dk, td);
-            self.zerob.dispatch_with_bind(&mut pass, &bop.zerob_dv, td);
+            self.flash_bwd.dispatch_with_binds(
+                enc, dpre, dq, dkv, t_u, n_head as u32, d_head as u32, 0,
+            );
+        } else {
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("zero dqkv"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.zerob.pipeline);
+                self.zerob.dispatch_with_bind(&mut pass, &bop.zerob_dq, td);
+                self.zerob.dispatch_with_bind(&mut pass, &bop.zerob_dk, td);
+                self.zerob.dispatch_with_bind(&mut pass, &bop.zerob_dv, td);
+            }
+            self.mha_bwd.dispatch_with_binds(
+                enc, &bop.mha_bwd_dscores, &bop.mha_bwd_dq, &bop.mha_bwd_dkv,
+                t_u, n_head as u32, d_head as u32,
+            );
         }
-        // mha bwd (3 internal sequential passes due to d_scores dep).
-        self.mha_bwd.dispatch_with_binds(
-            enc, &bop.mha_bwd_dscores, &bop.mha_bwd_dq, &bop.mha_bwd_dkv,
-            t_u, n_head as u32, d_head as u32,
-        );
 
         // dq/dk are gradients w.r.t. the rotated q/k — apply the inverse
         // rotation before they feed the projection backward below.
@@ -1755,7 +1965,7 @@ impl DecoderTransformerGpu {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("bwd dx qkv"), timestamp_writes: None,
             });
-            pass.set_pipeline(&self.gemm.pipeline);
+            pass.set_pipeline(self.gemm_w_pipeline());
             self.gemm.dispatch_with_bind(&mut pass, &bop.gemm_dx_q, t_u, d_u, d_u);
             self.gemm.dispatch_with_bind(&mut pass, &bop.gemm_dx_k, t_u, d_u, d_u);
             self.gemm.dispatch_with_bind(&mut pass, &bop.gemm_dx_v, t_u, d_u, d_u);
@@ -1838,6 +2048,7 @@ impl DecoderTransformerGpu {
                 );
             }
         }
+        self.encode_shadow_refresh(&mut enc);
         self.ctx.queue.submit(Some(enc.finish()));
     }
 
@@ -2074,6 +2285,7 @@ impl DecoderTransformerGpu {
             }
         }
 
+        self.encode_shadow_refresh(&mut enc);
         self.ctx.queue.submit(Some(enc.finish()));
     }
 

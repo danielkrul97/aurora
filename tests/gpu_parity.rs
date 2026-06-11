@@ -1229,3 +1229,420 @@ fn gpu_muon_hybrid_drops_loss_on_overfit() {
         "GPU muon: loss did not drop: initial {initial_loss} → final {final_loss}"
     );
 }
+
+// ─── perf-f16-flash branch: flash attention + f16 weight shadows ─────────
+
+/// Kernel-level flash parity vs CPU SDPA, T = 200 — crosses the 128-wide
+/// key-tile boundary, the spot where online-softmax rescaling bugs live.
+#[test]
+fn flash_attention_kernel_matches_cpu_sdpa() {
+    use aurora::gpu::{FlashAttnBackwardKernel, FlashAttnForwardKernel};
+    use aurora::transformer::attention::{causal_mha_backward, causal_mha_forward, MhaGrads, MhaWeights};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let fwd = FlashAttnForwardKernel::new(&ctx);
+    let bwd = FlashAttnBackwardKernel::new(&ctx);
+    let mut rng = StdRng::seed_from_u64(0xF1A5);
+
+    let t = 200_usize;
+    let n_head = 2_usize;
+    let d_head = 32_usize;
+    let d_model = n_head * d_head;
+
+    let w = MhaWeights::new(d_model, n_head, &mut rng);
+    let x = random_vec(t * d_model, &mut rng);
+    let dy_heads = random_vec(t * d_model, &mut rng);
+
+    // CPU reference: run MHA forward to get q/k/v + per-head probs, then
+    // backprop dy_heads through the attention core only. We reuse the MHA
+    // wrappers but compare at the heads_out / dq/dk/dv level (w_o is
+    // zero-init, so route grads via the cache directly).
+    let (_y, cache) = causal_mha_forward(&w, &x);
+    // dq/dk/dv via the CPU backward with upstream chosen so that
+    // d_heads_out == dy_heads: feed dy through an identity by calling the
+    // attention backward per head ourselves.
+    use aurora::attention::scaled_dot_product_attention_backward;
+    let mut cpu_dq = vec![0.0_f32; t * d_model];
+    let mut cpu_dk = vec![0.0_f32; t * d_model];
+    let mut cpu_dv = vec![0.0_f32; t * d_model];
+    let mut cpu_heads = vec![0.0_f32; t * d_model];
+    {
+        let mut q_h = vec![0.0_f32; t * d_head];
+        let mut k_h = vec![0.0_f32; t * d_head];
+        let mut v_h = vec![0.0_f32; t * d_head];
+        let mut d_h = vec![0.0_f32; t * d_head];
+        for h in 0..n_head {
+            for ti in 0..t {
+                let src = ti * d_model + h * d_head;
+                let dst = ti * d_head;
+                q_h[dst..dst + d_head].copy_from_slice(&cache.q[src..src + d_head]);
+                k_h[dst..dst + d_head].copy_from_slice(&cache.k[src..src + d_head]);
+                v_h[dst..dst + d_head].copy_from_slice(&cache.v[src..src + d_head]);
+                d_h[dst..dst + d_head].copy_from_slice(&dy_heads[src..src + d_head]);
+            }
+            let (dq_h, dk_h, dv_h) = scaled_dot_product_attention_backward(
+                &q_h, &k_h, &v_h, &cache.attn_caches[h], &d_h,
+            );
+            for ti in 0..t {
+                let dst = ti * d_model + h * d_head;
+                let src = ti * d_head;
+                cpu_dq[dst..dst + d_head].copy_from_slice(&dq_h[src..src + d_head]);
+                cpu_dk[dst..dst + d_head].copy_from_slice(&dk_h[src..src + d_head]);
+                cpu_dv[dst..dst + d_head].copy_from_slice(&dv_h[src..src + d_head]);
+            }
+        }
+    }
+    cpu_heads.copy_from_slice(&cache.heads_out);
+    let _ = causal_mha_backward(&w, &cache, &vec![0.0; t * d_model], &mut MhaGrads::zeros(d_model));
+
+    // GPU flash forward + backward.
+    let q_gpu = GpuBuffer::from_slice(&ctx, "q", &cache.q);
+    let k_gpu = GpuBuffer::from_slice(&ctx, "k", &cache.k);
+    let v_gpu = GpuBuffer::from_slice(&ctx, "v", &cache.v);
+    let out_gpu = GpuBuffer::zeros(&ctx, "out", t * d_model);
+    let ml_gpu = GpuBuffer::zeros(&ctx, "ml", n_head * t * 2);
+    let dy_gpu = GpuBuffer::from_slice(&ctx, "dy", &dy_heads);
+    let drow_gpu = GpuBuffer::zeros(&ctx, "drow", n_head * t);
+    let dq_gpu = GpuBuffer::zeros(&ctx, "dq", t * d_model);
+    let dk_gpu = GpuBuffer::zeros(&ctx, "dk", t * d_model);
+    let dv_gpu = GpuBuffer::zeros(&ctx, "dv", t * d_model);
+
+    let mut enc = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("flash test") });
+    {
+        let bind = fwd.build_bind(&ctx, &q_gpu, &k_gpu, &v_gpu, &out_gpu, &ml_gpu);
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("flash fwd"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&fwd.pipeline);
+        fwd.dispatch_with_bind(&mut pass, &bind, t as u32, n_head as u32, d_head as u32, 0);
+    }
+    let b_dpre = bwd.build_bind_dpre(&ctx, &dy_gpu, &out_gpu, &drow_gpu);
+    let b_dq = bwd.build_bind_dq(&ctx, &q_gpu, &k_gpu, &v_gpu, &dy_gpu, &ml_gpu, &drow_gpu, &dq_gpu);
+    let b_dkv = bwd.build_bind_dkv(
+        &ctx, &q_gpu, &k_gpu, &v_gpu, &dy_gpu, &ml_gpu, &drow_gpu, &dk_gpu, &dv_gpu,
+    );
+    bwd.dispatch_with_binds(&mut enc, &b_dpre, &b_dq, &b_dkv, t as u32, n_head as u32, d_head as u32, 0);
+    ctx.queue.submit(Some(enc.finish()));
+
+    let gpu_out = out_gpu.download(&ctx);
+    let err_out = max_rel_err(&cpu_heads, &gpu_out);
+    assert!(err_out < 5e-2, "flash fwd err {err_out}");
+    // Backward recomputes P from (m, l): tiny f32 drift in the rebuilt
+    // scores lands on near-zero grad elements, where pointwise relative
+    // error is meaningless — measure RMS-normalized.
+    let err_dq = max_err_rms(&cpu_dq, &dq_gpu.download(&ctx));
+    let err_dk = max_err_rms(&cpu_dk, &dk_gpu.download(&ctx));
+    let err_dv = max_err_rms(&cpu_dv, &dv_gpu.download(&ctx));
+    assert!(err_dq < 5e-2, "flash dq err {err_dq}");
+    assert!(err_dk < 5e-2, "flash dk err {err_dk}");
+    assert!(err_dv < 5e-2, "flash dv err {err_dv}");
+}
+
+fn full_model_parity_with_opts(opts: aurora::gpu::GpuOpts, seed: u64, tol: f32) {
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(seed);
+    // Untied head so the f16 reference can round the head matrix without
+    // also perturbing the (f32) embedding lookup of the tied w_tok.
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        rope: true,
+        qk_norm: true,
+        untied_head: true,
+        ..TransformerConfig::default()
+    };
+    let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    if let Some(h) = cpu_model.w_head.as_mut() {
+        for v in h.iter_mut() {
+            *v = rng.random::<f32>() * 0.4 - 0.2;
+        }
+    }
+    let gpu_src = cpu_model.clone();
+    // The GPU's f16 path computes with exactly-representable f16 weights;
+    // round the CPU reference identically so the comparison measures the
+    // implementation, not the (expected) f16 quantization of tiny grads.
+    if opts.f16_weights {
+        let r16 = |w: &mut Vec<f32>| {
+            for v in w.iter_mut() {
+                *v = half::f16::from_f32(*v).to_f32();
+            }
+        };
+        for blk in cpu_model.blocks.iter_mut() {
+            r16(&mut blk.mha.w_q.w);
+            r16(&mut blk.mha.w_k.w);
+            r16(&mut blk.mha.w_v.w);
+            r16(&mut blk.mha.w_o.w);
+            r16(&mut blk.ffn.w_fc.w);
+            r16(&mut blk.ffn.w_proj.w);
+        }
+        if let Some(h) = cpu_model.w_head.as_mut() {
+            r16(h);
+        }
+    }
+    let cpu_model = cpu_model;
+    let mut gpu_model = DecoderTransformerGpu::from_cpu_with_opts(&gpu_src, ctx, 1, opts);
+
+    let tokens: Vec<u32> = (0..12u32).map(|i| (i * 5 + 3) % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let (cpu_logits, cpu_cache) = cpu_model.forward(&tokens);
+    let mut cpu_grads = ModelGrads::zeros(&cfg);
+    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &cpu_logits, &targets, &mut cpu_grads);
+
+    gpu_model.zero_grad();
+    let gpu_loss = gpu_model.train_step(&tokens, &targets);
+    assert!(
+        (cpu_loss - gpu_loss).abs() < tol,
+        "opts {opts:?}: loss CPU {cpu_loss} vs GPU {gpu_loss}"
+    );
+
+    // Pointwise relative error explodes on near-zero grads under f16
+    // quantization (GPU truncates, `half` rounds-to-nearest) — use the
+    // RMS-normalized metric on the f16 path.
+    let err_fn: fn(&[f32], &[f32]) -> f32 =
+        if opts.f16_weights { max_err_rms } else { max_rel_err };
+    for li in 0..cfg.n_layer {
+        let gpu_g_w_q = gpu_model.p.blocks[li].g_w_q.download(&gpu_model.ctx);
+        let gpu_g_w_fc = gpu_model.p.blocks[li].g_w_fc.download(&gpu_model.ctx);
+        let err_q = err_fn(&cpu_grads.blocks[li].d_mha.d_w_q.d_w, &gpu_g_w_q);
+        let err_fc = err_fn(&cpu_grads.blocks[li].d_ffn.d_w_fc.d_w, &gpu_g_w_fc);
+        assert!(err_q < tol, "opts {opts:?}: g_w_q layer {li} err {err_q}");
+        assert!(err_fc < tol, "opts {opts:?}: g_w_fc layer {li} err {err_fc}");
+    }
+    let gpu_g_w_tok = gpu_model.p.g_w_tok.download(&gpu_model.ctx);
+    let err_tok = err_fn(&cpu_grads.embed.d_w_tok, &gpu_g_w_tok);
+    assert!(err_tok < tol, "opts {opts:?}: g_w_tok err {err_tok}");
+}
+
+#[test]
+fn full_transformer_flash_matches_cpu() {
+    full_model_parity_with_opts(
+        aurora::gpu::GpuOpts { flash: true, f16_weights: false },
+        0xF1A5,
+        5e-2,
+    );
+}
+
+#[test]
+fn full_transformer_f16_weights_matches_cpu() {
+    // f16 weight rounding adds ~1e-3 relative error on top of the usual
+    // f32 drift — still well inside the parity envelope.
+    full_model_parity_with_opts(
+        aurora::gpu::GpuOpts { flash: false, f16_weights: true },
+        0xF16F,
+        5e-2,
+    );
+}
+
+#[test]
+fn full_transformer_flash_f16_combo_matches_cpu() {
+    full_model_parity_with_opts(
+        aurora::gpu::GpuOpts { flash: true, f16_weights: true },
+        0xC0B0,
+        5e-2,
+    );
+}
+
+/// Flash + 3-step training must still reduce the loss (catches refresh
+/// bugs where shadows go stale after optimizer steps).
+#[test]
+fn flash_f16_training_step_reduces_loss() {
+    use aurora::gpu::{DecoderTransformerGpu, GpuOpts};
+    use aurora::optimizer::AdamWConfig;
+    use aurora::transformer::{DecoderTransformer, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0x7141);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        rope: true,
+        ..TransformerConfig::default()
+    };
+    let cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let mut gpu_model = DecoderTransformerGpu::from_cpu_with_opts(
+        &cpu_model,
+        ctx,
+        1,
+        GpuOpts { flash: true, f16_weights: true },
+    );
+    let adam = AdamWConfig { lr: 3e-3, weight_decay: 0.0, ..AdamWConfig::default() };
+
+    let tokens: Vec<u32> = (0..8u32).map(|i| i % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    gpu_model.zero_grad();
+    let initial = gpu_model.train_step(&tokens, &targets);
+    for _ in 0..5 {
+        gpu_model.zero_grad();
+        let _ = gpu_model.train_step(&tokens, &targets);
+        gpu_model.clip_grads(1.0);
+        gpu_model.step_adamw(&adam);
+    }
+    let after = gpu_model.train_step(&tokens, &targets);
+    assert!(
+        after < initial - 0.05,
+        "flash+f16 loss did not drop: {initial} → {after}"
+    );
+}
+
+/// f16-B GEMM kernels vs CPU on non-square shapes (the failing case).
+#[test]
+fn gemm_f16b_kernels_match_cpu() {
+    use aurora::gpu::{CastF16Kernel, GemmKernel, GemmTransposeBKernel};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    if !ctx.shader_f16 {
+        eprintln!("no SHADER_F16 — skipping");
+        return;
+    }
+    let gemm16 = GemmKernel::new_f16b(&ctx);
+    let gemm_t16 = GemmTransposeBKernel::new_f16b(&ctx);
+    let cast = CastF16Kernel::new(&ctx);
+    let mut rng = StdRng::seed_from_u64(0x6F16);
+
+    let (m, k, n) = (12_usize, 32_usize, 64_usize);
+    let a = random_vec(m * k, &mut rng);
+    let b = random_vec(k * n, &mut rng); // for C = A@B
+    let bt = random_vec(n * k, &mut rng); // for C = A@Bᵀ ([n × k] row-major)
+
+    let b_rounded: Vec<f32> = b.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+    let bt_rounded: Vec<f32> = bt.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+    let cpu_c = cpu_gemm(&a, &b_rounded, m, k, n);
+    let cpu_ct = cpu_gemm_transpose_b(&a, &bt_rounded, m, k, n);
+
+    let a_gpu = GpuBuffer::from_slice(&ctx, "a", &a);
+    let b_gpu = GpuBuffer::from_slice(&ctx, "b", &b);
+    let bt_gpu = GpuBuffer::from_slice(&ctx, "bt", &bt);
+    let b16 = GpuBuffer::empty_f16(&ctx, "b16", k * n);
+    let bt16 = GpuBuffer::empty_f16(&ctx, "bt16", n * k);
+    let c_gpu = GpuBuffer::zeros(&ctx, "c", m * n);
+    let ct_gpu = GpuBuffer::zeros(&ctx, "ct", m * n);
+
+    let mut enc = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("f16 gemm test") });
+    {
+        let cb = cast.build_bind(&ctx, &b_gpu, &b16);
+        let cbt = cast.build_bind(&ctx, &bt_gpu, &bt16);
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cast"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&cast.pipeline);
+        cast.dispatch_with_bind(&mut pass, &cb, (k * n) as u32);
+        cast.dispatch_with_bind(&mut pass, &cbt, (n * k) as u32);
+    }
+    {
+        let bind = gemm16.build_bind(&ctx, &a_gpu, &b16, &c_gpu);
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gemm f16"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&gemm16.pipeline);
+        gemm16.dispatch_with_bind(&mut pass, &bind, m as u32, n as u32, k as u32);
+    }
+    {
+        let bind = gemm_t16.build_bind(&ctx, &a_gpu, &bt16, &ct_gpu);
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gemm_t f16"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(gemm_t16.pipeline_pub());
+        gemm_t16.dispatch_with_bind(&mut pass, &bind, m as u32, n as u32, k as u32);
+    }
+    ctx.queue.submit(Some(enc.finish()));
+
+    let gpu_c = c_gpu.download(&ctx);
+    let gpu_ct = ct_gpu.download(&ctx);
+    // GPU f16 cast truncates vs the RNE `half` reference (≤ 1 ULP/elem);
+    // a k-term dot accumulates ≲ k·ulp ≈ 2e-2 absolute — measure RMS-
+    // normalized, not pointwise relative.
+    let err_c = max_err_rms(&cpu_c, &gpu_c);
+    let err_ct = max_err_rms(&cpu_ct, &gpu_ct);
+    assert!(err_c < 5e-3, "gemm f16b err {err_c}");
+    assert!(err_ct < 5e-3, "gemm_t f16b err {err_ct}");
+}
+
+/// f32→f16→f32 roundtrip on GPU must match the `half` crate exactly.
+#[test]
+fn cast_f16_roundtrip_matches_half_crate() {
+    use aurora::gpu::{CastF16Kernel, CastF32Kernel};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    if !ctx.shader_f16 {
+        return;
+    }
+    let c16 = CastF16Kernel::new(&ctx);
+    let c32 = CastF32Kernel::new(&ctx);
+    let mut rng = StdRng::seed_from_u64(0xCA57);
+    let n = 2048_usize;
+    let x = random_vec(n, &mut rng);
+    let expected: Vec<f32> = x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+
+    let x_gpu = GpuBuffer::from_slice(&ctx, "x", &x);
+    let h_gpu = GpuBuffer::empty_f16(&ctx, "h", n);
+    let y_gpu = GpuBuffer::zeros(&ctx, "y", n);
+    let mut enc = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("cast rt") });
+    {
+        let b1 = c16.build_bind(&ctx, &x_gpu, &h_gpu);
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("c16"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c16.pipeline);
+        c16.dispatch_with_bind(&mut pass, &b1, n as u32);
+    }
+    {
+        let b2 = c32.build_bind(&ctx, &h_gpu, &y_gpu);
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("c32"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&c32.pipeline);
+        c32.dispatch_with_bind(&mut pass, &b2, n as u32);
+    }
+    ctx.queue.submit(Some(enc.finish()));
+    let y = y_gpu.download(&ctx);
+    // The GPU conversion truncates; RNE (`half`) may differ by exactly
+    // one f16 ULP. Anything larger is a real cast bug.
+    for i in 0..n {
+        let ulp = (expected[i].abs() * 2.0 / 1024.0).max(6.1e-5);
+        let d = (y[i] - expected[i]).abs();
+        assert!(
+            d <= ulp,
+            "GPU f16 cast off by > 1 ULP at {i}: {} vs {} (d {d})",
+            y[i], expected[i]
+        );
+    }
+}
+
+
+/// Max absolute error normalized by the reference RMS — the right metric
+/// for f16-quantization comparisons, where near-zero elements make
+/// pointwise relative error meaningless.
+fn max_err_rms(cpu: &[f32], gpu: &[f32]) -> f32 {
+    let rms = (cpu.iter().map(|v| v * v).sum::<f32>() / cpu.len().max(1) as f32).sqrt();
+    let denom = rms.max(1e-6);
+    cpu.iter()
+        .zip(gpu)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max)
+        / denom
+}

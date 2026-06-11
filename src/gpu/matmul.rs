@@ -228,7 +228,7 @@ struct GemmParams {
 }
 
 pub struct GemmKernel {
-    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
+    pub pipeline: Arc<wgpu::ComputePipeline>,
     pub(crate) bind_group_layout: Arc<wgpu::BindGroupLayout>,
 }
 
@@ -406,6 +406,12 @@ impl GemmTransposeBKernel {
     pub(crate) fn pipeline(&self) -> &wgpu::ComputePipeline {
         &self.inner.pipeline
     }
+
+    /// Public pipeline accessor for tests.
+    #[must_use]
+    pub fn pipeline_pub(&self) -> &wgpu::ComputePipeline {
+        &self.inner.pipeline
+    }
 }
 
 /// CPU reference for `C = A @ B` where A:[m×k], B:[k×n], C:[m×n].
@@ -438,4 +444,233 @@ pub fn cpu_gemm_transpose_b(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) 
         }
     }
     c
+}
+
+// ───── Half-precision weight (B operand) variants ────────────────────────
+//
+// Same tile geometry; only the B global loads change to f16 (converted
+// to f32 at tile-load time, so the inner FMA loop and the f32
+// accumulation are bit-identical in structure). This halves the
+// dominant DRAM traffic — the weight matrix — which is what the thermo
+// roofline lesson says actually moves the needle. A full f16-compute
+// (vec2<f16> FMA) variant is a follow-up once this is measured.
+
+fn f16_b_source(wgsl: &str) -> String {
+    let s = wgsl
+        .replace(
+            "@group(0) @binding(1) var<storage, read>       b: array<f32>;",
+            "@group(0) @binding(1) var<storage, read>       b: array<f16>;",
+        )
+        .replace(
+            "tb[kk * 64u + cc] = b[g_row * p.n + g_col];",
+            "tb[kk * 64u + cc] = f32(b[g_row * p.n + g_col]);",
+        )
+        .replace(
+            "tb[kk * 64u + cc] = b[g_col * p.k + g_row];",
+            "tb[kk * 64u + cc] = f32(b[g_col * p.k + g_row]);",
+        );
+    format!("enable f16;\n{s}")
+}
+
+impl GemmKernel {
+    /// `C = A @ B` with B stored as f16. Requires `SHADER_F16`.
+    #[must_use]
+    pub fn new_f16b(ctx: &GpuContext) -> Self {
+        Self::build(ctx, &f16_b_source(GEMM_WGSL), "aurora gemm f16b")
+    }
+}
+
+impl GemmTransposeBKernel {
+    /// `C = A @ Bᵀ` with B stored as f16. Requires `SHADER_F16`.
+    #[must_use]
+    pub fn new_f16b(ctx: &GpuContext) -> Self {
+        Self {
+            inner: GemmKernel::build(
+                ctx,
+                &f16_b_source(GEMM_TRANSPOSE_B_WGSL),
+                "aurora gemm_transpose_b f16b",
+            ),
+        }
+    }
+}
+
+// On-device f32 → f16 cast for refreshing weight shadows after each
+// optimizer step.
+//
+// NOTE: the hardware `f16(x)` conversion truncates (round-toward-zero)
+// on NVIDIA/Naga — ~half of all values differ from round-to-nearest by
+// one f16 ULP. Harmless for training: the f32 masters are re-cast every
+// step (no accumulation) and the ~1e-4 relative shrink is far below
+// weight-decay scale. Tests therefore compare with an RMS-normalized
+// absolute tolerance, not bitwise against an RNE reference.
+const CAST_F16_WGSL: &str = "
+enable f16;
+struct P { n: u32, _p0: u32, _p1: u32, _p2: u32 };
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f16>;
+var<push_constant> p: P;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= p.n) { return; }
+    y[i] = f16(x[i]);
+}
+";
+
+pub struct CastF16Kernel {
+    pub pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
+}
+
+impl CastF16Kernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("aurora cast f16"),
+                source: wgpu::ShaderSource::Wgsl(CAST_F16_WGSL.into()),
+            });
+        let bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("aurora cast f16 bgl"),
+                entries: &[storage_entry(0, true), storage_entry(1, false)],
+            });
+        let pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("aurora cast f16 pl"),
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..16,
+                }],
+            });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("aurora cast f16"),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        Self {
+            pipeline: Arc::new(pipeline),
+            bgl: Arc::new(bgl),
+        }
+    }
+
+    pub fn build_bind(&self, ctx: &GpuContext, x: &GpuBuffer, y: &GpuBuffer) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora cast f16 bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: x.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: y.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        n: u32,
+    ) {
+        let p = GemmParams { m: n, n: 0, k: 0, _pad: 0 };
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+    }
+}
+
+// f16 → f32 readback cast — debugging/tests only (shadows are otherwise
+// write-only from the host's perspective).
+const CAST_F32_WGSL: &str = "
+enable f16;
+struct P { n: u32, _p0: u32, _p1: u32, _p2: u32 };
+@group(0) @binding(0) var<storage, read>       x: array<f16>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+var<push_constant> p: P;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= p.n) { return; }
+    y[i] = f32(x[i]);
+}
+";
+
+pub struct CastF32Kernel {
+    pub pipeline: Arc<wgpu::ComputePipeline>,
+    pub(crate) bgl: Arc<wgpu::BindGroupLayout>,
+}
+
+impl CastF32Kernel {
+    #[must_use]
+    pub fn new(ctx: &GpuContext) -> Self {
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("aurora cast f32"),
+                source: wgpu::ShaderSource::Wgsl(CAST_F32_WGSL.into()),
+            });
+        let bgl = ctx
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("aurora cast f32 bgl"),
+                entries: &[storage_entry(0, true), storage_entry(1, false)],
+            });
+        let pl = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("aurora cast f32 pl"),
+                bind_group_layouts: &[&bgl],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..16,
+                }],
+            });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("aurora cast f32"),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        Self {
+            pipeline: Arc::new(pipeline),
+            bgl: Arc::new(bgl),
+        }
+    }
+
+    pub fn build_bind(&self, ctx: &GpuContext, x: &GpuBuffer, y: &GpuBuffer) -> wgpu::BindGroup {
+        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("aurora cast f32 bind"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: x.inner.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: y.inner.as_entire_binding() },
+            ],
+        })
+    }
+
+    pub fn dispatch_with_bind(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bind: &wgpu::BindGroup,
+        n: u32,
+    ) {
+        let p = GemmParams { m: n, n: 0, k: 0, _pad: 0 };
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_push_constants(0, bytemuck::bytes_of(&p));
+        pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+    }
 }

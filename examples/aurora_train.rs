@@ -34,7 +34,7 @@ use std::time::Instant;
 use aurora::bpe::BpeTokenizer;
 use aurora::checkpoint;
 #[cfg(feature = "gpu")]
-use aurora::gpu::{DecoderTransformerGpu, GpuContext};
+use aurora::gpu::{DecoderTransformerGpu, GpuContext, GpuOpts};
 use aurora::optimizer::{AdamWConfig, MuonConfig};
 use aurora::text_io::{bits_per_byte, load_corpus, sample_token};
 #[cfg(feature = "viz")]
@@ -93,6 +93,8 @@ struct Cli {
     /// Hard cap on global optimizer steps (0 = epochs decide). For
     /// token-budgeted runs (iso-FLOP sweeps): tokens = max_steps · B · T.
     max_steps: usize,
+    flash: bool,
+    f16: bool,
 }
 
 impl Cli {
@@ -133,6 +135,8 @@ impl Cli {
         let mut decay_frac: f32 = 0.4;
         let mut tier1: bool = false;
         let mut max_steps: usize = 0;
+        let mut flash: bool = false;
+        let mut f16: bool = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -293,6 +297,14 @@ impl Cli {
                     max_steps = val(i, arg)?.parse().map_err(|e| format!("--max-steps: {e}"))?;
                     i += 2;
                 }
+                "--flash" => {
+                    flash = true;
+                    i += 1;
+                }
+                "--f16" => {
+                    f16 = true;
+                    i += 1;
+                }
                 // Tier-1 modernization pack: rope + rmsnorm + relu2 +
                 // qk-norm + untied head + softcap 30 + zero ffn proj + WSD.
                 "--tier1" => {
@@ -367,6 +379,8 @@ impl Cli {
             lr_schedule,
             decay_frac,
             max_steps,
+            flash,
+            f16,
         })
     }
 }
@@ -493,9 +507,18 @@ fn main() -> ExitCode {
         match GpuContext::new() {
             Ok(ctx) => {
                 let name = ctx.adapter_info().name.clone();
-                let gpu = DecoderTransformerGpu::from_cpu(&model, ctx, cli.batch_size);
+                let opts = GpuOpts { flash: cli.flash, f16_weights: cli.f16 };
+                let gpu =
+                    DecoderTransformerGpu::from_cpu_with_opts(&model, ctx, cli.batch_size, opts);
+                let mut tags = String::new();
+                if gpu.opts.flash {
+                    tags.push_str(", flash");
+                }
+                if gpu.opts.f16_weights {
+                    tags.push_str(", f16");
+                }
                 gpu_backend = Some(gpu);
-                format!("GPU ({name})")
+                format!("GPU ({name}{tags})")
             }
             Err(e) => {
                 eprintln!("⚠ GPU init failed: {e}; falling back to CPU");

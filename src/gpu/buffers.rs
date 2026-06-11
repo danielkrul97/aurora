@@ -86,6 +86,25 @@ impl GpuBuffer {
         }
     }
 
+    /// Half-precision storage buffer (`array<f16>` in WGSL) holding
+    /// `len` f16 elements. Written only by the on-device f32→f16 cast
+    /// kernel — `upload`/`download` must not be called on it.
+    #[must_use]
+    pub fn empty_f16(ctx: &GpuContext, label: &str, len: usize) -> Self {
+        // Round the byte size up to a 4-byte multiple for binding rules.
+        let bytes = ((len * 2 + 3) & !3) as u64;
+        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            inner: Arc::new(buf),
+            len,
+        }
+    }
+
     /// Upload from CPU. Length must match.
     pub fn upload(&self, ctx: &GpuContext, data: &[f32]) {
         debug_assert_eq!(data.len(), self.len);
@@ -136,7 +155,7 @@ impl GpuBuffer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        let _ = ctx.device.poll(wgpu::Maintain::Wait);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
         receiver
             .recv()
             .expect("map_async sender dropped")
@@ -177,7 +196,7 @@ impl GpuBuffer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        let _ = ctx.device.poll(wgpu::Maintain::Wait);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
         receiver
             .recv()
             .expect("map_async sender dropped")

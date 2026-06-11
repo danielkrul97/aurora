@@ -21,6 +21,7 @@ pub mod attention;
 pub mod buffers;
 pub mod context;
 pub mod elementwise;
+pub mod flash_attention;
 pub mod embedding;
 pub mod gelu;
 pub mod kv_cache;
@@ -38,11 +39,12 @@ pub mod transformer;
 pub use attention::{CausalMhaBackwardKernel, CausalMhaForwardKernel};
 pub use context::GpuContext;
 pub use elementwise::{VectorAddKernel, ZeroBufferKernel};
+pub use flash_attention::{FlashAttnBackwardKernel, FlashAttnForwardKernel};
 pub use embedding::{EmbedScatterAddKernel, TokenPosEmbedKernel};
 pub use gelu::{GeluBackwardKernel, GeluKernel};
 pub use kv_cache::{KvBlockGpu, KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
 pub use layer_norm::{LayerNormBackwardKernel, LayerNormForwardKernel};
-pub use matmul::{cpu_gemm, cpu_gemm_transpose_b, GemmKernel, GemmTransposeBKernel};
+pub use matmul::{cpu_gemm, cpu_gemm_transpose_b, CastF16Kernel, CastF32Kernel, GemmKernel, GemmTransposeBKernel};
 pub use muon::{
     MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel, MuonLoadStoreKernel,
     MuonMomentumKernel, MuonStepXKernel,
@@ -56,4 +58,4 @@ pub use reduce::{
 pub use rope::RopeKernel;
 pub use softcap::{SoftcapBackwardKernel, SoftcapKernel};
 pub use softmax_ce::SoftmaxCrossEntropyKernel;
-pub use transformer::DecoderTransformerGpu;
+pub use transformer::{DecoderTransformerGpu, GpuOpts};

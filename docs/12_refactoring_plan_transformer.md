@@ -709,6 +709,45 @@ d384/L6, seq 256, batch 16, **2 epochy/arm**, warmup 1000, seed
 
 ---
 
+## Sprint 67 — MFU práce: wgpu 27, flash attention, f16 váhy (branch `perf-f16-flash`)
+
+**Cíl:** zvednout ~10% MFU (měřeno na A/B runu: 0.29 TFLOPS efektivně
+z ~3 TFLOPS peak) a odemknout dlouhý kontext. Tři kusy:
+
+1. **wgpu 23 → 27** — prereq pro f16 (Naga `enable f16;`). API churn
+   minimální (Instance ref, request_adapter Result, DeviceDescriptor
+   experimental_features/trace, PollType). `GpuContext.shader_f16`
+   detekuje SHADER_F16.
+2. **Flash attention** (`--flash`) — `flash_attention.rs`: fwd online
+   softmax po 128-widoých key tilech, ukládá jen per-row staty (m, l);
+   bwd 3-pass rekompute (D-precompute, dq, dkv) bez T² bufferů
+   (probs + d_scores se nealokují). ~2× attention FLOPs za O(T·d)
+   paměť ⇒ seq-len 1024+ na 4 GB. Sliding-window mask v push
+   konstantách (kompozice s tier3 `--local-window` po merge).
+3. **f16 weight shadows** (`--f16`) — f16 stínové kopie 6 matic/blok +
+   head, refresh cast-kernelem po každém optimizer kroku (mastery f32,
+   žádná akumulace chyb). GEMM varianty `new_f16b` čtou B v f16
+   (f32 konverze při tile-loadu, f32 akumulace) — poloviční DRAM
+   traffic za váhy. LESSON: hardware `f16()` cast TRUNKUJE (RTZ, ne
+   RNE) — ~50 % hodnot ±1 ULP vs `half` crate; pro trénink neškodné,
+   ale testy musí měřit RMS-normalizovanou absolutní chybu, ne
+   pointwise relativní (ta exploduje na ~nulových gradientech).
+
+**Backend opce, ne architektura:** `GpuOpts { flash, f16_weights }` —
+záměrně mimo TransformerConfig/checkpoint (numericky ekvivalentní
+exekuční strategie). `from_cpu_with_opts`; trainer flagy `--flash`
+`--f16`; `--f16` bez HW podpory degraduje s warningem.
+
+**Testy (+5, celkem 77):** kernel-level flash parity vs CPU SDPA na
+T=200 (přes tile hranici), full-model flash/f16/combo parity, f16 GEMM
+unit test, cast roundtrip (≤1 ULP). Vše zelené na GTX 1650.
+
+**Pending:** perf bench (cool-GPU per thermo lesson) + T=1024 smoke —
+GPU drží iso-FLOP sweep; doměřit po jeho doběhnutí. Inference cesty
+(generate/prefill) zůstávají f32 cached-probs — dokumentovaný scope.
+
+---
+
 ## Sprint 60+ — otevřená pole
 
 | Větev | Co odemyká | Effort |
