@@ -1,0 +1,77 @@
+no checkpoint at experiments/results/screen10/layerscale.ckpt — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  4.3M params  ·  CPU
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921076 (BPE vocab 4096, encode 5.2s)
+ train / val  : 2628968 / 292108
+ model        : d=256 L=4 h=4 dff=1024 ctx=256 pos=learned
+ arch         : norm=ln act=gelu qk_norm=false head=tied softcap=0 zero_proj=false
+ lr schedule  : cosine (decay_frac 0.4)
+ optim        : muon hybrid | matrix lr 2.00e-2, momentum 0.95, wd 0 | embed/LN adamw lr 6.00e-4 → 6.00e-5
+              : warmup 200 step, adamw wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : experiments/results/screen10/layerscale.ckpt
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.383  bpb 3.528  lr 3.60e-5  gn 0.40    38.3s
+  step      24  chunk    24/641    loss 8.357  bpb 3.527  lr 7.20e-5  gn 0.40    76.2s
+  step      36  chunk    36/641    loss 8.356  bpb 3.525  lr 1.08e-4  gn 0.42   114.2s
+  step      48  chunk    48/641    loss 8.310  bpb 3.522  lr 1.44e-4  gn 0.55   152.0s
+  step      60  chunk    60/641    loss 8.256  bpb 3.516  lr 1.80e-4  gn 0.75   190.3s
+  step      72  chunk    72/641    loss 8.062  bpb 3.503  lr 2.16e-4  gn 1.21   228.3s
+  step      84  chunk    84/641    loss 7.696  bpb 3.477  lr 2.52e-4  gn 0.66   266.2s
+  step      96  chunk    96/641    loss 7.525  bpb 3.443  lr 2.88e-4  gn 0.53   304.4s
+  step     108  chunk   108/641    loss 7.417  bpb 3.410  lr 3.24e-4  gn 0.46   342.8s
+  step     120  chunk   120/641    loss 7.431  bpb 3.382  lr 3.60e-4  gn 0.55   381.5s
+  step     132  chunk   132/641    loss 7.365  bpb 3.359  lr 3.96e-4  gn 0.63   420.1s
+  step     144  chunk   144/641    loss 7.289  bpb 3.335  lr 4.32e-4  gn 0.74   458.4s
+  step     156  chunk   156/641    loss 7.054  bpb 3.310  lr 4.68e-4  gn 0.64   497.3s
+  step     168  chunk   168/641    loss 6.920  bpb 3.283  lr 5.04e-4  gn 0.62   535.8s
+  step     180  chunk   180/641    loss 6.722  bpb 3.256  lr 5.40e-4  gn 0.66   574.9s
+  step     192  chunk   192/641    loss 6.635  bpb 3.228  lr 5.76e-4  gn 0.76   613.7s
+  step     204  chunk   204/641    loss 6.518  bpb 3.200  lr 6.00e-4  gn 0.84   652.8s
+  step     216  chunk   216/641    loss 6.453  bpb 3.174  lr 5.98e-4  gn 0.80   692.0s
+  step     228  chunk   228/641    loss 6.405  bpb 3.148  lr 5.95e-4  gn 0.78   731.4s
+  step     240  chunk   240/641    loss 6.284  bpb 3.124  lr 5.90e-4  gn 0.79   770.3s
+  step     252  chunk   252/641    loss 6.310  bpb 3.102  lr 5.82e-4  gn 0.91   809.4s
+  step     264  chunk   264/641    loss 6.238  bpb 3.081  lr 5.73e-4  gn 0.84   848.6s
+  step     276  chunk   276/641    loss 6.228  bpb 3.060  lr 5.62e-4  gn 1.04   887.5s
+  step     288  chunk   288/641    loss 6.204  bpb 3.040  lr 5.50e-4  gn 1.02   926.7s
+  step     300  chunk   300/641    loss 6.098  bpb 3.021  lr 5.36e-4  gn 1.01   965.6s
+  step     312  chunk   312/641    loss 6.003  bpb 3.001  lr 5.20e-4  gn 1.00  1004.2s
+  step     324  chunk   324/641    loss 5.955  bpb 2.984  lr 5.03e-4  gn 1.10  1043.2s
+  step     336  chunk   336/641    loss 6.140  bpb 2.967  lr 4.84e-4  gn 0.94  1082.2s
+  step     348  chunk   348/641    loss 6.015  bpb 2.953  lr 4.65e-4  gn 0.95  1120.8s
+  step     360  chunk   360/641    loss 5.807  bpb 2.937  lr 4.45e-4  gn 1.23  1159.5s
+  step     372  chunk   372/641    loss 5.719  bpb 2.921  lr 4.23e-4  gn 1.19  1198.3s
+  step     384  chunk   384/641    loss 5.776  bpb 2.907  lr 4.01e-4  gn 1.09  1237.3s
+  step     396  chunk   396/641    loss 5.732  bpb 2.892  lr 3.79e-4  gn 1.10  1275.8s
+  step     408  chunk   408/641    loss 5.741  bpb 2.878  lr 3.56e-4  gn 1.13  1314.2s
+  step     420  chunk   420/641    loss 5.883  bpb 2.867  lr 3.33e-4  gn 1.18  1354.4s
+  step     432  chunk   432/641    loss 5.776  bpb 2.855  lr 3.10e-4  gn 1.14  1399.8s
+  step     444  chunk   444/641    loss 5.668  bpb 2.842  lr 2.87e-4  gn 1.21  1439.2s
+  step     456  chunk   456/641    loss 5.796  bpb 2.831  lr 2.64e-4  gn 1.11  1481.2s
+  step     468  chunk   468/641    loss 5.589  bpb 2.820  lr 2.42e-4  gn 1.14  1524.7s
+  step     480  chunk   480/641    loss 5.639  bpb 2.809  lr 2.21e-4  gn 1.25  1564.5s
+  step     492  chunk   492/641    loss 5.607  bpb 2.798  lr 2.00e-4  gn 1.30  1605.0s
+  step     504  chunk   504/641    loss 5.760  bpb 2.789  lr 1.80e-4  gn 1.14  1645.3s
+  step     516  chunk   516/641    loss 5.691  bpb 2.779  lr 1.62e-4  gn 1.20  1685.1s
+  step     528  chunk   528/641    loss 5.653  bpb 2.770  lr 1.44e-4  gn 1.59  1727.1s
+  step     540  chunk   540/641    loss 5.683  bpb 2.761  lr 1.28e-4  gn 1.51  1768.2s
+  step     552  chunk   552/641    loss 5.526  bpb 2.752  lr 1.14e-4  gn 1.18  1808.8s
+  step     564  chunk   564/641    loss 5.542  bpb 2.743  lr 1.01e-4  gn 1.32  1849.4s
+  step     576  chunk   576/641    loss 5.430  bpb 2.735  lr 8.93e-5  gn 1.39  1888.4s
+  step     588  chunk   588/641    loss 5.659  bpb 2.727  lr 7.97e-5  gn 1.35  1927.7s
+  step     600  chunk   600/641    loss 5.452  bpb 2.719  lr 7.20e-5  gn 1.25  1968.8s
+  step     612  chunk   612/641    loss 5.519  bpb 2.711  lr 6.61e-5  gn 1.41  2009.6s
+  step     624  chunk   624/641    loss 5.653  bpb 2.704  lr 6.22e-5  gn 1.37  2051.0s
+  step     636  chunk   636/641    loss 5.474  bpb 2.698  lr 6.02e-5  gn 1.28  2089.7s
+  done   train bpb 2.695  val bpb 2.369  2135.0s (eval 29.2s)
+  checkpoint → experiments/results/screen10/layerscale.ckpt
+  sample:
+    seed: "ons. To the Athenians it "
+    cont: "since seonertained dictions]] with various characters on them.\n\nIts make a Recents in to igrant designed for a subject's successemporary promisly arant question. As near the state contained that a egendom.pngarding. \n\n===\n\nBroyal Erive to silinquite went inile of the country, cause ened, including Robted to his subject the higher is lates of Aute, continuations he discovered will not be arely regular minused\n\n*Make with the pasters may i]] has a sh"
+
+Total time 2151.5s   best val bpb 2.369   steps planned 641

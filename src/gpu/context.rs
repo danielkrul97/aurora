@@ -34,7 +34,18 @@ impl GpuContext {
                 // `var<push_constant>` instead of a per-dispatch uniform
                 // buffer + bind group entry; saves ~100-200 µs per
                 // dispatch on the Vulkan path.
-                required_features: wgpu::Features::PUSH_CONSTANTS,
+                required_features: {
+                    let mut f = wgpu::Features::PUSH_CONSTANTS;
+                    // Opt-in timestamp profiling (diagnostic only — see
+                    // gpu::profiler). INSIDE_ENCODERS is what lets us mark
+                    // between dispatches (not just at pass boundaries).
+                    let ts = wgpu::Features::TIMESTAMP_QUERY
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+                    if adapter.features().contains(ts) {
+                        f |= ts;
+                    }
+                    f
+                },
                 required_limits: {
                     let supported = adapter.limits();
                     let mut wanted = wgpu::Limits::default();

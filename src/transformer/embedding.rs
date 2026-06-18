@@ -58,6 +58,10 @@ pub struct EmbedGrads {
     pub d_w_pos: Vec<f32>,
     /// Untied LM head gradient; empty when the head is tied.
     pub d_w_head: Vec<f32>,
+    /// LM-head bias gradient `[vocab]`; empty when head bias is off.
+    pub d_head_bias: Vec<f32>,
+    /// Sink/register grad `[sink_tokens * d_model]`; empty when off.
+    pub d_sink: Vec<f32>,
 }
 
 impl EmbedGrads {
@@ -67,6 +71,8 @@ impl EmbedGrads {
             d_w_tok: vec![0.0; vocab * d_model],
             d_w_pos: vec![0.0; seq_len_max * d_model],
             d_w_head: Vec::new(),
+            d_head_bias: Vec::new(),
+            d_sink: Vec::new(),
         }
     }
 
@@ -74,6 +80,8 @@ impl EmbedGrads {
         self.d_w_tok.fill(0.0);
         self.d_w_pos.fill(0.0);
         self.d_w_head.fill(0.0);
+        self.d_head_bias.fill(0.0);
+        self.d_sink.fill(0.0);
     }
 }
 
@@ -135,8 +143,8 @@ pub fn embed_backward(w: &EmbedWeights, cache: &EmbedCache, dy: &[f32], grads: &
 
 /// Position-block size: each `w_tok` row is streamed once per block of
 /// positions instead of once per position (`w_tok` is the largest matrix
-/// in the model — vocab × d_model ≫ cache). Dot products are computed in
-/// the unblocked order, so results are bit-exact.
+/// in the model — vocab × d_model ≫ cache). Dot products use the
+/// vectorized 8-lane `dot` (AVX2 FMA under target-cpu=native).
 const HEAD_BLOCK_T: usize = 8;
 
 /// Forward: `logits[t, v] = sum_c h[t, c] * w_tok[v, c]`. Tied LM head.
@@ -152,11 +160,7 @@ pub fn tied_lm_head_forward(h: &[f32], w_tok: &[f32], vocab: usize, d_model: usi
             for tt in 0..tb {
                 let ti = t0 + tt;
                 let hr = &h[ti * d_model..(ti + 1) * d_model];
-                let mut acc = 0.0_f32;
-                for c in 0..d_model {
-                    acc += hr[c] * wr[c];
-                }
-                logits[ti * vocab + v] = acc;
+                logits[ti * vocab + v] = crate::linalg::dot(hr, wr);
             }
         }
         t0 += tb;

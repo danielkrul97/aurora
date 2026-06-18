@@ -19,6 +19,7 @@
 
 pub mod attention;
 pub mod buffers;
+pub mod canon;
 pub mod context;
 pub mod elementwise;
 pub mod embedding;
@@ -28,6 +29,7 @@ pub mod layer_norm;
 pub mod matmul;
 pub mod muon;
 pub mod optimizer;
+pub mod profiler;
 pub mod qk_norm;
 pub mod reduce;
 pub mod rope;
@@ -36,6 +38,7 @@ pub mod softmax_ce;
 pub mod transformer;
 
 pub use attention::{CausalMhaBackwardKernel, CausalMhaForwardKernel};
+pub use canon::{CanonDwKernel, CanonDxKernel, CanonForwardKernel};
 pub use context::GpuContext;
 pub use elementwise::{VectorAddKernel, ZeroBufferKernel};
 pub use embedding::{EmbedScatterAddKernel, TokenPosEmbedKernel};
@@ -48,6 +51,7 @@ pub use muon::{
     MuonMomentumKernel, MuonStepXKernel,
 };
 pub use optimizer::AdamWKernel;
+pub use profiler::GpuProfiler;
 pub use qk_norm::{QkNormBackwardKernel, QkNormKernel};
 pub use reduce::{
     EmbedScatterReduceKernel, GradNormFinalizeKernel, GradNormSqReduceKernel,
@@ -56,4 +60,4 @@ pub use reduce::{
 pub use rope::RopeKernel;
 pub use softcap::{SoftcapBackwardKernel, SoftcapKernel};
 pub use softmax_ce::SoftmaxCrossEntropyKernel;
-pub use transformer::DecoderTransformerGpu;
+pub use transformer::{DecoderTransformerGpu, GpuStateSnapshot};

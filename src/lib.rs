@@ -6,6 +6,7 @@
 pub mod attention;
 pub mod bpe;
 pub mod checkpoint;
+pub mod governor;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod linalg;

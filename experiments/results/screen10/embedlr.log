@@ -1,0 +1,77 @@
+no checkpoint at experiments/results/screen10/embedlr.ckpt — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  4.3M params  ·  CPU
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921076 (BPE vocab 4096, encode 5.4s)
+ train / val  : 2628968 / 292108
+ model        : d=256 L=4 h=4 dff=1024 ctx=256 pos=learned
+ arch         : norm=ln act=gelu qk_norm=false head=tied softcap=0 zero_proj=false
+ lr schedule  : cosine (decay_frac 0.4)
+ optim        : muon hybrid | matrix lr 2.00e-2, momentum 0.95, wd 0 | embed/LN adamw lr 6.00e-4 → 6.00e-5
+              : warmup 200 step, adamw wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : experiments/results/screen10/embedlr.ckpt
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.283  bpb 3.513  lr 3.60e-5  gn 0.47    37.5s
+  step      24  chunk    24/641    loss 8.066  bpb 3.479  lr 7.20e-5  gn 0.51    76.0s
+  step      36  chunk    36/641    loss 7.692  bpb 3.423  lr 1.08e-4  gn 0.48   114.3s
+  step      48  chunk    48/641    loss 7.461  bpb 3.364  lr 1.44e-4  gn 0.47   153.0s
+  step      60  chunk    60/641    loss 7.470  bpb 3.324  lr 1.80e-4  gn 0.52   191.4s
+  step      72  chunk    72/641    loss 7.401  bpb 3.292  lr 2.16e-4  gn 0.47   229.8s
+  step      84  chunk    84/641    loss 7.273  bpb 3.266  lr 2.52e-4  gn 0.49   268.2s
+  step      96  chunk    96/641    loss 7.118  bpb 3.237  lr 2.88e-4  gn 0.57   306.8s
+  step     108  chunk   108/641    loss 6.851  bpb 3.204  lr 3.24e-4  gn 0.57   345.0s
+  step     120  chunk   120/641    loss 6.762  bpb 3.169  lr 3.60e-4  gn 0.60   383.5s
+  step     132  chunk   132/641    loss 6.643  bpb 3.137  lr 3.96e-4  gn 0.61   421.9s
+  step     144  chunk   144/641    loss 6.564  bpb 3.107  lr 4.32e-4  gn 0.70   460.3s
+  step     156  chunk   156/641    loss 6.400  bpb 3.077  lr 4.68e-4  gn 0.60   498.8s
+  step     168  chunk   168/641    loss 6.370  bpb 3.049  lr 5.04e-4  gn 0.57   537.0s
+  step     180  chunk   180/641    loss 6.279  bpb 3.024  lr 5.40e-4  gn 0.59   575.1s
+  step     192  chunk   192/641    loss 6.270  bpb 2.998  lr 5.76e-4  gn 0.66   613.4s
+  step     204  chunk   204/641    loss 6.164  bpb 2.974  lr 6.00e-4  gn 0.69   652.2s
+  step     216  chunk   216/641    loss 6.125  bpb 2.952  lr 5.98e-4  gn 0.55   690.5s
+  step     228  chunk   228/641    loss 6.093  bpb 2.930  lr 5.95e-4  gn 0.56   729.2s
+  step     240  chunk   240/641    loss 6.006  bpb 2.910  lr 5.90e-4  gn 0.60   768.4s
+  step     252  chunk   252/641    loss 6.057  bpb 2.894  lr 5.82e-4  gn 0.59   807.5s
+  step     264  chunk   264/641    loss 6.027  bpb 2.876  lr 5.73e-4  gn 0.56   847.1s
+  step     276  chunk   276/641    loss 6.021  bpb 2.859  lr 5.62e-4  gn 0.62   885.9s
+  step     288  chunk   288/641    loss 6.046  bpb 2.845  lr 5.50e-4  gn 0.57   924.7s
+  step     300  chunk   300/641    loss 5.877  bpb 2.830  lr 5.36e-4  gn 0.54   963.3s
+  step     312  chunk   312/641    loss 5.789  bpb 2.813  lr 5.20e-4  gn 0.54  1001.7s
+  step     324  chunk   324/641    loss 5.713  bpb 2.799  lr 5.03e-4  gn 0.56  1041.1s
+  step     336  chunk   336/641    loss 5.951  bpb 2.787  lr 4.84e-4  gn 0.53  1081.1s
+  step     348  chunk   348/641    loss 5.851  bpb 2.776  lr 4.65e-4  gn 0.50  1122.6s
+  step     360  chunk   360/641    loss 5.515  bpb 2.763  lr 4.45e-4  gn 0.60  1162.9s
+  step     372  chunk   372/641    loss 5.504  bpb 2.750  lr 4.23e-4  gn 0.58  1203.8s
+  step     384  chunk   384/641    loss 5.594  bpb 2.738  lr 4.01e-4  gn 0.56  1244.7s
+  step     396  chunk   396/641    loss 5.543  bpb 2.726  lr 3.79e-4  gn 0.51  1284.1s
+  step     408  chunk   408/641    loss 5.563  bpb 2.714  lr 3.56e-4  gn 0.54  1325.1s
+  step     420  chunk   420/641    loss 5.698  bpb 2.706  lr 3.33e-4  gn 0.51  1366.0s
+  step     432  chunk   432/641    loss 5.602  bpb 2.696  lr 3.10e-4  gn 0.54  1405.1s
+  step     444  chunk   444/641    loss 5.508  bpb 2.685  lr 2.87e-4  gn 0.56  1444.0s
+  step     456  chunk   456/641    loss 5.599  bpb 2.677  lr 2.64e-4  gn 0.50  1482.7s
+  step     468  chunk   468/641    loss 5.374  bpb 2.667  lr 2.42e-4  gn 0.52  1521.5s
+  step     480  chunk   480/641    loss 5.428  bpb 2.658  lr 2.21e-4  gn 0.60  1563.8s
+  step     492  chunk   492/641    loss 5.431  bpb 2.648  lr 2.00e-4  gn 0.57  1603.3s
+  step     504  chunk   504/641    loss 5.585  bpb 2.641  lr 1.80e-4  gn 0.51  1642.5s
+  step     516  chunk   516/641    loss 5.469  bpb 2.633  lr 1.62e-4  gn 0.54  1682.5s
+  step     528  chunk   528/641    loss 5.458  bpb 2.625  lr 1.44e-4  gn 0.68  1721.0s
+  step     540  chunk   540/641    loss 5.501  bpb 2.618  lr 1.28e-4  gn 0.59  1762.7s
+  step     552  chunk   552/641    loss 5.315  bpb 2.609  lr 1.14e-4  gn 0.50  1802.7s
+  step     564  chunk   564/641    loss 5.312  bpb 2.602  lr 1.01e-4  gn 0.52  1842.0s
+  step     576  chunk   576/641    loss 5.144  bpb 2.594  lr 8.93e-5  gn 0.57  1881.6s
+  step     588  chunk   588/641    loss 5.434  bpb 2.587  lr 7.97e-5  gn 0.52  1921.0s
+  step     600  chunk   600/641    loss 5.233  bpb 2.580  lr 7.20e-5  gn 0.56  1960.5s
+  step     612  chunk   612/641    loss 5.269  bpb 2.573  lr 6.61e-5  gn 0.56  2000.1s
+  step     624  chunk   624/641    loss 5.474  bpb 2.567  lr 6.22e-5  gn 0.56  2040.9s
+  step     636  chunk   636/641    loss 5.255  bpb 2.562  lr 6.02e-5  gn 0.55  2081.6s
+  done   train bpb 2.560  val bpb 2.293  2126.7s (eval 28.8s)
+  checkpoint → experiments/results/screen10/embedlr.ckpt
+  sample:
+    seed: "ons. To the Athenians it "
+    cont: "said to womice is written that later that ón't refers has overclaim contains if the culture.\n\n==See also==\n{{main|main|Islamic]] webs==\n{{main|religion of History of America's intage is not built in this government to fleet meeternal into [[King [[SSonirootories|right|Andrew AdiseasAlthough the homan|authority of Deps]] (apolisha, the diathinschbn as open's first place are law of assinian lowers are Procl-dial popular'' is now grow of Zealt that "
+
+Total time 2142.9s   best val bpb 2.293   steps planned 641

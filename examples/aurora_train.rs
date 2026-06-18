@@ -34,7 +34,8 @@ use std::time::Instant;
 use aurora::bpe::BpeTokenizer;
 use aurora::checkpoint;
 #[cfg(feature = "gpu")]
-use aurora::gpu::{DecoderTransformerGpu, GpuContext};
+use aurora::gpu::{DecoderTransformerGpu, GpuContext, GpuStateSnapshot};
+use aurora::governor::{build_probe, CpuTrialBackend, Governor, GovernorConfig, StepSample};
 use aurora::optimizer::{AdamWConfig, MuonConfig};
 use aurora::text_io::{bits_per_byte, load_corpus, sample_token};
 #[cfg(feature = "viz")]
@@ -93,6 +94,33 @@ struct Cli {
     /// Hard cap on global optimizer steps (0 = epochs decide). For
     /// token-budgeted runs (iso-FLOP sweeps): tokens = max_steps · B · T.
     max_steps: usize,
+    /// Cap val-eval to this many evenly-spaced windows (0 = all). Full
+    /// sliding-window eval dominates A/B screening wall-clock; capping
+    /// trades eval precision for throughput. Use 0 for final numbers.
+    eval_windows_cap: usize,
+    /// Logit z-loss weight (PaLM regularizer). 0.0 = off.
+    z_loss: f32,
+    /// LR multiplier for embedding/head Adam groups. 1.0 = off.
+    embed_lr_mult: f32,
+    /// Unigram-initialized additive LM-head bias.
+    head_bias: bool,
+    /// Parallel (GPT-J) block topology.
+    parallel_block: bool,
+    /// Per-channel LayerScale gates on attn/FFN branches.
+    layerscale: bool,
+    /// EMA decay for weight-averaged eval (CPU path). 0.0 = off.
+    ema: f32,
+    /// SwiGLU gated FFN (pass a reduced --d-ff to stay iso-param).
+    swiglu: bool,
+    /// Canon causal depthwise-conv kernel size (0 = off).
+    canon_kernel: usize,
+    /// Differential attention (two-softmax minus learned per-head λ).
+    diff_attn: bool,
+    /// Learnable sink/register tokens prepended to each sequence (0 = off).
+    sink_tokens: usize,
+    /// PHAGE runtime efficiency governor: watches training, diagnoses
+    /// stalls, hot-swaps live math after a paired-rollout sequential test.
+    governor: bool,
 }
 
 impl Cli {
@@ -132,7 +160,20 @@ impl Cli {
         let mut lr_schedule: Option<LrSchedule> = None;
         let mut decay_frac: f32 = 0.4;
         let mut tier1: bool = false;
+        let mut tier4: bool = false;
         let mut max_steps: usize = 0;
+        let mut eval_windows_cap: usize = 0;
+        let mut z_loss: f32 = 0.0;
+        let mut embed_lr_mult: f32 = 1.0;
+        let mut head_bias: bool = false;
+        let mut parallel_block: bool = false;
+        let mut layerscale: bool = false;
+        let mut ema: f32 = 0.0;
+        let mut swiglu: bool = false;
+        let mut canon_kernel: usize = 0;
+        let mut diff_attn: bool = false;
+        let mut sink_tokens: usize = 0;
+        let mut governor: bool = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
@@ -293,10 +334,74 @@ impl Cli {
                     max_steps = val(i, arg)?.parse().map_err(|e| format!("--max-steps: {e}"))?;
                     i += 2;
                 }
+                "--eval-windows" => {
+                    eval_windows_cap =
+                        val(i, arg)?.parse().map_err(|e| format!("--eval-windows: {e}"))?;
+                    i += 2;
+                }
+                "--z-loss" => {
+                    z_loss = val(i, arg)?.parse().map_err(|e| format!("--z-loss: {e}"))?;
+                    i += 2;
+                }
+                "--embed-lr-mult" => {
+                    embed_lr_mult =
+                        val(i, arg)?.parse().map_err(|e| format!("--embed-lr-mult: {e}"))?;
+                    i += 2;
+                }
+                "--head-bias" => {
+                    head_bias = true;
+                    i += 1;
+                }
+                "--parallel-block" => {
+                    parallel_block = true;
+                    i += 1;
+                }
+                "--layerscale" => {
+                    layerscale = true;
+                    i += 1;
+                }
+                "--ema" => {
+                    ema = val(i, arg)?.parse().map_err(|e| format!("--ema: {e}"))?;
+                    i += 2;
+                }
+                "--swiglu" => {
+                    swiglu = true;
+                    i += 1;
+                }
+                "--canon" => {
+                    if canon_kernel == 0 {
+                        canon_kernel = 4;
+                    }
+                    i += 1;
+                }
+                "--canon-kernel" => {
+                    canon_kernel =
+                        val(i, arg)?.parse().map_err(|e| format!("--canon-kernel: {e}"))?;
+                    i += 2;
+                }
+                "--diff-attn" => {
+                    diff_attn = true;
+                    i += 1;
+                }
+                "--sink" => {
+                    sink_tokens = val(i, arg)?.parse().map_err(|e| format!("--sink: {e}"))?;
+                    i += 2;
+                }
                 // Tier-1 modernization pack: rope + rmsnorm + relu2 +
                 // qk-norm + untied head + softcap 30 + zero ffn proj + WSD.
                 "--tier1" => {
                     tier1 = true;
+                    i += 1;
+                }
+                // Tier-4 pack: the two confirmed winners of the 10-hypothesis
+                // sprint — Canon causal-conv (kernel 4) + 3× embedding LR.
+                // Nano d384/L6 4ep enwik8_10m: 1.797 → 1.661 (Δ −0.136, seed 42).
+                "--tier4" => {
+                    tier4 = true;
+                    i += 1;
+                }
+                "--governor" => {
+                    governor = true;
                     i += 1;
                 }
                 "-h" | "--help" => {
@@ -315,6 +420,14 @@ impl Cli {
             zero_ffn_proj = true;
             softcap = softcap.or(Some(30.0));
             lr_schedule = lr_schedule.or(Some(LrSchedule::Wsd));
+        }
+        if tier4 {
+            if canon_kernel == 0 {
+                canon_kernel = 4;
+            }
+            if embed_lr_mult == 1.0 {
+                embed_lr_mult = 3.0;
+            }
         }
         let softcap = softcap.unwrap_or(0.0);
         let lr_schedule = lr_schedule.unwrap_or(LrSchedule::Cosine);
@@ -367,6 +480,18 @@ impl Cli {
             lr_schedule,
             decay_frac,
             max_steps,
+            eval_windows_cap,
+            z_loss,
+            embed_lr_mult,
+            head_bias,
+            parallel_block,
+            layerscale,
+            ema,
+            swiglu,
+            canon_kernel,
+            diff_attn,
+            sink_tokens,
+            governor,
         })
     }
 }
@@ -450,8 +575,17 @@ fn main() -> ExitCode {
         untied_head: cli.untied_head,
         softcap: cli.softcap,
         zero_ffn_proj: cli.zero_ffn_proj,
+        z_loss: cli.z_loss,
+        embed_lr_mult: cli.embed_lr_mult,
+        head_bias: cli.head_bias,
+        parallel_block: cli.parallel_block,
+        layerscale: cli.layerscale,
+        swiglu: cli.swiglu,
+        canon_kernel: cli.canon_kernel,
+        diff_attn: cli.diff_attn,
+        sink_tokens: cli.sink_tokens,
     };
-    let (model, start_epoch, step) = match checkpoint::load(&cli.checkpoint) {
+    let (mut model, start_epoch, step) = match checkpoint::load(&cli.checkpoint) {
         Ok(ckpt) => {
             if ckpt.model.config.vocab == actual_vocab
                 && ckpt.model.config.d_model == cli.d_model
@@ -464,6 +598,13 @@ fn main() -> ExitCode {
                 && ckpt.model.config.qk_norm == cli.qk_norm
                 && ckpt.model.config.untied_head == cli.untied_head
                 && ckpt.model.config.softcap == cli.softcap
+                && ckpt.model.config.canon_kernel == cli.canon_kernel
+                && ckpt.model.config.swiglu == cli.swiglu
+                && ckpt.model.config.layerscale == cli.layerscale
+                && ckpt.model.config.parallel_block == cli.parallel_block
+                && ckpt.model.config.diff_attn == cli.diff_attn
+                && ckpt.model.config.head_bias == cli.head_bias
+                && ckpt.model.config.sink_tokens == cli.sink_tokens
             {
                 println!(
                     "resuming from {} (epoch {}, step {})",
@@ -486,10 +627,69 @@ fn main() -> ExitCode {
         }
     };
 
+    // embed_lr_mult is a training-time LR knob (not serialized); CLI wins
+    // even on resume, where the loaded config would default it to 1.0.
+    model.config.embed_lr_mult = cli.embed_lr_mult;
+
+    // Unigram-prior init for the LM-head bias: log p(token) over the train
+    // split (Laplace-smoothed). Gives the head a calibrated starting point
+    // so early steps don't burn capacity learning marginal token frequency.
+    if cli.head_bias {
+        if let Some(hb) = model.head_bias.as_mut() {
+            let mut counts = vec![1.0_f64; actual_vocab];
+            for &tok in &tokens[..n_train] {
+                counts[tok as usize] += 1.0;
+            }
+            let total: f64 = counts.iter().sum();
+            for (c, cnt) in counts.iter().enumerate() {
+                hb[c] = (cnt / total).ln() as f32;
+            }
+        }
+    }
+
     #[cfg(feature = "gpu")]
     let mut gpu_backend: Option<DecoderTransformerGpu> = None;
     #[cfg(feature = "gpu")]
     let backend_name = if cli.gpu {
+        // The GPU backend implements only rope/rmsnorm/relu2/qk-norm/
+        // untied-head/softcap/canon. Building from_cpu drops every other
+        // feature silently, so refuse rather than train a different model
+        // than the flags asked for.
+        let mut unsupported: Vec<&str> = Vec::new();
+        if cli.swiglu {
+            unsupported.push("--swiglu");
+        }
+        if cli.diff_attn {
+            unsupported.push("--diff-attn");
+        }
+        if cli.sink_tokens > 0 {
+            unsupported.push("--sink");
+        }
+        if cli.layerscale {
+            unsupported.push("--layerscale");
+        }
+        if cli.parallel_block {
+            unsupported.push("--parallel-block");
+        }
+        if cli.head_bias {
+            unsupported.push("--head-bias");
+        }
+        if cli.z_loss != 0.0 {
+            unsupported.push("--z-loss");
+        }
+        if cli.embed_lr_mult != 1.0 {
+            unsupported.push("--embed-lr-mult (incl. via --tier4)");
+        }
+        if !unsupported.is_empty() {
+            eprintln!(
+                "error: GPU backend does not implement {}; rerun on CPU (drop --gpu) or remove the flag(s)",
+                unsupported.join(", ")
+            );
+            return ExitCode::FAILURE;
+        }
+        if cli.ema > 0.0 {
+            eprintln!("⚠ --ema has no effect under --gpu (EMA blend is CPU-only); eval uses live GPU weights");
+        }
         match GpuContext::new() {
             Ok(ctx) => {
                 let name = ctx.adapter_info().name.clone();
@@ -686,6 +886,8 @@ fn run_training_loop(mut ctx: TrainCtx) {
     }
 
     let mut grads = ModelGrads::zeros(&ctx.model.config);
+    let mut ema_model: Option<DecoderTransformer> =
+        (ctx.cli.ema > 0.0).then(|| ctx.model.clone());
 
     // Per-batch-element gradient scratch for the CPU stepper: rayon runs
     // forward+backward for each element into its own buffer (no shared
@@ -717,9 +919,45 @@ fn run_training_loop(mut ctx: TrainCtx) {
         ctx.cli.muon_lr * 0.1
     };
 
+    // PHAGE governor. Backend-agnostic core; the trial/rollback machinery
+    // is driven through a CpuTrialBackend (here) or a GpuTrialBackend (under
+    // --gpu), so it works on both the CPU model and the on-device GPU model.
+    let gov_cfg = GovernorConfig::default();
+    let gov_horizon = gov_cfg.horizon;
+    let gov_probe_n = gov_cfg.probe_windows;
+    let mut governor = if ctx.cli.governor {
+        let mem_path = ctx.cli.checkpoint.with_extension("phage");
+        println!("⚙ PHAGE governor active — memory {}", mem_path.display());
+        Some(Governor::new(
+            gov_cfg,
+            ctx.cli.muon_momentum,
+            ctx.cli.weight_decay,
+            total_steps_for_lr as u64,
+            ctx.cli.warmup_steps as u64,
+            ctx.cli.seed,
+            Some(mem_path),
+        ))
+    } else {
+        None
+    };
+    let (gov_probe_in, gov_probe_out) = if governor.is_some() {
+        build_probe(val_toks, ctx.cli.seq_len, gov_probe_n)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut gov_safe: Option<DecoderTransformer> = None;
+    #[cfg(feature = "gpu")]
+    let mut gov_gpu_safe: Option<GpuStateSnapshot> = None;
+    #[cfg(feature = "gpu")]
+    let mut gov_gpu_base: Option<GpuStateSnapshot> = None;
+    let mut gov_brng = StdRng::seed_from_u64(ctx.cli.seed ^ 0x5EED_1234_ABCD_0001);
+
     let mut capped = false;
     for epoch in ctx.start_epoch..ctx.cli.epochs as u32 {
         let epoch_start = Instant::now();
+        let step_at_epoch_start = ctx.step;
+        let mut last_report_elapsed = 0.0_f64;
+        let mut last_report_step = ctx.step;
         println!("\n── epoch {epoch} ───────────────────────────────");
 
         let mut total_nats = 0.0_f32;
@@ -750,17 +988,27 @@ fn run_training_loop(mut ctx: TrainCtx) {
             };
             let lr_t = lr_at(ctx.cli.lr, ctx.cli.min_lr);
             let muon_lr_t = lr_at(ctx.cli.muon_lr, muon_min_lr);
-            let adam = AdamWConfig {
+            let mut adam = AdamWConfig {
                 lr: lr_t,
                 weight_decay: ctx.cli.weight_decay,
                 ..AdamWConfig::default()
             };
-            let muon_cfg = MuonConfig {
+            let mut muon_cfg = MuonConfig {
                 lr: muon_lr_t,
                 momentum: ctx.cli.muon_momentum,
                 weight_decay: ctx.cli.muon_wd,
                 ..MuonConfig::default()
             };
+            // The governor reads the MSV and scales this step's configs in
+            // place; all backends consume the result, so LR/momentum/wd
+            // governance is automatic and only the clip value is threaded.
+            let clip_eff = if let Some(gov) = governor.as_mut() {
+                let msv = gov.begin_step(lr_t, muon_lr_t);
+                msv.apply_optim(&mut adam, &mut muon_cfg, ctx.cli.grad_clip)
+            } else {
+                ctx.cli.grad_clip
+            };
+            let step_t0 = governor.as_ref().map(|_| Instant::now());
 
             // The pre-clip grad norm is only displayed on report steps
             // (and every step under viz). On other steps we skip the
@@ -801,7 +1049,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
                 // clip threshold scales with batch size. Clip touches only
                 // the AdamW slice (embed + LN); matrix-grad magnitudes are
                 // bounded by Newton–Schulz inside the Muon step.
-                let clip_max = ctx.cli.grad_clip * ctx.cli.batch_size as f32;
+                let clip_max = clip_eff * ctx.cli.batch_size as f32;
                 grad_norm = gpu.clip_grads_adamw_subset(clip_max, want_grad_norm);
                 gpu.step_muon_hybrid(&muon_cfg, &adam);
                 ctx.step += 1;
@@ -814,7 +1062,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
                         stream_len,
                         chunk_idx,
                         ctx.cli.seq_len,
-                        ctx.cli.grad_clip,
+                        clip_eff,
                         &mut grads,
                         &mut batch_grads,
                         &muon_cfg,
@@ -844,7 +1092,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
                     grads.scale(1.0 / ctx.cli.batch_size as f32);
                     grad_norm = DecoderTransformer::clip_grads_adamw_subset(
                         &mut grads,
-                        ctx.cli.grad_clip,
+                        clip_eff,
                     );
                     ctx.model.step_muon_hybrid(&grads, &muon_cfg, &adam);
                 }
@@ -860,7 +1108,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
                         stream_len,
                         chunk_idx,
                         ctx.cli.seq_len,
-                        ctx.cli.grad_clip,
+                        clip_eff,
                         &mut grads,
                         &mut batch_grads,
                         &muon_cfg,
@@ -890,16 +1138,97 @@ fn run_training_loop(mut ctx: TrainCtx) {
                     grads.scale(1.0 / ctx.cli.batch_size as f32);
                     grad_norm = DecoderTransformer::clip_grads_adamw_subset(
                         &mut grads,
-                        ctx.cli.grad_clip,
+                        clip_eff,
                     );
                     ctx.model.step_muon_hybrid(&grads, &muon_cfg, &adam);
                 }
                 ctx.step += 1;
             }
 
+            // EMA shadow blend (CPU path only — under --gpu the live weights
+            // stay on-device between evals, so a CPU blend here would read
+            // stale params; GPU EMA needs an on-device blend kernel).
+            if let Some(ema) = ema_model.as_mut() {
+                #[cfg(feature = "gpu")]
+                let cpu_step = ctx.gpu_backend.is_none();
+                #[cfg(not(feature = "gpu"))]
+                let cpu_step = true;
+                if cpu_step {
+                    ema.ema_update(&ctx.model, ctx.cli.ema);
+                }
+            }
+
             let avg_loss = batch_loss / ctx.cli.batch_size as f32;
             total_nats += avg_loss * ctx.cli.seq_len as f32;
             total_tokens += ctx.cli.seq_len;
+
+            if let Some(gov) = governor.as_mut() {
+                let dt = step_t0.map_or(0.0, |t| t.elapsed().as_secs_f32());
+                let sample = StepSample {
+                    step: ctx.step,
+                    loss: avg_loss,
+                    grad_norm,
+                    dt_secs: dt,
+                    lr: adam.lr,
+                    muon_lr: muon_cfg.lr,
+                };
+                #[cfg(feature = "gpu")]
+                let events = if let Some(gpu) = ctx.gpu_backend.as_mut() {
+                    let mut backend = GpuTrialBackend {
+                        gpu,
+                        safe: &mut gov_gpu_safe,
+                        base: &mut gov_gpu_base,
+                        train_toks,
+                        probe_inputs: &gov_probe_in,
+                        probe_targets: &gov_probe_out,
+                        seq_len: ctx.cli.seq_len,
+                        comp: ctx.comp,
+                        base_muon_wd: ctx.cli.muon_wd,
+                        base_clip: ctx.cli.grad_clip,
+                        horizon: gov_horizon,
+                        rng: &mut gov_brng,
+                    };
+                    gov.end_step(sample, &mut backend)
+                } else {
+                    let mut backend = CpuTrialBackend {
+                        model: &mut ctx.model,
+                        safe: &mut gov_safe,
+                        train_toks,
+                        probe_inputs: &gov_probe_in,
+                        probe_targets: &gov_probe_out,
+                        seq_len: ctx.cli.seq_len,
+                        comp: ctx.comp,
+                        base_muon_wd: ctx.cli.muon_wd,
+                        base_clip: ctx.cli.grad_clip,
+                        horizon: gov_horizon,
+                        rng: &mut gov_brng,
+                    };
+                    gov.end_step(sample, &mut backend)
+                };
+                #[cfg(not(feature = "gpu"))]
+                let events = {
+                    let mut backend = CpuTrialBackend {
+                        model: &mut ctx.model,
+                        safe: &mut gov_safe,
+                        train_toks,
+                        probe_inputs: &gov_probe_in,
+                        probe_targets: &gov_probe_out,
+                        seq_len: ctx.cli.seq_len,
+                        comp: ctx.comp,
+                        base_muon_wd: ctx.cli.muon_wd,
+                        base_clip: ctx.cli.grad_clip,
+                        horizon: gov_horizon,
+                        rng: &mut gov_brng,
+                    };
+                    gov.end_step(sample, &mut backend)
+                };
+                for line in &events {
+                    if let Some(m) = metrics.as_mut() {
+                        m.raw(line);
+                    }
+                    println!("  ⚙ {line}");
+                }
+            }
 
             let bpb_running =
                 bits_per_byte(total_nats, (total_tokens as f32 * ctx.comp) as usize);
@@ -925,6 +1254,13 @@ fn run_training_loop(mut ctx: TrainCtx) {
             if (chunk_idx + 1).is_multiple_of(report_every) {
                 let bpb = bpb_running;
                 let elapsed = epoch_start.elapsed().as_secs_f64();
+                let win_steps = ctx.step.saturating_sub(last_report_step).max(1);
+                let win_s = (elapsed - last_report_elapsed).max(1e-9);
+                let ms_per_step = win_s * 1000.0 / win_steps as f64;
+                let tok_per_s =
+                    win_steps as f64 * (ctx.cli.batch_size * ctx.cli.seq_len) as f64 / win_s;
+                last_report_elapsed = elapsed;
+                last_report_step = ctx.step;
                 println!(
                     "  step {:>7}  chunk {:>5}/{:<5}  loss {:.3}  bpb {:.3}  lr {:.2e}  gn {:.2}  {:>6.1}s",
                     ctx.step,
@@ -937,7 +1273,10 @@ fn run_training_loop(mut ctx: TrainCtx) {
                     elapsed
                 );
                 if let Some(m) = metrics.as_mut() {
-                    m.step(epoch, ctx.step, avg_loss, bpb, lr_t, grad_norm, elapsed);
+                    m.step(
+                        epoch, ctx.step, avg_loss, bpb, lr_t, grad_norm, elapsed, ms_per_step,
+                        tok_per_s,
+                    );
                 }
             }
 
@@ -956,24 +1295,36 @@ fn run_training_loop(mut ctx: TrainCtx) {
 
         let train_bpb = bits_per_byte(total_nats, (total_tokens as f32 * ctx.comp) as usize);
         let eval_start = Instant::now();
+        // Evaluate the EMA shadow when active (CPU); else the live model.
+        let eval_model = ema_model.as_ref().unwrap_or(&ctx.model);
         #[cfg(feature = "gpu")]
         let val_bpb = if let Some(gpu) = ctx.gpu_backend.as_ref() {
-            evaluate_gpu(gpu, val_toks, ctx.cli.seq_len, ctx.comp)
+            evaluate_gpu(gpu, val_toks, ctx.cli.seq_len, ctx.comp, ctx.cli.eval_windows_cap)
         } else {
-            evaluate(&ctx.model, val_toks, ctx.cli.seq_len, ctx.comp)
+            evaluate(eval_model, val_toks, ctx.cli.seq_len, ctx.comp, ctx.cli.eval_windows_cap)
         };
         #[cfg(not(feature = "gpu"))]
-        let val_bpb = evaluate(&ctx.model, val_toks, ctx.cli.seq_len, ctx.comp);
+        let val_bpb = evaluate(eval_model, val_toks, ctx.cli.seq_len, ctx.comp, ctx.cli.eval_windows_cap);
         let eval_s = eval_start.elapsed().as_secs_f64();
+        if let Some(gov) = governor.as_mut() {
+            gov.set_val_gap(val_bpb - train_bpb);
+        }
         if val_bpb < best_val {
             best_val = val_bpb;
         }
         let epoch_elapsed = epoch_start.elapsed().as_secs_f64();
+        let steps_this_epoch = ctx.step.saturating_sub(step_at_epoch_start).max(1);
+        let train_s = (epoch_elapsed - eval_s).max(1e-9);
+        let ms_per_step = train_s * 1000.0 / steps_this_epoch as f64;
+        let tok_per_s =
+            steps_this_epoch as f64 * (ctx.cli.batch_size * ctx.cli.seq_len) as f64 / train_s;
         println!(
-            "  done   train bpb {train_bpb:.3}  val bpb {val_bpb:.3}  {epoch_elapsed:.1}s (eval {eval_s:.1}s)"
+            "  done   train bpb {train_bpb:.3}  val bpb {val_bpb:.3}  {epoch_elapsed:.1}s (eval {eval_s:.1}s)  {ms_per_step:.1}ms/step  {tok_per_s:.0}tok/s"
         );
         if let Some(m) = metrics.as_mut() {
-            m.epoch_done(epoch, train_bpb, val_bpb, epoch_elapsed, eval_s);
+            m.epoch_done(
+                epoch, train_bpb, val_bpb, epoch_elapsed, eval_s, ms_per_step, tok_per_s,
+            );
         }
 
         if let Err(e) = checkpoint::save(&ctx.cli.checkpoint, &ctx.model, epoch + 1, ctx.step) {
@@ -1006,6 +1357,10 @@ fn run_training_loop(mut ctx: TrainCtx) {
             println!("  max-steps {} reached — stopping", ctx.cli.max_steps);
             break;
         }
+    }
+
+    if let Some(gov) = governor.as_ref() {
+        gov.save_memory();
     }
 
     let total_elapsed = total_start.elapsed().as_secs_f64();
@@ -1196,15 +1551,34 @@ fn eval_windows(val_len: usize, seq_len: usize) -> (Vec<usize>, usize) {
     (starts, seq_len - stride)
 }
 
+/// Evenly subsample window starts to at most `cap` (0 = keep all). Keeps
+/// start 0 (the only window scored from position 0) and spreads the rest
+/// across the whole val split, so a capped eval still covers the full
+/// range at lower density. For A/B screening, not for final numbers.
+fn cap_windows(starts: Vec<usize>, cap: usize) -> Vec<usize> {
+    if cap == 0 || starts.len() <= cap {
+        return starts;
+    }
+    let step = starts.len() / cap;
+    starts.into_iter().step_by(step).take(cap).collect()
+}
+
 /// Compute val BPB by sliding a window of length `seq_len` over `val_toks`.
 /// Windows are scored in parallel (forward is `&self`); per-row scoring
 /// uses logsumexp directly — no per-position softmax allocation.
-fn evaluate(model: &DecoderTransformer, val_toks: &[u32], seq_len: usize, comp: f32) -> f32 {
+fn evaluate(
+    model: &DecoderTransformer,
+    val_toks: &[u32],
+    seq_len: usize,
+    comp: f32,
+    max_windows: usize,
+) -> f32 {
     use rayon::prelude::*;
     if val_toks.len() <= seq_len + 1 {
         return f32::INFINITY;
     }
     let (starts, scored_tail) = eval_windows(val_toks.len(), seq_len);
+    let starts = cap_windows(starts, max_windows);
     let v = model.config.vocab;
     let (total_nats, total_tokens) = starts
         .par_iter()
@@ -1239,11 +1613,13 @@ fn evaluate_gpu(
     val_toks: &[u32],
     seq_len: usize,
     comp: f32,
+    max_windows: usize,
 ) -> f32 {
     if val_toks.len() <= seq_len + 1 {
         return f32::INFINITY;
     }
     let (starts, scored_tail) = eval_windows(val_toks.len(), seq_len);
+    let starts = cap_windows(starts, max_windows);
     let mut total_nats = 0.0_f32;
     let mut total_tokens = 0_usize;
     for (ci, chunk) in starts.chunks(gpu.max_batch).enumerate() {
@@ -1261,6 +1637,147 @@ fn evaluate_gpu(
         }
     }
     bits_per_byte(total_nats, (total_tokens as f32 * comp) as usize)
+}
+
+/// On-device PHAGE trial backend. Reflex rollback and the paired rollout
+/// run entirely on the GPU via device snapshot/restore (no host readback),
+/// so trials keep pace with --gpu training.
+#[cfg(feature = "gpu")]
+struct GpuTrialBackend<'a> {
+    gpu: &'a mut DecoderTransformerGpu,
+    safe: &'a mut Option<GpuStateSnapshot>,
+    base: &'a mut Option<GpuStateSnapshot>,
+    train_toks: &'a [u32],
+    probe_inputs: &'a [Vec<u32>],
+    probe_targets: &'a [Vec<u32>],
+    seq_len: usize,
+    comp: f32,
+    base_muon_wd: f32,
+    base_clip: f32,
+    horizon: usize,
+    rng: &'a mut StdRng,
+}
+
+#[cfg(feature = "gpu")]
+impl aurora::governor::TrialBackend for GpuTrialBackend<'_> {
+    fn snapshot_safe(&mut self) {
+        match self.safe.as_mut() {
+            Some(s) => self.gpu.refresh_state(s),
+            None => *self.safe = Some(self.gpu.snapshot_state()),
+        }
+    }
+
+    fn restore_safe(&mut self) {
+        if let Some(s) = self.safe.as_ref() {
+            self.gpu.restore_state(s);
+        }
+    }
+
+    fn paired_diff(
+        &mut self,
+        control: &aurora::governor::MathState,
+        treatment: &aurora::governor::MathState,
+        sched_lr: f32,
+        sched_muon_lr: f32,
+    ) -> f32 {
+        // Snapshot current weights once; both arms roll from it, restored
+        // between and after so the live trajectory is untouched.
+        match self.base.as_mut() {
+            Some(s) => self.gpu.refresh_state(s),
+            None => *self.base = Some(self.gpu.snapshot_state()),
+        }
+        // Both arms must roll over the SAME minibatch draws so the paired
+        // difference cancels batch noise (the CPU backend shares one
+        // `starts` vector). Replay the rng from the same state for treatment.
+        let rng_at_arm_start = self.rng.clone();
+        let bpb_c = gpu_rollout_and_probe(
+            self.gpu, self.train_toks, self.rng, self.horizon, self.seq_len, self.comp,
+            self.probe_inputs, self.probe_targets, self.base_muon_wd, self.base_clip, control,
+            sched_lr, sched_muon_lr,
+        );
+        self.gpu.restore_state(self.base.as_ref().unwrap());
+        *self.rng = rng_at_arm_start;
+        let bpb_t = gpu_rollout_and_probe(
+            self.gpu, self.train_toks, self.rng, self.horizon, self.seq_len, self.comp,
+            self.probe_inputs, self.probe_targets, self.base_muon_wd, self.base_clip, treatment,
+            sched_lr, sched_muon_lr,
+        );
+        self.gpu.restore_state(self.base.as_ref().unwrap());
+        bpb_c - bpb_t
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_rollout_and_probe(
+    gpu: &mut DecoderTransformerGpu,
+    train_toks: &[u32],
+    rng: &mut StdRng,
+    horizon: usize,
+    seq_len: usize,
+    comp: f32,
+    probe_inputs: &[Vec<u32>],
+    probe_targets: &[Vec<u32>],
+    base_muon_wd: f32,
+    base_clip: f32,
+    msv: &aurora::governor::MathState,
+    sched_lr: f32,
+    sched_muon_lr: f32,
+) -> f32 {
+    use rand::Rng;
+    let max_start = train_toks.len().saturating_sub(seq_len + 1);
+    if max_start == 0 {
+        return 0.0;
+    }
+    for _ in 0..horizon {
+        let p = rng.random_range(0..max_start);
+        let input = &train_toks[p..p + seq_len];
+        let target = &train_toks[p + 1..p + seq_len + 1];
+        let mut adam = AdamWConfig { lr: sched_lr, ..AdamWConfig::default() };
+        let mut muon = MuonConfig {
+            lr: sched_muon_lr,
+            weight_decay: base_muon_wd,
+            ..MuonConfig::default()
+        };
+        let clip = msv.apply_optim(&mut adam, &mut muon, base_clip);
+        gpu.zero_grad();
+        gpu.train_step_batch(&[input], &[target]);
+        gpu.clip_grads_adamw_subset(clip, false);
+        gpu.step_muon_hybrid(&muon, &adam);
+    }
+    gpu_probe_bpb(gpu, probe_inputs, probe_targets, seq_len, comp)
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_probe_bpb(
+    gpu: &DecoderTransformerGpu,
+    inputs: &[Vec<u32>],
+    targets: &[Vec<u32>],
+    seq_len: usize,
+    comp: f32,
+) -> f32 {
+    if inputs.is_empty() {
+        return 0.0;
+    }
+    let scored_from = seq_len.saturating_sub(seq_len / 2).min(seq_len.saturating_sub(1));
+    let cap = gpu.max_batch.max(1);
+    let mut nats = 0.0_f32;
+    let mut tokens = 0usize;
+    let mut i = 0;
+    while i < inputs.len() {
+        let end = (i + cap).min(inputs.len());
+        let inp: Vec<&[u32]> = inputs[i..end].iter().map(Vec::as_slice).collect();
+        let tgt: Vec<&[u32]> = targets[i..end].iter().map(Vec::as_slice).collect();
+        let nlls = gpu.eval_step_batch(&inp, &tgt);
+        for wi in 0..(end - i) {
+            nats += nlls[wi * seq_len + scored_from..(wi + 1) * seq_len]
+                .iter()
+                .sum::<f32>();
+            tokens += seq_len - scored_from;
+        }
+        i = end;
+    }
+    bits_per_byte(nats, (tokens as f32 * comp) as usize)
 }
 
 fn generate(
@@ -1380,6 +1897,12 @@ impl MetricsWriter {
         let _ = self.inner.flush();
     }
 
+    fn raw(&mut self, line: &str) {
+        let _ = self.inner.write_all(line.as_bytes());
+        let _ = self.inner.write_all(b"\n");
+        self.flush();
+    }
+
     fn run_meta(
         &mut self,
         cli: &Cli,
@@ -1410,19 +1933,21 @@ impl MetricsWriter {
         self.flush();
     }
 
-    fn step(&mut self, epoch: u32, step: u64, loss: f32, bpb: f32, lr: f32, grad_norm: f32, elapsed_s: f64) {
+    #[allow(clippy::too_many_arguments)]
+    fn step(&mut self, epoch: u32, step: u64, loss: f32, bpb: f32, lr: f32, grad_norm: f32, elapsed_s: f64, ms_per_step: f64, tok_per_s: f64) {
         let line = format!(
-            "{{\"event\":\"step\",\"epoch\":{epoch},\"step\":{step},\"loss\":{},\"bpb\":{},\"lr\":{:.6e},\"grad_norm\":{},\"elapsed_s\":{:.3}}}\n",
-            json_f32(loss), json_f32(bpb), lr, json_f32(grad_norm), elapsed_s
+            "{{\"event\":\"step\",\"epoch\":{epoch},\"step\":{step},\"loss\":{},\"bpb\":{},\"lr\":{:.6e},\"grad_norm\":{},\"elapsed_s\":{:.3},\"ms_per_step\":{:.3},\"tok_per_s\":{:.1}}}\n",
+            json_f32(loss), json_f32(bpb), lr, json_f32(grad_norm), elapsed_s, ms_per_step, tok_per_s
         );
         let _ = self.inner.write_all(line.as_bytes());
         self.flush();
     }
 
-    fn epoch_done(&mut self, epoch: u32, train_bpb: f32, val_bpb: f32, elapsed_s: f64, eval_s: f64) {
+    #[allow(clippy::too_many_arguments)]
+    fn epoch_done(&mut self, epoch: u32, train_bpb: f32, val_bpb: f32, elapsed_s: f64, eval_s: f64, ms_per_step: f64, tok_per_s: f64) {
         let line = format!(
-            "{{\"event\":\"epoch_done\",\"epoch\":{epoch},\"train_bpb\":{},\"val_bpb\":{},\"elapsed_s\":{:.3},\"eval_s\":{:.3}}}\n",
-            json_f32(train_bpb), json_f32(val_bpb), elapsed_s, eval_s
+            "{{\"event\":\"epoch_done\",\"epoch\":{epoch},\"train_bpb\":{},\"val_bpb\":{},\"elapsed_s\":{:.3},\"eval_s\":{:.3},\"ms_per_step\":{:.3},\"tok_per_s\":{:.1}}}\n",
+            json_f32(train_bpb), json_f32(val_bpb), elapsed_s, eval_s, ms_per_step, tok_per_s
         );
         let _ = self.inner.write_all(line.as_bytes());
         self.flush();

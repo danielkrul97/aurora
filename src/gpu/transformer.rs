@@ -14,7 +14,8 @@
 use super::buffers::GpuBuffer;
 use super::kv_cache::{KvCacheGpu, MhaKvCacheKernel, SingleTokenEmbedKernel};
 use super::{
-    AdamWKernel, CausalMhaBackwardKernel, CausalMhaForwardKernel, EmbedScatterAddKernel,
+    AdamWKernel, CanonDwKernel, CanonDxKernel, CanonForwardKernel, CausalMhaBackwardKernel,
+    CausalMhaForwardKernel, EmbedScatterAddKernel,
     EmbedScatterReduceKernel, GeluBackwardKernel, GeluKernel, GemmKernel, GemmTransposeBKernel,
     GpuContext, GradNormFinalizeKernel, GradNormSqReduceKernel, LayerNormBackwardKernel,
     LayerNormForwardKernel, MuonApplyKernel, MuonCombineBKernel, MuonFrobInvKernel,
@@ -71,6 +72,9 @@ pub struct DecoderTransformerGpu {
     pub qknorm_bwd: QkNormBackwardKernel,
     pub softcap_fwd: SoftcapKernel,
     pub softcap_bwd: SoftcapBackwardKernel,
+    pub canon_fwd: CanonForwardKernel,
+    pub canon_dx: CanonDxKernel,
+    pub canon_dw: CanonDwKernel,
 
     // Pure-GPU clip_grads scratch:
     //   gn_partials_flat — concatenated per-tensor partial sums of squares
@@ -144,6 +148,9 @@ pub(crate) struct LayerForwardOps {
     pub gelu: wgpu::BindGroup,
     pub gemm_proj: wgpu::BindGroup,
     pub vadd_z: wgpu::BindGroup,
+    /// Canon conv `x → canon_out` (None when canon off). ln1 + post_attn
+    /// residual read canon_out instead of the raw block input.
+    pub canon_fwd: Option<wgpu::BindGroup>,
 }
 
 pub(crate) struct BackwardOps {
@@ -193,6 +200,10 @@ pub(crate) struct LayerBackwardOps {
     pub outer_g_v: wgpu::BindGroup,
     pub ln1_bwd: wgpu::BindGroup,
     pub vadd_dx: wgpu::BindGroup,
+    /// Canon backward (None when off): `vadd_dx` writes `canon_din`, then
+    /// canon_dw accumulates g_canon_w and canon_dx maps canon_din → dx.
+    pub canon_dw: Option<wgpu::BindGroup>,
+    pub canon_dx: Option<wgpu::BindGroup>,
 }
 
 pub(crate) struct GradOps {
@@ -231,6 +242,8 @@ pub(crate) struct LayerCache {
     pub ln2_inv: GpuBuffer,
     pub h_pre: GpuBuffer,
     pub h_post: GpuBuffer,
+    /// Canon-mixed block input `x + dwconv(x)` (1-elem dummy when off).
+    pub canon_out: GpuBuffer,
 }
 
 /// All activation buffers used by `train_step`, allocated once at
@@ -281,6 +294,9 @@ pub(crate) struct Activations {
     pub d_x_mha: GpuBuffer,
     pub dx: GpuBuffer,
     pub d_w_tok_per_pos: GpuBuffer,
+    /// Canon backward scratch: d w.r.t. the canon-mixed input (1-elem
+    /// dummy when canon off). canon_dx then maps it to `dx`.
+    pub canon_din: GpuBuffer,
 }
 
 impl Activations {
@@ -299,6 +315,7 @@ impl Activations {
         let bt = max_batch.max(1) * t;
 
         let qk_raw_len = if cfg.qk_norm { td } else { 1 };
+        let canon_len = if cfg.canon_kernel > 0 { td } else { 1 };
         let layers: Vec<LayerCache> = (0..cfg.n_layer)
             .map(|_| LayerCache {
                 ln1_out: GpuBuffer::empty(ctx, "ln1_out", td),
@@ -316,6 +333,7 @@ impl Activations {
                 ln2_inv: GpuBuffer::empty(ctx, "ln2_inv", t),
                 h_pre: GpuBuffer::empty(ctx, "h_pre", td_ff),
                 h_post: GpuBuffer::empty(ctx, "h_post", td_ff),
+                canon_out: GpuBuffer::empty(ctx, "canon_out", canon_len),
             })
             .collect();
         let z_chain: Vec<GpuBuffer> = (0..cfg.n_layer)
@@ -360,8 +378,18 @@ impl Activations {
             d_x_mha: GpuBuffer::empty(ctx, "d_x_mha", td),
             dx: GpuBuffer::empty(ctx, "dx_blk", td),
             d_w_tok_per_pos: GpuBuffer::empty(ctx, "dwt_pr", td),
+            canon_din: GpuBuffer::empty(ctx, "canon_din", canon_len),
         }
     }
+}
+
+/// Device-side snapshot of all persistent model state (weights + AdamW
+/// moments + Muon momentum), captured on-device for the PHAGE governor's
+/// reflex rollback and paired-rollout trials. Buffer order mirrors
+/// `DecoderTransformerGpu::state_buffers`.
+pub struct GpuStateSnapshot {
+    bufs: Vec<GpuBuffer>,
+    step: u64,
 }
 
 pub struct GpuParams {
@@ -402,6 +430,8 @@ pub struct GpuBlock {
     pub ln2_beta: GpuBuffer,
     pub w_fc: GpuBuffer,
     pub w_proj: GpuBuffer,
+    /// Canon conv taps `[d_model * canon_k]` (1-elem dummy when off).
+    pub canon_w: GpuBuffer,
 
     pub g_ln1_gamma: GpuBuffer,
     pub g_ln1_beta: GpuBuffer,
@@ -413,6 +443,7 @@ pub struct GpuBlock {
     pub g_ln2_beta: GpuBuffer,
     pub g_w_fc: GpuBuffer,
     pub g_w_proj: GpuBuffer,
+    pub g_canon_w: GpuBuffer,
 
     pub m1: BlockAdamMoments,
     pub m2: BlockAdamMoments,
@@ -430,6 +461,7 @@ pub struct BlockAdamMoments {
     pub ln2_beta: GpuBuffer,
     pub w_fc: GpuBuffer,
     pub w_proj: GpuBuffer,
+    pub canon_w: GpuBuffer,
 }
 
 /// Muon momentum buffers per block — only for the 6 matrix params.
@@ -501,6 +533,7 @@ fn build_forward_ops(
     rope: &RopeKernel,
     qknorm_fwd: &QkNormKernel,
     softcap_fwd: &SoftcapKernel,
+    canon_fwd: &CanonForwardKernel,
 ) -> ForwardOps {
     let embed = embed_fwd.build_bind(ctx, &a.tok_buf, &p.w_tok, &p.w_pos, &a.h0);
     let layers: Vec<LayerForwardOps> = (0..cfg.n_layer)
@@ -508,6 +541,9 @@ fn build_forward_ops(
             let blk = &p.blocks[li];
             let lc = &a.layers[li];
             let x = if li == 0 { &a.h0 } else { &a.z_chain[li - 1] };
+            // Canon mixes the block input first; ln1 + the post-attn
+            // residual then read canon_out instead of the raw input.
+            let canon_x = if cfg.canon_kernel > 0 { &lc.canon_out } else { x };
             // With qk-norm the QKV gemms write into q_raw/k_raw and the
             // norm produces q/k; without it they write q/k directly.
             let (q_dst, k_dst) = if cfg.qk_norm {
@@ -517,7 +553,7 @@ fn build_forward_ops(
             };
             LayerForwardOps {
                 ln1: ln_fwd.build_bind(
-                    ctx, x, &blk.ln1_gamma, &blk.ln1_beta, &lc.ln1_out, &a.ln1_mean,
+                    ctx, canon_x, &blk.ln1_gamma, &blk.ln1_beta, &lc.ln1_out, &a.ln1_mean,
                     &lc.ln1_inv, &lc.ln1_xhat,
                 ),
                 gemm_q: gemm_t.build_bind(ctx, &lc.ln1_out, &blk.w_q, q_dst),
@@ -533,7 +569,7 @@ fn build_forward_ops(
                 rope_k: rope.build_bind(ctx, &lc.k),
                 mha: mha_fwd.build_bind(ctx, &lc.q, &lc.k, &lc.v, &lc.heads_out, &lc.head_probs),
                 gemm_o: gemm_t.build_bind(ctx, &lc.heads_out, &blk.w_o, &a.mha_out),
-                vadd_post_attn: vadd.build_bind(ctx, x, &a.mha_out, &a.post_attn),
+                vadd_post_attn: vadd.build_bind(ctx, canon_x, &a.mha_out, &a.post_attn),
                 ln2: ln_fwd.build_bind(
                     ctx, &a.post_attn, &blk.ln2_gamma, &blk.ln2_beta, &lc.ln2_out, &a.ln2_mean,
                     &lc.ln2_inv, &lc.ln2_xhat,
@@ -542,6 +578,8 @@ fn build_forward_ops(
                 gelu: gelu_fwd.build_bind(ctx, &lc.h_pre, &lc.h_post),
                 gemm_proj: gemm_t.build_bind(ctx, &lc.h_post, &blk.w_proj, &a.ffn_out),
                 vadd_z: vadd.build_bind(ctx, &a.post_attn, &a.ffn_out, &a.z_chain[li]),
+                canon_fwd: (cfg.canon_kernel > 0)
+                    .then(|| canon_fwd.build_bind(ctx, x, &blk.canon_w, &lc.canon_out)),
             }
         })
         .collect();
@@ -573,6 +611,8 @@ fn build_backward_ops(
     rope: &RopeKernel,
     qknorm_bwd: &QkNormBackwardKernel,
     softcap_bwd: &SoftcapBackwardKernel,
+    canon_dx: &CanonDxKernel,
+    canon_dw: &CanonDwKernel,
 ) -> BackwardOps {
     let head_w = p.w_head.as_ref().unwrap_or(&p.w_tok);
     let g_head = p.g_w_head.as_ref().unwrap_or(&p.g_w_tok);
@@ -591,6 +631,11 @@ fn build_backward_ops(
             // d_z is d_pre_final only for the LAST backward iteration
             // (which is li = n-1 since we iterate in reverse).
             let d_z = if li == n - 1 { &a.d_pre_final } else { &a.dx };
+            let x_in = if li == 0 { &a.h0 } else { &a.z_chain[li - 1] };
+            // With canon, vadd_dx writes canon_din (= d w.r.t. the canon-
+            // mixed input); canon backward then maps it to dx (d w.r.t. the
+            // raw block input) and accumulates g_canon_w.
+            let dx_target = if cfg.canon_kernel > 0 { &a.canon_din } else { &a.dx };
             LayerBackwardOps {
                 gemm_d_h_post: gemm.build_bind(ctx, d_z, &blk.w_proj, &a.d_h_post),
                 outer_g_proj: outer_accum.build_bind(ctx, &lc.h_post, d_z, &blk.g_w_proj),
@@ -633,7 +678,11 @@ fn build_backward_ops(
                     ctx, &a.d_ln1_out, &blk.ln1_gamma, &lc.ln1_xhat, &lc.ln1_inv,
                     &a.d_x_mha, &blk.g_ln1_gamma, &blk.g_ln1_beta,
                 ),
-                vadd_dx: vadd.build_bind(ctx, &a.d_post_attn, &a.d_x_mha, &a.dx),
+                vadd_dx: vadd.build_bind(ctx, &a.d_post_attn, &a.d_x_mha, dx_target),
+                canon_dw: (cfg.canon_kernel > 0)
+                    .then(|| canon_dw.build_bind(ctx, &a.canon_din, x_in, &blk.g_canon_w)),
+                canon_dx: (cfg.canon_kernel > 0)
+                    .then(|| canon_dx.build_bind(ctx, &a.canon_din, &blk.canon_w, &a.dx)),
             }
         })
         .collect();
@@ -716,6 +765,11 @@ fn build_grad_ops(
         push(&blk.ln2_beta, &blk.g_ln2_beta, &blk.m1.ln2_beta, &blk.m2.ln2_beta, d as u32, false, false);
         push(&blk.w_fc, &blk.g_w_fc, &blk.m1.w_fc, &blk.m2.w_fc, (d * d_ff) as u32, true, true);
         push(&blk.w_proj, &blk.g_w_proj, &blk.m1.w_proj, &blk.m2.w_proj, (d * d_ff) as u32, true, true);
+        if cfg.canon_kernel > 0 {
+            // Canon taps: AdamW-managed (1D), no decay, not a Muon matrix.
+            push(&blk.canon_w, &blk.g_canon_w, &blk.m1.canon_w, &blk.m2.canon_w,
+                 (d * cfg.canon_kernel) as u32, false, false);
+        }
     }
     ops
 }
@@ -810,6 +864,8 @@ fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) ->
     let zeros_d = || GpuBuffer::zeros(ctx, "z", d);
     let zeros_dd = || GpuBuffer::zeros(ctx, "z", d * d);
     let zeros_dff = || GpuBuffer::zeros(ctx, "z", d * d_ff);
+    let cw = (cpu.canon_k * d).max(1);
+    let zeros_canon = || GpuBuffer::zeros(ctx, "z", cw);
     let m1 = BlockAdamMoments {
         ln1_gamma: zeros_d(),
         ln1_beta: zeros_d(),
@@ -821,6 +877,7 @@ fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) ->
         ln2_beta: zeros_d(),
         w_fc: zeros_dff(),
         w_proj: zeros_dff(),
+        canon_w: zeros_canon(),
     };
     let m2 = BlockAdamMoments {
         ln1_gamma: zeros_d(),
@@ -833,6 +890,7 @@ fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) ->
         ln2_beta: zeros_d(),
         w_fc: zeros_dff(),
         w_proj: zeros_dff(),
+        canon_w: zeros_canon(),
     };
     let mu = BlockMuonMoments {
         w_q: zeros_dd(),
@@ -853,6 +911,11 @@ fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) ->
         ln2_beta: GpuBuffer::from_slice(ctx, "ln2_b", &cpu.ln2.beta),
         w_fc: GpuBuffer::from_slice(ctx, "wfc", &cpu.ffn.w_fc.w),
         w_proj: GpuBuffer::from_slice(ctx, "wp", &cpu.ffn.w_proj.w),
+        canon_w: if cpu.canon_k > 0 {
+            GpuBuffer::from_slice(ctx, "canon", &cpu.canon_w)
+        } else {
+            GpuBuffer::zeros(ctx, "canon", 1)
+        },
         g_ln1_gamma: zeros_d(),
         g_ln1_beta: zeros_d(),
         g_w_q: zeros_dd(),
@@ -863,6 +926,7 @@ fn upload_block(ctx: &GpuContext, cpu: &crate::transformer::TransformerBlock) ->
         g_ln2_beta: zeros_d(),
         g_w_fc: zeros_dff(),
         g_w_proj: zeros_dff(),
+        g_canon_w: zeros_canon(),
         m1,
         m2,
         mu,
@@ -955,6 +1019,9 @@ impl DecoderTransformerGpu {
         let qknorm_bwd = QkNormBackwardKernel::new(&ctx);
         let softcap_fwd = SoftcapKernel::new(&ctx);
         let softcap_bwd = SoftcapBackwardKernel::new(&ctx);
+        let canon_fwd = CanonForwardKernel::new(&ctx);
+        let canon_dx = CanonDxKernel::new(&ctx);
+        let canon_dw = CanonDwKernel::new(&ctx);
 
         let grad_ops =
             build_grad_ops(&ctx, &p, &cfg, &zerob, &adamw, &gn_sq, &scaleb_buf,
@@ -971,13 +1038,13 @@ impl DecoderTransformerGpu {
         let fwd_ops = build_forward_ops(
             &ctx, &p, &acts, &cfg,
             &embed_fwd, &ln_fwd, &gemm_t, &mha_fwd, &gelu_fwd, &vadd, &rope,
-            &qknorm_fwd, &softcap_fwd,
+            &qknorm_fwd, &softcap_fwd, &canon_fwd,
         );
         let bwd_ops = build_backward_ops(
             &ctx, &p, &acts, &cfg,
             &gemm, &ln_bwd, &mha_bwd, &gelu_bwd, &vadd, &outer_accum,
             &embed_bwd, &embed_scatter_reduce, &zerob, &rope,
-            &qknorm_bwd, &softcap_bwd,
+            &qknorm_bwd, &softcap_bwd, &canon_dx, &canon_dw,
         );
 
         Self {
@@ -1014,6 +1081,9 @@ impl DecoderTransformerGpu {
             qknorm_bwd,
             softcap_fwd,
             softcap_bwd,
+            canon_fwd,
+            canon_dx,
+            canon_dw,
             gn_partials_flat,
             gn_result,
             ctx,
@@ -1057,9 +1127,105 @@ impl DecoderTransformerGpu {
             blk.ln2.beta = gb.ln2_beta.download(&self.ctx);
             blk.ffn.w_fc.w = gb.w_fc.download(&self.ctx);
             blk.ffn.w_proj.w = gb.w_proj.download(&self.ctx);
+            if self.config.canon_kernel > 0 {
+                blk.canon_w = gb.canon_w.download(&self.ctx);
+            }
         }
         cpu.step = self.step;
         cpu
+    }
+
+    /// Ordered list of all persistent state buffers — weights + AdamW
+    /// moments + Muon momentum (gradients are excluded; they are recomputed
+    /// each step). `snapshot`/`restore` walk this in the same order, so the
+    /// pairing is stable as long as it comes from the same model.
+    fn state_buffers(&self) -> Vec<&GpuBuffer> {
+        let p = &self.p;
+        let mut v: Vec<&GpuBuffer> = Vec::with_capacity(14 + p.blocks.len() * 36);
+        v.push(&p.w_tok);
+        v.push(&p.w_pos);
+        if let Some(b) = &p.w_head {
+            v.push(b);
+        }
+        v.push(&p.final_gamma);
+        v.push(&p.final_beta);
+        v.push(&p.m1_w_tok);
+        v.push(&p.m2_w_tok);
+        v.push(&p.m1_w_pos);
+        v.push(&p.m2_w_pos);
+        if let Some(b) = &p.m1_w_head {
+            v.push(b);
+        }
+        if let Some(b) = &p.m2_w_head {
+            v.push(b);
+        }
+        v.push(&p.m1_final_gamma);
+        v.push(&p.m2_final_gamma);
+        v.push(&p.m1_final_beta);
+        v.push(&p.m2_final_beta);
+        for blk in &p.blocks {
+            for b in [
+                &blk.ln1_gamma, &blk.ln1_beta, &blk.w_q, &blk.w_k, &blk.w_v, &blk.w_o,
+                &blk.ln2_gamma, &blk.ln2_beta, &blk.w_fc, &blk.w_proj,
+                &blk.m1.ln1_gamma, &blk.m1.ln1_beta, &blk.m1.w_q, &blk.m1.w_k, &blk.m1.w_v,
+                &blk.m1.w_o, &blk.m1.ln2_gamma, &blk.m1.ln2_beta, &blk.m1.w_fc, &blk.m1.w_proj,
+                &blk.m2.ln1_gamma, &blk.m2.ln1_beta, &blk.m2.w_q, &blk.m2.w_k, &blk.m2.w_v,
+                &blk.m2.w_o, &blk.m2.ln2_gamma, &blk.m2.ln2_beta, &blk.m2.w_fc, &blk.m2.w_proj,
+                &blk.mu.w_q, &blk.mu.w_k, &blk.mu.w_v, &blk.mu.w_o, &blk.mu.w_fc, &blk.mu.w_proj,
+                &blk.canon_w, &blk.m1.canon_w, &blk.m2.canon_w,
+            ] {
+                v.push(b);
+            }
+        }
+        v
+    }
+
+    fn copy_state(&self, dst: &[GpuBuffer], src: &[&GpuBuffer], label: &str) {
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        for (d, s) in dst.iter().zip(src) {
+            enc.copy_buffer_to_buffer(&s.inner, 0, &d.inner, 0, (s.len * 4) as u64);
+        }
+        self.ctx.queue.submit(Some(enc.finish()));
+    }
+
+    /// Capture all persistent state into fresh device buffers (one
+    /// buffer-to-buffer copy each — stays on-device, no host readback).
+    /// For the PHAGE governor's reflex rollback and paired-rollout trials.
+    pub fn snapshot_state(&self) -> GpuStateSnapshot {
+        let live = self.state_buffers();
+        let bufs: Vec<GpuBuffer> = live
+            .iter()
+            .map(|b| GpuBuffer::empty(&self.ctx, "phage snapshot", b.len))
+            .collect();
+        self.copy_state(&bufs, &live, "phage snapshot");
+        GpuStateSnapshot { bufs, step: self.step }
+    }
+
+    /// Re-capture current state into an existing snapshot — no allocation.
+    pub fn refresh_state(&self, snap: &mut GpuStateSnapshot) {
+        let live = self.state_buffers();
+        self.copy_state(&snap.bufs, &live, "phage refresh");
+        snap.step = self.step;
+    }
+
+    /// Restore weights + optimizer state from a snapshot.
+    pub fn restore_state(&mut self, snap: &GpuStateSnapshot) {
+        {
+            let mut enc = self
+                .ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("phage restore"),
+                });
+            for (live, backup) in self.state_buffers().iter().zip(&snap.bufs) {
+                enc.copy_buffer_to_buffer(&backup.inner, 0, &live.inner, 0, (backup.len * 4) as u64);
+            }
+            self.ctx.queue.submit(Some(enc.finish()));
+        }
+        self.step = snap.step;
     }
 
     /// Zero all gradient buffers. One compute pass, cached bind groups.
@@ -1194,6 +1360,16 @@ impl DecoderTransformerGpu {
 
         for li in 0..cfg.n_layer {
             let fop = &self.fwd_ops.layers[li];
+
+            // Canon: canon_out = x + dwconv(x). ln1 + the post-attn residual
+            // read canon_out (wired into their bind groups in build_forward_ops).
+            if let Some(cf) = &fop.canon_fwd {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("canon fwd"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.canon_fwd.pipeline);
+                self.canon_fwd.dispatch_with_bind(&mut pass, cf, t_u, d_u, cfg.canon_kernel as u32);
+            }
 
             // ln1
             {
@@ -1652,6 +1828,7 @@ impl DecoderTransformerGpu {
         let d_ff_u = d_ff as u32;
         let td = (t * d) as u32;
         let td_ff = (t * d_ff) as u32;
+        let k_u = self.config.canon_kernel as u32;
 
         // FFN backward chain. gemm + outer_accum share `d_z` (read-only)
         // and write disjoint outputs — safe in one pass.
@@ -1802,6 +1979,17 @@ impl DecoderTransformerGpu {
             });
             pass.set_pipeline(&self.vadd.pipeline);
             self.vadd.dispatch_with_bind(&mut pass, &bop.vadd_dx, td);
+        }
+        // Canon backward: vadd_dx wrote canon_din (d w.r.t. canon-mixed
+        // input); accumulate g_canon_w (dw) and map canon_din → dx (dx).
+        if let (Some(dw), Some(dx)) = (&bop.canon_dw, &bop.canon_dx) {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("canon bwd"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.canon_dw.pipeline);
+            self.canon_dw.dispatch_with_bind(&mut pass, dw, t_u, d_u, k_u);
+            pass.set_pipeline(&self.canon_dx.pipeline);
+            self.canon_dx.dispatch_with_bind(&mut pass, dx, t_u, d_u, k_u);
         }
     }
 

@@ -38,6 +38,11 @@ pub struct MhaWeights {
     /// Parameter-free RMS norm of each per-head Q/K row after
     /// projection, before RoPE.
     pub qk_norm: bool,
+    /// Differential attention (DIFF Transformer): two softmax maps from
+    /// the two halves of Q/K, combined as `A1 − λ·A2` applied to V.
+    /// `lambda` is one learned scalar per head; empty when off.
+    pub diff_attn: bool,
+    pub lambda: Vec<f32>,
 }
 
 impl MhaWeights {
@@ -57,6 +62,8 @@ impl MhaWeights {
             d_model,
             rope: false,
             qk_norm: false,
+            diff_attn: false,
+            lambda: Vec::new(),
         }
     }
 }
@@ -67,6 +74,8 @@ pub struct MhaGrads {
     pub d_w_k: LinearGrads,
     pub d_w_v: LinearGrads,
     pub d_w_o: LinearGrads,
+    /// Per-head diff-attention λ grad; empty when diff_attn is off.
+    pub d_lambda: Vec<f32>,
 }
 
 impl MhaGrads {
@@ -77,6 +86,7 @@ impl MhaGrads {
             d_w_k: LinearGrads::zeros(d_model, d_model),
             d_w_v: LinearGrads::zeros(d_model, d_model),
             d_w_o: LinearGrads::zeros(d_model, d_model),
+            d_lambda: Vec::new(),
         }
     }
 
@@ -85,6 +95,7 @@ impl MhaGrads {
         self.d_w_k.zero();
         self.d_w_v.zero();
         self.d_w_o.zero();
+        self.d_lambda.fill(0.0);
     }
 }
 
@@ -98,6 +109,10 @@ pub struct MhaCache {
     pub q_raw: Vec<f32>,
     pub k_raw: Vec<f32>,
     pub heads_out: Vec<f32>,
+    /// Second-map attention output `[T * D]` (diff_attn only), kept for
+    /// the λ gradient. Empty otherwise. With diff_attn, `attn_caches`
+    /// holds two caches per head (map 1 then map 2).
+    pub out2: Vec<f32>,
     pub attn_caches: Vec<AttentionCache>,
 }
 
@@ -127,7 +142,9 @@ pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
     }
 
     let mut heads_out = vec![0.0_f32; t * d];
-    let mut attn_caches = Vec::with_capacity(n_head);
+    let mut out2_full = if w.diff_attn { vec![0.0_f32; t * d] } else { Vec::new() };
+    let caches_per_head = if w.diff_attn { 2 } else { 1 };
+    let mut attn_caches = Vec::with_capacity(n_head * caches_per_head);
     // Per-head scratch reused across heads (every element is overwritten
     // by the gather loop below).
     let mut q_h = vec![0.0_f32; t * d_head];
@@ -141,15 +158,46 @@ pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
             k_h[dst_off..dst_off + d_head].copy_from_slice(&k[src_off..src_off + d_head]);
             v_h[dst_off..dst_off + d_head].copy_from_slice(&v[src_off..src_off + d_head]);
         }
-        let (out_h, cache_h) =
-            scaled_dot_product_attention(&q_h, &k_h, &v_h, d_head, d_head, true);
-        for ti in 0..t {
-            let dst_off = ti * d + h * d_head;
-            let src_off = ti * d_head;
-            heads_out[dst_off..dst_off + d_head]
-                .copy_from_slice(&out_h[src_off..src_off + d_head]);
+        if w.diff_attn {
+            // Two softmax maps from the two halves of Q/K (shared V), then
+            // out = A1·V − λ·A2·V = SDPA1 − λ·SDPA2 (distributes over V).
+            let half = d_head / 2;
+            let mut q1 = vec![0.0_f32; t * half];
+            let mut q2 = vec![0.0_f32; t * half];
+            let mut k1 = vec![0.0_f32; t * half];
+            let mut k2 = vec![0.0_f32; t * half];
+            for ti in 0..t {
+                for c in 0..half {
+                    q1[ti * half + c] = q_h[ti * d_head + c];
+                    q2[ti * half + c] = q_h[ti * d_head + half + c];
+                    k1[ti * half + c] = k_h[ti * d_head + c];
+                    k2[ti * half + c] = k_h[ti * d_head + half + c];
+                }
+            }
+            let (out1, cache1) = scaled_dot_product_attention(&q1, &k1, &v_h, half, d_head, true);
+            let (out2, cache2) = scaled_dot_product_attention(&q2, &k2, &v_h, half, d_head, true);
+            let lam = w.lambda[h];
+            for ti in 0..t {
+                let dst_off = ti * d + h * d_head;
+                let src_off = ti * d_head;
+                for c in 0..d_head {
+                    heads_out[dst_off + c] = out1[src_off + c] - lam * out2[src_off + c];
+                    out2_full[dst_off + c] = out2[src_off + c];
+                }
+            }
+            attn_caches.push(cache1);
+            attn_caches.push(cache2);
+        } else {
+            let (out_h, cache_h) =
+                scaled_dot_product_attention(&q_h, &k_h, &v_h, d_head, d_head, true);
+            for ti in 0..t {
+                let dst_off = ti * d + h * d_head;
+                let src_off = ti * d_head;
+                heads_out[dst_off..dst_off + d_head]
+                    .copy_from_slice(&out_h[src_off..src_off + d_head]);
+            }
+            attn_caches.push(cache_h);
         }
-        attn_caches.push(cache_h);
     }
 
     let y = linear_forward(&w.w_o, &heads_out);
@@ -163,6 +211,7 @@ pub fn causal_mha_forward(w: &MhaWeights, x: &[f32]) -> (Vec<f32>, MhaCache) {
             q_raw,
             k_raw,
             heads_out,
+            out2: out2_full,
             attn_caches,
         },
     )
@@ -199,22 +248,67 @@ pub fn causal_mha_backward(
             d_out_h[dst_off..dst_off + d_head]
                 .copy_from_slice(&d_heads_out[src_off..src_off + d_head]);
         }
-        let (dq_h, dk_h, dv_h) = scaled_dot_product_attention_backward(
-            &q_h,
-            &k_h,
-            &v_h,
-            &cache.attn_caches[h],
-            &d_out_h,
-        );
-        for ti in 0..t {
-            let dst_off = ti * d + h * d_head;
-            let src_off = ti * d_head;
-            d_q[dst_off..dst_off + d_head]
-                .copy_from_slice(&dq_h[src_off..src_off + d_head]);
-            d_k[dst_off..dst_off + d_head]
-                .copy_from_slice(&dk_h[src_off..src_off + d_head]);
-            d_v[dst_off..dst_off + d_head]
-                .copy_from_slice(&dv_h[src_off..src_off + d_head]);
+        if w.diff_attn {
+            let half = d_head / 2;
+            let lam = w.lambda[h];
+            let mut q1 = vec![0.0_f32; t * half];
+            let mut q2 = vec![0.0_f32; t * half];
+            let mut k1 = vec![0.0_f32; t * half];
+            let mut k2 = vec![0.0_f32; t * half];
+            for ti in 0..t {
+                for c in 0..half {
+                    q1[ti * half + c] = q_h[ti * d_head + c];
+                    q2[ti * half + c] = q_h[ti * d_head + half + c];
+                    k1[ti * half + c] = k_h[ti * d_head + c];
+                    k2[ti * half + c] = k_h[ti * d_head + half + c];
+                }
+            }
+            // out = out1 − λ·out2 ⇒ d_out1 = d_out_h, d_out2 = −λ·d_out_h,
+            // dλ = −Σ d_out_h ⊙ out2.
+            let mut d_out2 = vec![0.0_f32; t * d_head];
+            for ti in 0..t {
+                for c in 0..d_head {
+                    let g = d_out_h[ti * d_head + c];
+                    grads.d_lambda[h] -= g * cache.out2[ti * d + h * d_head + c];
+                    d_out2[ti * d_head + c] = -lam * g;
+                }
+            }
+            let (dq1, dk1, dv1) = scaled_dot_product_attention_backward(
+                &q1, &k1, &v_h, &cache.attn_caches[2 * h], &d_out_h,
+            );
+            let (dq2, dk2, dv2) = scaled_dot_product_attention_backward(
+                &q2, &k2, &v_h, &cache.attn_caches[2 * h + 1], &d_out2,
+            );
+            for ti in 0..t {
+                let dst = ti * d + h * d_head;
+                for c in 0..half {
+                    d_q[dst + c] = dq1[ti * half + c];
+                    d_q[dst + half + c] = dq2[ti * half + c];
+                    d_k[dst + c] = dk1[ti * half + c];
+                    d_k[dst + half + c] = dk2[ti * half + c];
+                }
+                for c in 0..d_head {
+                    d_v[dst + c] = dv1[ti * d_head + c] + dv2[ti * d_head + c];
+                }
+            }
+        } else {
+            let (dq_h, dk_h, dv_h) = scaled_dot_product_attention_backward(
+                &q_h,
+                &k_h,
+                &v_h,
+                &cache.attn_caches[h],
+                &d_out_h,
+            );
+            for ti in 0..t {
+                let dst_off = ti * d + h * d_head;
+                let src_off = ti * d_head;
+                d_q[dst_off..dst_off + d_head]
+                    .copy_from_slice(&dq_h[src_off..src_off + d_head]);
+                d_k[dst_off..dst_off + d_head]
+                    .copy_from_slice(&dk_h[src_off..src_off + d_head]);
+                d_v[dst_off..dst_off + d_head]
+                    .copy_from_slice(&dv_h[src_off..src_off + d_head]);
+            }
         }
     }
 

@@ -775,3 +775,236 @@ pomalejší, viz Sprint 67). Trainer val: e0 1.561, e1 **1.337**.
 3. **Workgroup memory budget na causal MHA.** Stávající `forward_mega_2layer` byl konstrávaný kolem hidden ≤ 1024. MHA forward s n_head=6, d_head=64, T=256 má jiný memory pattern — workgroup-tiled QKᵀ není trivial port. Sprint 57 risk.
 4. **Embedding scatter-add atomic kontence na GTX 1650** (Turing TU116, ne tensor cores). Bude se měřit, ale není apriorní red flag.
 5. **JSONL schema breaking change.** `analysis/diagnostics.py` musí umět detekovat verzi (SNN-era `rates`/`alphas` vs transformer-era `lr`/`grad_norm`). Buď dvojí parser nebo prefer-new + fallback. Sprint 54 deliverable.
+
+---
+
+# Sprint 67 — 10-hypotéz balík: canon + embed-lr vyhrály
+
+Cíl: 10 naprosto unikátních hypotéz na zvednutí kvality, ověřit a aplikovat.
+Všech 10 implementováno CPU-first + **grad-check** (`tests/transformer_primitives.rs`,
+21 testů, central-difference tol 5e-2 — projekt nemá autograd, takže každý
+nový backward je ručně ověřený). Infra navíc: `--eval-windows N` (cap val-eval,
+eval byl ~79 s/epochu = skutečný per-run bottleneck).
+
+## Flagy (všechny default-off, kompozují)
+`--z-loss <w>` (PaLM logit z-loss), `--embed-lr-mult <m>` (LR× pro embed/head
+Adam grupy), `--head-bias` (unigram-init LM-head bias), `--parallel-block`
+(GPT-J topologie), `--layerscale` (per-kanál CaiT gaty), `--ema <d>` (weight-EMA
+eval, CPU), `--swiglu` (gated FFN + `w_gate` Muon; reduce `--d-ff` pro iso-param),
+`--canon-kernel <k>` (causal depthwise conv v residual streamu), `--diff-attn`
+(DIFF Transformer přes SDPA-reuse: `SDPA(Q1,K1,V)−λ·SDPA(Q2,K2,V)`), `--sink <K>`
+(učené register-tokeny). Composite: **`--tier4` = canon-kernel 4 + embed-lr-mult 3.**
+
+## Metodika: 3-stupňový funnel
+Screening na enwik8_10m (proxy d256/L4). **Klíčové ponaučení:** 1-epochové proxy
+je *zaujaté ve prospěch early-convergence akcelerátorů* — convergence test (3 ep)
+**obrátil pořadí**.
+
+| lever | Δ 1ep (d256/L4) | Δ 3ep | verdikt |
+|-------|-----------------|-------|---------|
+| canon | −0.059 | **−0.236** | roste s tréninkem → reálný |
+| embedlr | −0.181 | **−0.103** | smrsklo, ale drží → reálný |
+| parallel | −0.136 | −0.021 | miráž (early-conv) |
+| layerscale | −0.106 | −0.019 | miráž (early-conv) |
+| headbias | −0.023 | −0.011 | pod prahem |
+| ema | +0.574 | −0.002 | **artefakt** (decay 0.999 ≫ 708 kroků) → neutrál @0.99 |
+| swiglu | +0.162 | +0.003 | **artefakt** (iso-param ⅔ zúžení) → neutrál @full d_ff |
+| sink / zloss / diffattn | ~0 | — | neutrál na téhle škále |
+
+## Nano confirm (gold škála, d384/L6, 4 ep, enwik8_10m, seed 42)
+| run | best val_bpb | Δ |
+|-----|--------------|---|
+| baseline | 1.7971 (✅ reprodukuje anchor ~1.82) | — |
+| canon | 1.6978 | **−0.099** |
+| embedlr | 1.7214 | **−0.076** |
+| **combo (--tier4)** | **1.6612** | **−0.136** |
+
+Stacking sub-aditivní (~78 %): canon a embed-lr jsou skoro ortogonální
+(architektura × optimizer), overlap ~22 %. Druhý seed (1337) běží.
+
+## Aplikováno trvale
+- `--tier4` composite (canon + embed-lr).
+- **Checkpoint AURORA06**: `canon_kernel: u32` v hlavičce + per-block `canon_w`
+  tenzor. AURORA05 se **stále čte** (dual-magic, canon off) — staré checkpointy
+  se neztratí. embed-lr-mult je training-time (neukládá se; CLI vyhrává i na resume).
+- Regrese: `checkpoint_v6_round_trip_preserves_canon` (52 testů zelených).
+
+## Další
+- Druhý/třetí seed confirm combo (běží seed 1337).
+- **Rekordní recept**: canon+embed-lr na full enwik8 + T=1024 + tier1 (současný
+  rekord 1.337) — projekce nový rekord ~1.27–1.31, netestováno.
+- Scale-hungry levery (diff-attn, z-loss s vyšší vahou) možná přidají při T=1024.
+
+## GPU port canonu — HOTOVO
+`src/gpu/canon.rs` — 3 WGSL kernely (fwd; bwd-dx gather; bwd-dw per-tap reduce,
+oba **bez f32 atomik / bez race**, jedna sekvence `[T·d]` na běh). Zapojeno do
+`transformer.rs`: per-block `canon_w` buffer + AdamW momenty, `canon_out` v
+LayerCache (ln1 + post-attn residual ho čtou), `canon_din` backward scratch,
+dispatch ve `encode_forward` (před ln1) a `block_backward` (po vadd_dx). Parity
+test `full_transformer_canon_forward_and_grads_match_cpu` (loss + g_canon_w +
+g_w_q + g_w_tok < 5e-2), 80 testů zelených. GPU smoke trénuje stabilně.
+**Pozn.:** embed-lr-mult je optimizer-only a na GPU step se zatím nečte — pro
+plný `--tier4` na GPU chybí 1 malá úprava (scale LR pro embed grad-grupy).
+
+## Sprint 68 — PHAGE: runtime governor efektivity (`--governor`)
+
+Samostatný subsystém `src/governor/`, který za běhu hlídá, jestli trénink
+jde efektivně, lokalizuje původce zpomalení/stagnace a mění živou matematiku
+bez rekompilace. Default off, zapíná `--governor` (CPU i GPU, viz níže).
+
+**Klíčový vhled, na kterém to stojí.** Aktuace v Auroře je *zadarmo*:
+`AdamWConfig`/`MuonConfig` se staví znovu každý krok, operátorové booly
+(`rms`, `relu2`, `rope`, `qk_norm`) a `softcap`/`z_loss` se čtou každý forward
+při neměnných tvarech tenzorů. Celá matematika je tedy funkce malého
+`MathState` (MSV) vektoru — žádný dlopen/JIT. Skutečný protivník není
+aktuace, ale **kauzální atribuce pod noise floor** (screening noise ~0.035
+BPB ≫ typický efekt). Proto těžiště algoritmu je verifier, ne knoby.
+
+**Architektura (7 vrstev, vše čisté + testovatelné):**
+- `state.rs` MSV — `lr_scale`/`muon_lr_scale`/`momentum`/`weight_decay`/
+  `grad_clip_scale`/`softcap`, `apply_optim` škáluje per-step configy in-place
+  (všechny backendy ho konzumují → LR/momentum/wd governance je automatická).
+- `vitals.rs` — multi-timescale EWMA, `Fingerprint`, `η = −Δloss/Δwall`.
+- `reflex.rs` — divergence guard (NaN/exploze) → `clone_from` rollback + LR cut,
+  jediná vrstva co jedná bez trialu (jistota).
+- `diagnosis.rs` — diferenciální diagnostika: posterior nad taxonomií poruch.
+- `pharmacy.rs` — fault→licencovaná ramena + Gaussian-Thompson bandit (TSV
+  sidecar `*.phage`, cross-run učení).
+- `verifier.rs` — **jádro novosti**: anytime-valid normal-mixture confidence
+  sequence nad *párovými* probe rozdíly. Imunní vůči peekingu → governor smí
+  zastavit hned, jak interval překročí floor, bez inflace false-adopt.
+- `trial.rs` / `backend.rs` — párový rollout přes `TrialBackend` trait
+  (snapshot/restore/paired_diff); core nesahá na model. Sdílené `W`+data+probe
+  ⇒ nuisance „kde na křivce jsme" se v rozdílu vyruší (model-level A/A test
+  dává **přesně 0**). `CpuTrialBackend` přes `Clone`, `GpuTrialBackend` přes
+  on-device buffer copy (viz CPU+GPU níže).
+
+**Verdikt = Adopt / Revert / BelowFloor.** Většina kandidátů je pod floor a
+governor je správně *odmítne* (disciplína, co chyběla ručnímu screeningu).
+Bandit se učí jen na potvrzených ziscích, ne na korelaci.
+
+**Verifikace.** `tests/governor.rs` 12 testů zelených — load-bearing je
+`cs_aa_false_positive_control` (null šum nesmí pálit ≤8 %) a
+`paired_rollout_identity_cancels_to_zero` (párování ruší nuisance přesně).
+41 anti-regrese testů zelených, build default/gpu/viz čistý. Smoke
+(tiny_200k, cold LR 2e-5): governor mlčí dokud trénink jede, na plató
+diagnostikuje `lr_too_cold`, otevře trial, 40 párových vzorků → `BelowFloor`
+(1.3× LR bump na nano modelu je pod 0.003 BPB floor), `.phage` perzistuje.
+
+**CPU + GPU (backend-agnostický core).** `end_step(.., &mut dyn TrialBackend)`.
+`GpuTrialBackend` snapshotuje **on-device** — přidány
+`DecoderTransformerGpu::{snapshot_state, refresh_state, restore_state}` +
+`GpuStateSnapshot` (kopíruje váhy + AdamW momenty + Muon momentum přes
+`copy_buffer_to_buffer`, žádný host readback), rollout přes `train_step_batch`/
+`step_muon_hybrid`, probe BPB přes `eval_step_batch`. Trialy i reflex rollback
+běží na GPU plnou rychlostí (jen 2 perzistentní snapshot buffer sety navíc).
+GPU verifikace `tests/governor_gpu.rs`: bit-exact snapshot→step→restore vč.
+Muon w_q — **pozor na zero-init w_o**: 1. krok má nulové matrix-grady, test
+musí warmupnout. **GPU gotcha:** divergence se klíčuje JEN na loss —
+`grad_norm` je na non-report stepech NaN (skipnutý readback), NE divergence
+(jinak reflex mlátí každý druhý krok). GPU smoke (cold LR): stejné chování i
+BPB jako CPU, trialy on-device.
+
+**Hranice (poctivě).** (a) Strukturální změny (tvary tenzorů, swap identity
+optimizeru AdamW↔Muon) nejdou hot-swapnout — governor je „medikace" živými
+skaláry, ne „chirurgie". (b) Krátký trial nevidí pomalé/odložené efekty
+(weight decay, tvar schedule) — ty jsou nízko-confidence. (c) Trial overhead
+(2×horizon shadow kroky per trialing step) je reálný a viditelný (GPU smoke
+~20 → ~60 ms/step během trialů); gated cooldownem + posterior prahem. (d)
+Probe je z val splitu — mírný Goodhart, hlavní BPB stále z plného valu.
+
+**Follow-up po prvním reálném GPU běhu (enwik8_10m, 13.9M, tier1+canon).** Běh
+ukázal 3 věci k opravě (governer NEškodil — committed zůstal identita, val
+2.69→2.05/3 epochy — ale byl *němý*: každý trial belowfloor):
+1. **Runtime A/A σ kalibrace** (`Calibrating` state) — margin byl zaseknutý na
+   0.0096 (n=40), protože `cfg.sigma=0.02` floor přebíjel mnohem menší
+   empirickou párovou σ. Před prvním trialem teď governer pustí
+   `calib_samples` (16) párových vzorků reálně-velkým arm a nastaví
+   `cs.sigma = max(1.5·std, 0.001)`. Smoke: změřená std **0.000187** → σ
+   **0.001**, margin **0.0096 → 0.00048** (20×). Floor (0.003) je teď binding
+   constraint, ne statistická nejistota — reálný efekt >0.003 *projde*.
+2. **Schedule-aware diagnóza** — `lr_too_hot` hard-gated když LR roste
+   (warmup grady jsou velké z principu; reálnou explozi chytá reflex),
+   `lr_too_cold` gated když LR klesá (WSD tail — zvyšovat LR je špatně). LR
+   směr z `lr_now` vs vlastní slow EWMA (`Fingerprint::lr_rising/lr_falling`).
+3. **Regime cap** — warmup regime capnut na `min(warmup_steps, total/10)`
+   (běh měl warmup 2000 z 2564 ⇒ 78 % „warmup", degenerovaný bandit kontext).
+
+Verifikace: `calibration_sigma_is_what_unblocks_adoption` (σ=0.02→BelowFloor,
+σ=0.006→Adopt na stejném 0.01 efektu), `diagnosis_respects_schedule`,
+`regime_warmup_is_capped`, `calibration_enables_adoption_below_default_floor`
+(MockBackend). 16 governor + 2 GPU testů zelených.
+
+---
+
+# Sprint 69 — Performance: měřicí základ + GPU occupancy
+
+Cíl: vyždímat GTX 1650 (TU116, GDDR6, ~192 GB/s, ridge ~14.8) + i5-12400F (12T)
+maximum. Roofline-grounded, měřením gated. **Baselines (nano d384/L6/B16/T256):**
+CPU **20.6 s/step**, GPU **1.17 s/step** (17.6× GPU).
+
+## Phase 0 — Měřicí základ (HOTOVO)
+
+- `src/gpu/profiler.rs` — `GpuProfiler` přes wgpu `TIMESTAMP_QUERY` +
+  `TIMESTAMP_QUERY_INSIDE_ENCODERS` (`encoder.write_timestamp` mezi dispatchi).
+  `context.rs` enabluje feature když ji adapter má. `probe_copy_ms` validuje
+  celou cestu; `tests/gpu_profiler.rs` zelený na GTX 1650 (de-riskuje Phase 4).
+- `examples/aurora_train.rs` — `ms_per_step` + `tok_per_s` v JSONL `step`
+  (windowed) i `epoch_done` (train-only = `(elapsed−eval)/steps`) + stdout.
+- `tests/perf_smoke.rs` — katastrofický-regrese gate (tiny d64/L2, strop 250ms,
+  ne flaky micro-bench).
+
+## Phase 1 — CPU codegen (HOTOVO, ale NEUTRÁLNÍ — důležité zjištění)
+
+- `.cargo/config.toml` `target-cpu=native` + `linalg::dot` (8 akumulátorů +
+  `mul_add` → AVX2 FMA) v `linear_forward` + tied head.
+- **MĚŘENÍM NEUTRÁLNÍ: 20.6 → 19.9 s/step (~3 %).** Dopředný dot je jen ~3 %
+  stepu → **CPU NENÍ compute-bound na matmulu** (`vfmadd` se bez `mul_add`
+  vůbec neemitoval — LLVM nekontrahuje f32). Bottleneck = Muon NS (par_iter přes
+  6 bloků = půl-idle na 12T), per-step `Vec` alloc/zeroing, memory traffic.
+  Velký CPU zisk = hluboký refactor (Muon-over-matrices reparallel, buffer
+  reuse) → mizerná ROI vs GPU. Vektorizovaný dot ponechán (korektní, ~3 % plus).
+  Pozor: native baked na tento CPU; každý gpu rebuild rekompiluje wgpu.
+
+## Phase 2 — GPU batch→M occupancy (NAVRŽENO, turnkey edit-list)
+
+**Proč:** `gpu_perf_bench` měří nano B16 batch speedup **1.00×** — současné
+batchování je falešná paralelizace (B sekvencí sdílí `self.acts` arénu → wgpu je
+serializuje WAW bariérami). GEMMy jsou occupancy-starved při M=T.
+
+**Design (grid.z, čistší než host b-loop):**
+- **Flatten M=B·T** (position-independent / per-row): embed-write, LN, QK-norm,
+  všechny GEMMy (q/k/v/o/fc/proj + head), gelu, vadd, softcap, softmax_ce. Bind
+  groups bindují CELÉ buffery (`as_entire_binding`) → stačí resize + dispatch
+  dostane M=`(b*t) as u32` / count B·*. Žádný rebind.
+- **MHA přes `wgid.z=b`** (grid `(T,n_head,B)`): kernel `qkv_base=bi*t*d_model`,
+  `probs_base=bi*n_head*t*t`; per-b probs (`probs_cap *= mb`). Žádný extra
+  push-constant. OOM až T=1024 vysoké B (B=1 record nezměněn).
+- **embed + rope = host b-loop** (NELZE flatnout): `d_w_pos[ti%T] +=` koliduje
+  přes B sekvencí (race); b-loop serializuje přes WAW → korektní. Potřebují
+  `out_offset`/`dy_offset` push-constant.
+- **Weight grady zdarma korektní:** outer_accum GEMM redukuje přes M=B·T = suma
+  přes batch.
+
+**Verifikace (klíč):** při B=1 je KAŽDÁ změna no-op (B·T=T, z=1, bi=0, offsety=0)
+→ `gpu_parity` (13 testů) MUSÍ zůstat zelený. Pak batch-consistency:
+`train_step_batch` grady == Σ B× `train_step`.
+
+**Edit-list (vše to-do; resize + MHA-fwd byly prototypovány a revertnuty, ať
+strom kompiluje — v git reflogu):**
+1. `Activations::new`: `td=mb*t*d`, `td_ff=mb*t*d_ff`, `probs_cap=mb*n_head*t*t`;
+   `ln*_inv/*_mean/f_*` → `bt`; logits/d_logits → `bt*v`. (`mb=max_batch.max(1)`)
+2. MHA fwd kernel `bi=wgid.z` + qkv_base/probs_base; `dispatch_with_bind(+b)`,
+   grid `(t,n_head,b)`.
+3. MHA bwd (dscores/dq/dkv) kernely: `bi=wgid.z` + offsety; dispatch z=b.
+4. embed fwd/bwd: `out_offset`/`dy_offset` push-constant + b-loop v encode.
+5. rope fwd/bwd: `qk_offset` push-constant + b-loop.
+6. `encode_forward(enc,t,b)`: flatten dispatche na M=B·T; embed/rope/mha b-aware.
+7. `block_backward`/backward část `encode_train_element`: flatten + z=b.
+8. `train_step_batch`: jeden batched encode místo B× `encode_train_element`.
+
+**Pozor — kaskáda:** signatura `encode_forward`/dispatchů protáhne přes všechny
+call-sites (train_step, eval_step, train_step_batch). ~40 vzájemně závislých
+editů + 2–3 `gpu_parity` debug cykly. All-or-nothing (fwd+bwd layouty musí
+sedět). → dedikovaný běh s plným budgetem. Očekávaný zisk ~1.3–1.4× @B8 T256
+(roofline; empiricky 1.07–1.4× strop).

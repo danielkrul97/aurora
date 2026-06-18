@@ -1,0 +1,257 @@
+no checkpoint at experiments/results/nano_confirm/combo_s1337.ckpt — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  12.3M params  ·  CPU
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921076 (BPE vocab 4096, encode 5.2s)
+ train / val  : 2628968 / 292108
+ model        : d=384 L=6 h=6 dff=1536 ctx=256 pos=learned
+ arch         : norm=ln act=gelu qk_norm=false head=tied softcap=0 zero_proj=false
+ lr schedule  : cosine (decay_frac 0.4)
+ optim        : muon hybrid | matrix lr 2.00e-2, momentum 0.95, wd 0 | embed/LN adamw lr 6.00e-4 → 6.00e-5
+              : warmup 2000 step, adamw wd 0.1, clip 1
+ epochs       : 4 (from 0) batch 16
+ checkpoint   : experiments/results/nano_confirm/combo_s1337.ckpt
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.366  bpb 3.531  lr 3.60e-6  gn 0.59    96.0s
+  step      24  chunk    24/641    loss 8.322  bpb 3.524  lr 7.20e-6  gn 0.58   194.8s
+  step      36  chunk    36/641    loss 8.218  bpb 3.512  lr 1.08e-5  gn 0.60   293.6s
+  step      48  chunk    48/641    loss 8.116  bpb 3.494  lr 1.44e-5  gn 0.70   392.3s
+  step      60  chunk    60/641    loss 7.988  bpb 3.474  lr 1.80e-5  gn 0.73   491.3s
+  step      72  chunk    72/641    loss 7.844  bpb 3.451  lr 2.16e-5  gn 0.64   589.9s
+  step      84  chunk    84/641    loss 7.685  bpb 3.426  lr 2.52e-5  gn 0.62   688.8s
+  step      96  chunk    96/641    loss 7.613  bpb 3.402  lr 2.88e-5  gn 0.60   787.3s
+  step     108  chunk   108/641    loss 7.464  bpb 3.376  lr 3.24e-5  gn 0.52   885.3s
+  step     120  chunk   120/641    loss 7.390  bpb 3.352  lr 3.60e-5  gn 0.51   984.0s
+  step     132  chunk   132/641    loss 7.367  bpb 3.331  lr 3.96e-5  gn 0.53  1083.3s
+  step     144  chunk   144/641    loss 7.324  bpb 3.310  lr 4.32e-5  gn 0.61  1181.6s
+  step     156  chunk   156/641    loss 7.193  bpb 3.290  lr 4.68e-5  gn 0.59  1280.8s
+  step     168  chunk   168/641    loss 7.128  bpb 3.270  lr 5.04e-5  gn 0.58  1380.2s
+  step     180  chunk   180/641    loss 6.954  bpb 3.251  lr 5.40e-5  gn 0.60  1479.1s
+  step     192  chunk   192/641    loss 6.926  bpb 3.231  lr 5.76e-5  gn 0.68  1578.3s
+  step     204  chunk   204/641    loss 6.871  bpb 3.212  lr 6.12e-5  gn 0.68  1677.6s
+  step     216  chunk   216/641    loss 6.761  bpb 3.192  lr 6.48e-5  gn 0.59  1776.0s
+  step     228  chunk   228/641    loss 6.756  bpb 3.173  lr 6.84e-5  gn 0.62  1875.1s
+  step     240  chunk   240/641    loss 6.606  bpb 3.155  lr 7.20e-5  gn 0.63  1974.2s
+  step     252  chunk   252/641    loss 6.626  bpb 3.138  lr 7.56e-5  gn 0.67  2072.5s
+  step     264  chunk   264/641    loss 6.514  bpb 3.121  lr 7.92e-5  gn 0.64  2171.2s
+  step     276  chunk   276/641    loss 6.495  bpb 3.104  lr 8.28e-5  gn 0.70  2271.0s
+  step     288  chunk   288/641    loss 6.493  bpb 3.087  lr 8.64e-5  gn 0.68  2369.2s
+  step     300  chunk   300/641    loss 6.375  bpb 3.072  lr 9.00e-5  gn 0.66  2467.9s
+  step     312  chunk   312/641    loss 6.311  bpb 3.055  lr 9.36e-5  gn 0.65  2567.3s
+  step     324  chunk   324/641    loss 6.252  bpb 3.040  lr 9.72e-5  gn 0.71  2666.0s
+  step     336  chunk   336/641    loss 6.381  bpb 3.026  lr 1.01e-4  gn 0.68  2765.3s
+  step     348  chunk   348/641    loss 6.258  bpb 3.013  lr 1.04e-4  gn 0.65  2864.6s
+  step     360  chunk   360/641    loss 6.104  bpb 2.999  lr 1.08e-4  gn 0.75  2963.0s
+  step     372  chunk   372/641    loss 5.952  bpb 2.985  lr 1.12e-4  gn 0.74  3062.6s
+  step     384  chunk   384/641    loss 6.022  bpb 2.972  lr 1.15e-4  gn 0.71  3162.8s
+  step     396  chunk   396/641    loss 5.971  bpb 2.958  lr 1.19e-4  gn 0.64  3261.2s
+  step     408  chunk   408/641    loss 5.972  bpb 2.945  lr 1.22e-4  gn 0.69  3360.2s
+  step     420  chunk   420/641    loss 6.037  bpb 2.934  lr 1.26e-4  gn 0.67  3459.3s
+  step     432  chunk   432/641    loss 5.974  bpb 2.922  lr 1.30e-4  gn 0.68  3558.1s
+  step     444  chunk   444/641    loss 5.868  bpb 2.910  lr 1.33e-4  gn 0.69  3656.9s
+  step     456  chunk   456/641    loss 5.933  bpb 2.899  lr 1.37e-4  gn 0.63  3756.0s
+  step     468  chunk   468/641    loss 5.708  bpb 2.888  lr 1.40e-4  gn 0.66  3855.0s
+  step     480  chunk   480/641    loss 5.779  bpb 2.877  lr 1.44e-4  gn 0.76  3953.9s
+  step     492  chunk   492/641    loss 5.745  bpb 2.865  lr 1.48e-4  gn 0.71  4053.4s
+  step     504  chunk   504/641    loss 5.846  bpb 2.855  lr 1.51e-4  gn 0.64  4152.5s
+  step     516  chunk   516/641    loss 5.763  bpb 2.846  lr 1.55e-4  gn 0.69  4250.8s
+  step     528  chunk   528/641    loss 5.715  bpb 2.836  lr 1.58e-4  gn 0.83  4350.2s
+  step     540  chunk   540/641    loss 5.667  bpb 2.825  lr 1.62e-4  gn 0.78  4449.3s
+  step     552  chunk   552/641    loss 5.517  bpb 2.814  lr 1.66e-4  gn 0.65  4547.6s
+  step     564  chunk   564/641    loss 5.481  bpb 2.804  lr 1.69e-4  gn 0.68  4647.2s
+  step     576  chunk   576/641    loss 5.369  bpb 2.794  lr 1.73e-4  gn 0.75  4745.9s
+  step     588  chunk   588/641    loss 5.588  bpb 2.784  lr 1.76e-4  gn 0.67  4844.6s
+  step     600  chunk   600/641    loss 5.420  bpb 2.774  lr 1.80e-4  gn 0.72  4944.9s
+  step     612  chunk   612/641    loss 5.408  bpb 2.764  lr 1.84e-4  gn 0.68  5043.3s
+  step     624  chunk   624/641    loss 5.595  bpb 2.756  lr 1.87e-4  gn 0.68  5141.7s
+  step     636  chunk   636/641    loss 5.334  bpb 2.747  lr 1.91e-4  gn 0.68  5240.9s
+  done   train bpb 2.743  val bpb 2.371  5335.5s (eval 53.7s)  8239.9ms/step  497tok/s
+  checkpoint → experiments/results/nano_confirm/combo_s1337.ckpt
+  sample:
+    seed: "ons. To the Athenians it "
+    cont: "in [[20)\n* the [[Battle of Hebrian]], Allan.&quot; Ambn Weed===\nHe still a gegions by abake like his opens of Roman clampublic ches repric, however, enced for his use of no many conber had have become a death.  Conlike this - after his become often has s were ravute the vot I is take to cut about the factual namgo (the specificationiesiety), refused to result in tankle in bn of the most vide. Since Greecas a men that the evalistic and thers in one of dis"
+
+── epoch 1 ───────────────────────────────
+  step     653  chunk    12/641    loss 5.407  bpb 2.319  lr 1.96e-4  gn 0.68    97.6s
+  step     665  chunk    24/641    loss 5.363  bpb 2.304  lr 2.00e-4  gn 0.73   197.0s
+  step     677  chunk    36/641    loss 5.375  bpb 2.294  lr 2.03e-4  gn 0.65   295.4s
+  step     689  chunk    48/641    loss 5.161  bpb 2.281  lr 2.07e-4  gn 0.82   394.3s
+  step     701  chunk    60/641    loss 5.267  bpb 2.274  lr 2.10e-4  gn 0.76   495.8s
+  step     713  chunk    72/641    loss 5.341  bpb 2.265  lr 2.14e-4  gn 0.70   595.1s
+  step     725  chunk    84/641    loss 5.252  bpb 2.262  lr 2.18e-4  gn 0.69   693.9s
+  step     737  chunk    96/641    loss 5.208  bpb 2.256  lr 2.21e-4  gn 0.73   793.2s
+  step     749  chunk   108/641    loss 5.135  bpb 2.251  lr 2.25e-4  gn 0.63   892.0s
+  step     761  chunk   120/641    loss 5.159  bpb 2.244  lr 2.28e-4  gn 0.68   990.7s
+  step     773  chunk   132/641    loss 5.224  bpb 2.237  lr 2.32e-4  gn 0.66  1089.9s
+  step     785  chunk   144/641    loss 5.126  bpb 2.231  lr 2.36e-4  gn 0.78  1188.8s
+  step     797  chunk   156/641    loss 5.023  bpb 2.225  lr 2.39e-4  gn 0.66  1287.7s
+  step     809  chunk   168/641    loss 5.168  bpb 2.220  lr 2.43e-4  gn 0.67  1387.3s
+  step     821  chunk   180/641    loss 5.093  bpb 2.216  lr 2.46e-4  gn 0.64  1486.1s
+  step     833  chunk   192/641    loss 5.138  bpb 2.209  lr 2.50e-4  gn 0.70  1584.8s
+  step     845  chunk   204/641    loss 4.942  bpb 2.202  lr 2.54e-4  gn 0.71  1684.3s
+  step     857  chunk   216/641    loss 5.043  bpb 2.198  lr 2.57e-4  gn 0.60  1783.6s
+  step     869  chunk   228/641    loss 4.987  bpb 2.191  lr 2.61e-4  gn 0.66  1882.5s
+  step     881  chunk   240/641    loss 4.983  bpb 2.185  lr 2.64e-4  gn 0.64  1982.2s
+  step     893  chunk   252/641    loss 5.095  bpb 2.183  lr 2.68e-4  gn 0.68  2080.9s
+  step     905  chunk   264/641    loss 5.132  bpb 2.179  lr 2.72e-4  gn 0.63  2180.1s
+  step     917  chunk   276/641    loss 5.140  bpb 2.175  lr 2.75e-4  gn 0.71  2280.0s
+  step     929  chunk   288/641    loss 5.120  bpb 2.173  lr 2.79e-4  gn 0.66  2378.8s
+  step     941  chunk   300/641    loss 5.007  bpb 2.169  lr 2.82e-4  gn 0.62  2477.1s
+  step     953  chunk   312/641    loss 4.890  bpb 2.164  lr 2.86e-4  gn 0.61  2576.9s
+  step     965  chunk   324/641    loss 4.831  bpb 2.160  lr 2.90e-4  gn 0.67  2675.7s
+  step     977  chunk   336/641    loss 5.128  bpb 2.158  lr 2.93e-4  gn 0.64  2774.2s
+  step     989  chunk   348/641    loss 5.136  bpb 2.158  lr 2.97e-4  gn 0.62  2873.6s
+  step    1001  chunk   360/641    loss 4.695  bpb 2.155  lr 3.00e-4  gn 0.67  2972.5s
+  step    1013  chunk   372/641    loss 4.666  bpb 2.150  lr 3.04e-4  gn 0.66  3070.9s
+  step    1025  chunk   384/641    loss 4.817  bpb 2.146  lr 3.08e-4  gn 0.66  3170.5s
+  step    1037  chunk   396/641    loss 4.800  bpb 2.142  lr 3.11e-4  gn 0.60  3269.2s
+  step    1049  chunk   408/641    loss 4.823  bpb 2.138  lr 3.15e-4  gn 0.63  3368.2s
+  step    1061  chunk   420/641    loss 5.028  bpb 2.137  lr 3.18e-4  gn 0.62  3468.0s
+  step    1073  chunk   432/641    loss 4.949  bpb 2.135  lr 3.22e-4  gn 0.64  3566.8s
+  step    1085  chunk   444/641    loss 4.844  bpb 2.132  lr 3.26e-4  gn 0.63  3665.5s
+  step    1097  chunk   456/641    loss 5.000  bpb 2.131  lr 3.29e-4  gn 0.59  3764.9s
+  step    1109  chunk   468/641    loss 4.642  bpb 2.127  lr 3.33e-4  gn 0.62  3863.6s
+  step    1121  chunk   480/641    loss 4.705  bpb 2.124  lr 3.36e-4  gn 0.68  3961.8s
+  step    1133  chunk   492/641    loss 4.694  bpb 2.120  lr 3.40e-4  gn 0.68  4061.3s
+  step    1145  chunk   504/641    loss 4.930  bpb 2.118  lr 3.44e-4  gn 0.59  4160.9s
+  step    1157  chunk   516/641    loss 4.826  bpb 2.116  lr 3.47e-4  gn 0.63  4259.1s
+  step    1169  chunk   528/641    loss 4.670  bpb 2.113  lr 3.51e-4  gn 0.77  4358.1s
+  step    1181  chunk   540/641    loss 4.755  bpb 2.109  lr 3.54e-4  gn 0.73  4456.4s
+  step    1193  chunk   552/641    loss 4.626  bpb 2.104  lr 3.58e-4  gn 0.59  4555.4s
+  step    1205  chunk   564/641    loss 4.608  bpb 2.101  lr 3.62e-4  gn 0.60  4654.9s
+  step    1217  chunk   576/641    loss 4.333  bpb 2.097  lr 3.65e-4  gn 0.67  4753.5s
+  step    1229  chunk   588/641    loss 4.695  bpb 2.093  lr 3.69e-4  gn 0.59  4852.4s
+  step    1241  chunk   600/641    loss 4.602  bpb 2.090  lr 3.72e-4  gn 0.66  4951.8s
+  step    1253  chunk   612/641    loss 4.498  bpb 2.087  lr 3.76e-4  gn 0.62  5050.4s
+  step    1265  chunk   624/641    loss 4.890  bpb 2.085  lr 3.80e-4  gn 0.67  5149.4s
+  step    1277  chunk   636/641    loss 4.600  bpb 2.083  lr 3.83e-4  gn 0.62  5248.8s
+  done   train bpb 2.082  val bpb 2.063  5343.8s (eval 53.6s)  8252.9ms/step  496tok/s
+  checkpoint → experiments/results/nano_confirm/combo_s1337.ckpt
+  sample:
+    seed: "ons. To the Athenians it "
+    cont: "in Russian and these geology under Jewish and other cases at the Troscopian slight, Ice Cambyl, Ice Cambylon]] and the [[Neaclemic]] sent, several by Russian, South Britain, the [[Soviet Union|Soviet Union]], and there was administration from Russia, 1828-198-1928-18-18-18, and 14 years old side of the Prospoping numeres.  Though the alternate communism was extended under the [[United States]], as well as grammes of the [[New Carolina]]. His first period ([[KilA]]) and the [[C"
+
+── epoch 2 ───────────────────────────────
+  step    1294  chunk    12/641    loss 4.565  bpb 1.982  lr 3.88e-4  gn 0.62    96.6s
+  step    1306  chunk    24/641    loss 4.565  bpb 1.961  lr 3.92e-4  gn 0.66   196.0s
+  step    1318  chunk    36/641    loss 4.651  bpb 1.950  lr 3.95e-4  gn 0.59   294.2s
+  step    1330  chunk    48/641    loss 4.306  bpb 1.940  lr 3.99e-4  gn 0.71   392.8s
+  step    1342  chunk    60/641    loss 4.563  bpb 1.937  lr 4.03e-4  gn 0.76   492.4s
+  step    1354  chunk    72/641    loss 4.528  bpb 1.931  lr 4.06e-4  gn 0.66   591.0s
+  step    1366  chunk    84/641    loss 4.412  bpb 1.932  lr 4.10e-4  gn 0.61   689.7s
+  step    1378  chunk    96/641    loss 4.480  bpb 1.928  lr 4.13e-4  gn 0.59   788.8s
+  step    1390  chunk   108/641    loss 4.410  bpb 1.927  lr 4.17e-4  gn 0.59   887.3s
+  step    1402  chunk   120/641    loss 4.346  bpb 1.922  lr 4.21e-4  gn 0.64   986.5s
+  step    1414  chunk   132/641    loss 4.482  bpb 1.916  lr 4.24e-4  gn 0.63  1086.1s
+  step    1426  chunk   144/641    loss 4.294  bpb 1.912  lr 4.28e-4  gn 0.70  1184.6s
+  step    1438  chunk   156/641    loss 4.352  bpb 1.908  lr 4.31e-4  gn 0.63  1283.2s
+  step    1450  chunk   168/641    loss 4.503  bpb 1.905  lr 4.35e-4  gn 0.62  1382.5s
+  step    1462  chunk   180/641    loss 4.389  bpb 1.904  lr 4.39e-4  gn 0.59  1481.1s
+  step    1474  chunk   192/641    loss 4.422  bpb 1.898  lr 4.42e-4  gn 0.64  1579.7s
+  step    1486  chunk   204/641    loss 4.227  bpb 1.892  lr 4.46e-4  gn 0.67  1678.6s
+  step    1498  chunk   216/641    loss 4.477  bpb 1.888  lr 4.49e-4  gn 0.57  1777.9s
+  step    1510  chunk   228/641    loss 4.390  bpb 1.884  lr 4.53e-4  gn 0.59  1876.6s
+  step    1522  chunk   240/641    loss 4.336  bpb 1.880  lr 4.57e-4  gn 0.64  1975.5s
+  step    1534  chunk   252/641    loss 4.450  bpb 1.881  lr 4.60e-4  gn 0.64  2075.2s
+  step    1546  chunk   264/641    loss 4.537  bpb 1.877  lr 4.64e-4  gn 0.61  2174.2s
+  step    1558  chunk   276/641    loss 4.467  bpb 1.875  lr 4.67e-4  gn 0.69  2273.3s
+  step    1570  chunk   288/641    loss 4.560  bpb 1.875  lr 4.71e-4  gn 0.63  2372.1s
+  step    1582  chunk   300/641    loss 4.427  bpb 1.872  lr 4.75e-4  gn 0.61  2471.4s
+  step    1594  chunk   312/641    loss 4.371  bpb 1.869  lr 4.78e-4  gn 0.61  2570.6s
+  step    1606  chunk   324/641    loss 4.165  bpb 1.867  lr 4.82e-4  gn 0.60  2669.6s
+  step    1618  chunk   336/641    loss 4.584  bpb 1.867  lr 4.85e-4  gn 0.65  2767.8s
+  step    1630  chunk   348/641    loss 4.663  bpb 1.869  lr 4.89e-4  gn 0.60  2867.2s
+  step    1642  chunk   360/641    loss 4.080  bpb 1.868  lr 4.93e-4  gn 0.63  2966.6s
+  step    1654  chunk   372/641    loss 4.054  bpb 1.865  lr 4.96e-4  gn 0.63  3064.9s
+  step    1666  chunk   384/641    loss 4.285  bpb 1.862  lr 5.00e-4  gn 0.58  3163.9s
+  step    1678  chunk   396/641    loss 4.312  bpb 1.859  lr 5.03e-4  gn 0.56  3262.4s
+  step    1690  chunk   408/641    loss 4.242  bpb 1.857  lr 5.07e-4  gn 0.59  3360.9s
+  step    1702  chunk   420/641    loss 4.581  bpb 1.857  lr 5.11e-4  gn 0.61  3459.9s
+  step    1714  chunk   432/641    loss 4.473  bpb 1.858  lr 5.14e-4  gn 0.61  3559.9s
+  step    1726  chunk   444/641    loss 4.345  bpb 1.856  lr 5.18e-4  gn 0.61  3658.4s
+  step    1738  chunk   456/641    loss 4.528  bpb 1.857  lr 5.21e-4  gn 0.57  3758.1s
+  step    1750  chunk   468/641    loss 4.172  bpb 1.855  lr 5.25e-4  gn 0.58  3857.1s
+  step    1762  chunk   480/641    loss 4.216  bpb 1.853  lr 5.29e-4  gn 0.64  3955.7s
+  step    1774  chunk   492/641    loss 4.217  bpb 1.851  lr 5.32e-4  gn 0.60  4055.2s
+  step    1786  chunk   504/641    loss 4.494  bpb 1.850  lr 5.36e-4  gn 0.59  4154.7s
+  step    1798  chunk   516/641    loss 4.405  bpb 1.850  lr 5.39e-4  gn 0.59  4253.2s
+  step    1810  chunk   528/641    loss 4.096  bpb 1.849  lr 5.43e-4  gn 0.73  4352.3s
+  step    1822  chunk   540/641    loss 4.204  bpb 1.846  lr 5.47e-4  gn 0.64  4451.4s
+  step    1834  chunk   552/641    loss 4.249  bpb 1.843  lr 5.50e-4  gn 0.56  4549.9s
+  step    1846  chunk   564/641    loss 4.226  bpb 1.842  lr 5.54e-4  gn 0.58  4649.5s
+  step    1858  chunk   576/641    loss 3.865  bpb 1.839  lr 5.57e-4  gn 0.62  4749.4s
+  step    1870  chunk   588/641    loss 4.337  bpb 1.837  lr 5.61e-4  gn 0.56  4847.7s
+  step    1882  chunk   600/641    loss 4.225  bpb 1.836  lr 5.65e-4  gn 0.57  4946.7s
+  step    1894  chunk   612/641    loss 4.094  bpb 1.834  lr 5.68e-4  gn 0.60  5046.0s
+  step    1906  chunk   624/641    loss 4.432  bpb 1.834  lr 5.72e-4  gn 0.63  5144.9s
+  step    1918  chunk   636/641    loss 4.264  bpb 1.834  lr 5.75e-4  gn 0.58  5243.8s
+  done   train bpb 1.834  val bpb 1.888  5338.9s (eval 53.9s)  8244.9ms/step  497tok/s
+  checkpoint → experiments/results/nano_confirm/combo_s1337.ckpt
+  sample:
+    seed: "ons. To the Athenians it "
+    cont: "colourness from the consequence and always and specrefers from Ice You wrote against his sound, and his workmaking, they got out for him the politic and have been printed by Athenian political politics.  To represent a large deal observed their own pracview.  He begin to other authorities who announced her town his farm of his stein, and his work was that he karred rape as the result-born Stocket was taken to be the pseudo-poor sound.\n\nIt was more than how his characters was accomply with personal "
+
+── epoch 3 ───────────────────────────────
+  step    1935  chunk    12/641    loss 4.238  bpb 1.824  lr 5.80e-4  gn 0.57    97.9s
+  step    1947  chunk    24/641    loss 4.183  bpb 1.807  lr 5.84e-4  gn 0.62   197.1s
+  step    1959  chunk    36/641    loss 4.354  bpb 1.797  lr 5.88e-4  gn 0.57   297.0s
+  step    1971  chunk    48/641    loss 3.958  bpb 1.788  lr 5.91e-4  gn 0.62   395.3s
+  step    1983  chunk    60/641    loss 4.191  bpb 1.789  lr 5.95e-4  gn 0.65   494.8s
+  step    1995  chunk    72/641    loss 4.228  bpb 1.787  lr 5.99e-4  gn 0.60   594.0s
+  step    2007  chunk    84/641    loss 4.114  bpb 1.790  lr 6.00e-4  gn 0.61   692.7s
+  step    2019  chunk    96/641    loss 4.242  bpb 1.789  lr 5.99e-4  gn 0.56   791.9s
+  step    2031  chunk   108/641    loss 4.166  bpb 1.792  lr 5.96e-4  gn 0.57   891.2s
+  step    2043  chunk   120/641    loss 4.072  bpb 1.789  lr 5.93e-4  gn 0.61   989.7s
+  step    2055  chunk   132/641    loss 4.241  bpb 1.785  lr 5.88e-4  gn 0.60  1088.7s
+  step    2067  chunk   144/641    loss 3.993  bpb 1.782  lr 5.82e-4  gn 0.63  1188.2s
+  step    2079  chunk   156/641    loss 4.117  bpb 1.780  lr 5.75e-4  gn 0.59  1286.6s
+  step    2091  chunk   168/641    loss 4.266  bpb 1.779  lr 5.67e-4  gn 0.59  1385.7s
+  step    2103  chunk   180/641    loss 4.111  bpb 1.779  lr 5.58e-4  gn 0.56  1485.6s
+  step    2115  chunk   192/641    loss 4.137  bpb 1.774  lr 5.47e-4  gn 0.58  1584.8s
+  step    2127  chunk   204/641    loss 3.967  bpb 1.768  lr 5.36e-4  gn 0.61  1684.0s
+  step    2139  chunk   216/641    loss 4.241  bpb 1.766  lr 5.24e-4  gn 0.54  1783.8s
+  step    2151  chunk   228/641    loss 4.141  bpb 1.762  lr 5.11e-4  gn 0.54  1882.5s
+  step    2163  chunk   240/641    loss 4.058  bpb 1.759  lr 4.97e-4  gn 0.55  1981.7s
+  step    2175  chunk   252/641    loss 4.195  bpb 1.760  lr 4.83e-4  gn 0.59  2081.6s
+  step    2187  chunk   264/641    loss 4.274  bpb 1.756  lr 4.68e-4  gn 0.56  2180.3s
+  step    2199  chunk   276/641    loss 4.186  bpb 1.755  lr 4.52e-4  gn 0.59  2279.2s
+  step    2211  chunk   288/641    loss 4.282  bpb 1.755  lr 4.35e-4  gn 0.56  2379.7s
+  step    2223  chunk   300/641    loss 4.108  bpb 1.752  lr 4.19e-4  gn 0.54  2478.4s
+  step    2235  chunk   312/641    loss 4.065  bpb 1.749  lr 4.01e-4  gn 0.53  2577.7s
+  step    2247  chunk   324/641    loss 3.894  bpb 1.746  lr 3.84e-4  gn 0.53  2677.5s
+  step    2259  chunk   336/641    loss 4.257  bpb 1.746  lr 3.66e-4  gn 0.55  2775.9s
+  step    2271  chunk   348/641    loss 4.351  bpb 1.748  lr 3.48e-4  gn 0.55  2875.1s
+  step    2283  chunk   360/641    loss 3.740  bpb 1.746  lr 3.30e-4  gn 0.56  2974.7s
+  step    2295  chunk   372/641    loss 3.710  bpb 1.741  lr 3.12e-4  gn 0.53  3073.3s
+  step    2307  chunk   384/641    loss 4.011  bpb 1.738  lr 2.94e-4  gn 0.53  3172.2s
+  step    2319  chunk   396/641    loss 3.962  bpb 1.734  lr 2.76e-4  gn 0.50  3271.9s
+  step    2331  chunk   408/641    loss 3.881  bpb 1.732  lr 2.59e-4  gn 0.52  3370.7s
+  step    2343  chunk   420/641    loss 4.205  bpb 1.732  lr 2.41e-4  gn 0.51  3469.2s
+  step    2355  chunk   432/641    loss 4.050  bpb 1.731  lr 2.25e-4  gn 0.50  3568.8s
+  step    2367  chunk   444/641    loss 3.896  bpb 1.728  lr 2.08e-4  gn 0.50  3667.6s
+  step    2379  chunk   456/641    loss 4.137  bpb 1.728  lr 1.92e-4  gn 0.51  3766.3s
+  step    2391  chunk   468/641    loss 3.751  bpb 1.724  lr 1.77e-4  gn 0.50  3865.8s
+  step    2403  chunk   480/641    loss 3.768  bpb 1.721  lr 1.63e-4  gn 0.50  3964.7s
+  step    2415  chunk   492/641    loss 3.773  bpb 1.718  lr 1.49e-4  gn 0.49  4063.4s
+  step    2427  chunk   504/641    loss 4.085  bpb 1.716  lr 1.36e-4  gn 0.49  4163.8s
+  step    2439  chunk   516/641    loss 3.962  bpb 1.714  lr 1.24e-4  gn 0.49  4263.2s
+  step    2451  chunk   528/641    loss 3.594  bpb 1.712  lr 1.13e-4  gn 0.57  4362.0s
+  step    2463  chunk   540/641    loss 3.794  bpb 1.707  lr 1.02e-4  gn 0.55  4461.5s
+  step    2475  chunk   552/641    loss 3.811  bpb 1.703  lr 9.32e-5  gn 0.46  4560.7s
+  step    2487  chunk   564/641    loss 3.760  bpb 1.701  lr 8.51e-5  gn 0.48  4659.2s
+  step    2499  chunk   576/641    loss 3.363  bpb 1.697  lr 7.80e-5  gn 0.50  4758.6s
+  step    2511  chunk   588/641    loss 3.853  bpb 1.694  lr 7.21e-5  gn 0.47  4857.4s
+  step    2523  chunk   600/641    loss 3.740  bpb 1.692  lr 6.74e-5  gn 0.47  4956.4s
+  step    2535  chunk   612/641    loss 3.517  bpb 1.689  lr 6.38e-5  gn 0.49  5056.3s
+  step    2547  chunk   624/641    loss 3.920  bpb 1.688  lr 6.14e-5  gn 0.50  5155.5s
+  step    2559  chunk   636/641    loss 3.769  bpb 1.687  lr 6.02e-5  gn 0.47  5254.4s
+  done   train bpb 1.686  val bpb 1.663  5350.2s (eval 54.2s)  8262.1ms/step  496tok/s
+  checkpoint → experiments/results/nano_confirm/combo_s1337.ckpt
+  sample:
+    seed: "ons. To the Athenians it "
+    cont: "gun to this theory of observer.  Aigtural ones was gainted, and his [[being]] of his interpretations, [[Paulley Crick]], a [[Bricks]] in the same time, on the Salmi War.\n\n=== History ==\n''Main article: [[History of the Salmar Warhol System]]''\n\nAigital is arrived by two companion of Ibn Various Salmariana. The only [[Kosenak ibn Iphos]], Aigorus, ''Kożâûæ"
+
+Total time 21454.8s   best val bpb 1.663   steps planned 2564

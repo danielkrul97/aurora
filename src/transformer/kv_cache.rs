@@ -68,6 +68,12 @@ impl KvCache {
     /// Pre-fill the cache by running the full sequence up through each
     /// block. Returns the final hidden state at the last position.
     pub fn prefill(&mut self, model: &DecoderTransformer, tokens: &[u32]) -> Vec<f32> {
+        // Sink tokens shift every position by K and add K rows to the
+        // history; the cached path tracks neither, so it is unsupported.
+        debug_assert_eq!(
+            model.config.sink_tokens, 0,
+            "kv_cache does not support sink tokens"
+        );
         self.reset();
         let d = self.d_model;
         let t = tokens.len();
@@ -120,6 +126,11 @@ pub fn generate_step(
     let (h_final, _) = crate::attention::layer_norm_forward(&model.final_ln, &h);
     let head_w = model.w_head.as_deref().unwrap_or(&model.embed.w_tok);
     let mut logits = tied_lm_head_forward(&h_final, head_w, v_dim, d);
+    if let Some(hb) = model.head_bias.as_ref() {
+        for (l, b) in logits.iter_mut().zip(hb) {
+            *l += b;
+        }
+    }
     let cap = model.config.softcap;
     if cap > 0.0 {
         for l in &mut logits {

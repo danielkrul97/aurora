@@ -210,8 +210,9 @@ impl LinearGrads {
 /// streamed from memory once per block of positions instead of once per
 /// position — the weight matrix is the dominant memory traffic (e.g.
 /// d×d_ff = 2.3 MB ≫ L2 per-core slice), so this cuts DRAM reads ~8×.
-/// Per-(position, output) dot products are computed in the same order
-/// as the unblocked loop, so results are bit-exact.
+/// Per-(position, output) dot products use the vectorized 8-lane `dot`
+/// (AVX2 FMA under target-cpu=native) — deterministic but not bit-
+/// identical to a sequential reduction.
 const LINEAR_BLOCK_T: usize = 8;
 
 /// Forward `y = x @ Wᵀ`. `x: [T * d_in]`, output `y: [T * d_out]`.
@@ -228,11 +229,7 @@ pub fn linear_forward(proj: &LinearProj, x: &[f32]) -> Vec<f32> {
             for tt in 0..tb {
                 let i = t0 + tt;
                 let xr = &x[i * d_in..(i + 1) * d_in];
-                let mut acc = 0.0_f32;
-                for k in 0..d_in {
-                    acc += row[k] * xr[k];
-                }
-                y[i * d_out + o] = acc;
+                y[i * d_out + o] = crate::linalg::dot(row, xr);
             }
         }
         t0 += tb;

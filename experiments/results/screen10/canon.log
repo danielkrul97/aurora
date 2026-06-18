@@ -1,0 +1,77 @@
+no checkpoint at experiments/results/screen10/canon.ckpt — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  4.3M params  ·  CPU
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921076 (BPE vocab 4096, encode 5.2s)
+ train / val  : 2628968 / 292108
+ model        : d=256 L=4 h=4 dff=1024 ctx=256 pos=learned
+ arch         : norm=ln act=gelu qk_norm=false head=tied softcap=0 zero_proj=false
+ lr schedule  : cosine (decay_frac 0.4)
+ optim        : muon hybrid | matrix lr 2.00e-2, momentum 0.95, wd 0 | embed/LN adamw lr 6.00e-4 → 6.00e-5
+              : warmup 200 step, adamw wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : experiments/results/screen10/canon.ckpt
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.306  bpb 3.516  lr 3.60e-5  gn 0.47    37.2s
+  step      24  chunk    24/641    loss 8.191  bpb 3.495  lr 7.20e-5  gn 0.51    74.8s
+  step      36  chunk    36/641    loss 8.021  bpb 3.467  lr 1.08e-4  gn 0.54   112.4s
+  step      48  chunk    48/641    loss 7.832  bpb 3.436  lr 1.44e-4  gn 0.60   150.0s
+  step      60  chunk    60/641    loss 7.689  bpb 3.404  lr 1.80e-4  gn 0.57   187.7s
+  step      72  chunk    72/641    loss 7.536  bpb 3.371  lr 2.16e-4  gn 0.43   225.4s
+  step      84  chunk    84/641    loss 7.425  bpb 3.341  lr 2.52e-4  gn 0.40   263.2s
+  step      96  chunk    96/641    loss 7.428  bpb 3.316  lr 2.88e-4  gn 0.47   300.7s
+  step     108  chunk   108/641    loss 7.332  bpb 3.292  lr 3.24e-4  gn 0.44   338.4s
+  step     120  chunk   120/641    loss 7.307  bpb 3.272  lr 3.60e-4  gn 0.52   376.2s
+  step     132  chunk   132/641    loss 7.202  bpb 3.253  lr 3.96e-4  gn 0.58   414.1s
+  step     144  chunk   144/641    loss 7.142  bpb 3.232  lr 4.32e-4  gn 0.83   451.7s
+  step     156  chunk   156/641    loss 6.950  bpb 3.211  lr 4.68e-4  gn 0.62   489.4s
+  step     168  chunk   168/641    loss 6.854  bpb 3.188  lr 5.04e-4  gn 0.56   527.2s
+  step     180  chunk   180/641    loss 6.747  bpb 3.167  lr 5.40e-4  gn 0.59   564.9s
+  step     192  chunk   192/641    loss 6.677  bpb 3.146  lr 5.76e-4  gn 0.63   602.7s
+  step     204  chunk   204/641    loss 6.614  bpb 3.124  lr 6.00e-4  gn 0.70   640.5s
+  step     216  chunk   216/641    loss 6.566  bpb 3.105  lr 5.98e-4  gn 0.57   678.1s
+  step     228  chunk   228/641    loss 6.553  bpb 3.085  lr 5.95e-4  gn 0.60   715.9s
+  step     240  chunk   240/641    loss 6.431  bpb 3.067  lr 5.90e-4  gn 0.62   753.9s
+  step     252  chunk   252/641    loss 6.469  bpb 3.051  lr 5.82e-4  gn 0.66   791.6s
+  step     264  chunk   264/641    loss 6.409  bpb 3.035  lr 5.73e-4  gn 0.64   829.4s
+  step     276  chunk   276/641    loss 6.398  bpb 3.019  lr 5.62e-4  gn 0.73   867.1s
+  step     288  chunk   288/641    loss 6.347  bpb 3.004  lr 5.50e-4  gn 0.67   904.8s
+  step     300  chunk   300/641    loss 6.257  bpb 2.990  lr 5.36e-4  gn 0.67   942.7s
+  step     312  chunk   312/641    loss 6.218  bpb 2.974  lr 5.20e-4  gn 0.65   980.2s
+  step     324  chunk   324/641    loss 6.165  bpb 2.960  lr 5.03e-4  gn 0.70  1017.8s
+  step     336  chunk   336/641    loss 6.307  bpb 2.948  lr 4.84e-4  gn 0.66  1055.6s
+  step     348  chunk   348/641    loss 6.187  bpb 2.937  lr 4.65e-4  gn 0.64  1093.2s
+  step     360  chunk   360/641    loss 5.975  bpb 2.924  lr 4.45e-4  gn 0.73  1131.2s
+  step     372  chunk   372/641    loss 5.842  bpb 2.911  lr 4.23e-4  gn 0.74  1169.4s
+  step     384  chunk   384/641    loss 5.974  bpb 2.899  lr 4.01e-4  gn 0.72  1206.9s
+  step     396  chunk   396/641    loss 5.926  bpb 2.886  lr 3.79e-4  gn 0.65  1244.7s
+  step     408  chunk   408/641    loss 5.931  bpb 2.875  lr 3.56e-4  gn 0.69  1282.4s
+  step     420  chunk   420/641    loss 6.020  bpb 2.865  lr 3.33e-4  gn 0.64  1319.9s
+  step     432  chunk   432/641    loss 5.958  bpb 2.855  lr 3.10e-4  gn 0.66  1357.8s
+  step     444  chunk   444/641    loss 5.801  bpb 2.844  lr 2.87e-4  gn 0.64  1395.3s
+  step     456  chunk   456/641    loss 5.941  bpb 2.835  lr 2.64e-4  gn 0.63  1433.0s
+  step     468  chunk   468/641    loss 5.711  bpb 2.825  lr 2.42e-4  gn 0.64  1470.6s
+  step     480  chunk   480/641    loss 5.771  bpb 2.815  lr 2.21e-4  gn 0.74  1508.2s
+  step     492  chunk   492/641    loss 5.751  bpb 2.806  lr 2.00e-4  gn 0.68  1545.9s
+  step     504  chunk   504/641    loss 5.865  bpb 2.797  lr 1.80e-4  gn 0.61  1583.6s
+  step     516  chunk   516/641    loss 5.815  bpb 2.789  lr 1.62e-4  gn 0.66  1621.3s
+  step     528  chunk   528/641    loss 5.791  bpb 2.781  lr 1.44e-4  gn 0.81  1659.1s
+  step     540  chunk   540/641    loss 5.795  bpb 2.773  lr 1.28e-4  gn 0.73  1696.9s
+  step     552  chunk   552/641    loss 5.678  bpb 2.765  lr 1.14e-4  gn 0.61  1734.9s
+  step     564  chunk   564/641    loss 5.658  bpb 2.757  lr 1.01e-4  gn 0.63  1772.4s
+  step     576  chunk   576/641    loss 5.559  bpb 2.749  lr 8.93e-5  gn 0.67  1809.9s
+  step     588  chunk   588/641    loss 5.780  bpb 2.742  lr 7.97e-5  gn 0.64  1847.6s
+  step     600  chunk   600/641    loss 5.559  bpb 2.735  lr 7.20e-5  gn 0.67  1885.3s
+  step     612  chunk   612/641    loss 5.662  bpb 2.728  lr 6.61e-5  gn 0.66  1922.8s
+  step     624  chunk   624/641    loss 5.742  bpb 2.721  lr 6.22e-5  gn 0.65  1960.5s
+  step     636  chunk   636/641    loss 5.610  bpb 2.716  lr 6.02e-5  gn 0.64  1998.3s
+  done   train bpb 2.713  val bpb 2.415  2041.7s (eval 27.6s)
+  checkpoint → experiments/results/screen10/canon.ckpt
+  sample:
+    seed: "ons. To the Athenians it "
+    cont: "into the shy the medal restly characters, we often determined to which have been two present of tues. Ats or limvigray, and to the ergice commonly it was never also been and [[Baid of Miss acquat its recognia/hapment and private from the recward from eleded for its Renih in stars as called at Gardelship the doctine and covered these ''rit to even the people is rest a founds their own gods, and to including this leading contries, its question has that 'Sitter, I is people he was promierain, which "
+
+Total time 2057.7s   best val bpb 2.415   steps planned 641

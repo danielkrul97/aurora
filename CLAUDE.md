@@ -21,8 +21,13 @@ v overnight runu (nano-GPT scale ~10M params, GTX 1650).
   --weight-decay --grad-clip --checkpoint --bpe --metrics --seed
   --sample-len --sample-temp --gpu --viz --rope --muon-lr
   --muon-momentum --muon-wd --rmsnorm --relu2 --qk-norm --untied-head
-  --softcap --zero-ffn-proj --lr-schedule --decay-frac --tier1`
-  (`--tier1` = celý Sprint 65 modernizační balík najednou). Spouštěj přes
+  --softcap --zero-ffn-proj --lr-schedule --decay-frac --tier1
+  --eval-windows --z-loss --embed-lr-mult --head-bias --parallel-block
+  --layerscale --ema --swiglu --canon-kernel --diff-attn --sink --tier4
+  --governor`
+  (`--tier1` = Sprint 65 modernizační balík; `--tier4` = Sprint 67 vítězové
+  canon-kernel 4 + embed-lr-mult 3, viz docs/12; `--governor` = Sprint 68
+  PHAGE runtime efficiency governor, CPU + GPU, `src/governor/`). Spouštěj přes
   `scripts/overnight.sh` nebo přímo `cargo run --release
   [--features gpu,viz] --example aurora_train -- ...`.
 - **Anti-regrese před commitem:**
@@ -32,6 +37,10 @@ v overnight runu (nano-GPT scale ~10M params, GTX 1650).
   - `tests/stability.rs` — grad health, sampling diversity, LR schedule
   - `tests/gpu_parity.rs` — CPU↔GPU drift < 5e-2, 13 testů (`--features gpu`)
   - `tests/kv_cache.rs` — inference parity vs full-forward
+  - `tests/governor.rs` — PHAGE governor (CS A/A false-positive kontrola,
+    párový rollout, diagnóza, bandit), 12 testů
+  - `tests/governor_gpu.rs` — GPU device snapshot/restore bit-exact
+    (`--features gpu`, skip bez GPU)
 - **Diagnostické grafy:** `python3 analysis/diagnostics.py logs/<run>.jsonl`
   po skončení tréninku.
 
@@ -42,13 +51,14 @@ v overnight runu (nano-GPT scale ~10M params, GTX 1650).
   historické záznamy SNN éry. Nový sprint dokumentuj v 12; pokud 12
   přeroste ~50 KB, založ 13.
 - **JSONL metriky** chodí default do `logs/<ckpt_stem>_<unix_ts>.jsonl`.
-  Schema: `run` / `step` / `epoch_done` / `checkpoint` events. Per-event
-  flush — `tail -f` má sub-second lag.
-- **Checkpoint format `AURORA05`** (`src/checkpoint.rs`) — `flags` u32
+  Schema: `run` / `step` / `epoch_done` / `checkpoint` events (+ `governor`
+  events s `--governor`). Per-event flush — `tail -f` má sub-second lag.
+- **Checkpoint format `AURORA06`** (`src/checkpoint.rs`) — `flags` u32
   (bit 0 = rope, 1 = rmsnorm, 2 = relu2, 3 = qk_norm, 4 = untied_head),
-  f32 `softcap` v hlavičce, podmíněný tensor `w_head` za `w_pos`. Žádný
-  backward compat se staršími formáty. Bumpy magic na AURORA06 při
-  schema change.
+  f32 `softcap` + u32 `canon_kernel` v hlavičce, podmíněné tensory
+  `w_head` (za `w_pos`) a per-block `canon_w` (za `w_proj`). Zapisuje se
+  vždy V6; **AURORA05 se stále čte** (dual-magic, canon off). Bumpy magic
+  na AURORA07 při dalším schema change.
 - **Korpusy** se stahují přes `scripts/get_corpus.sh <variant>` do
   `data/`. `data/` a `logs/` jsou v gitignore.
 - **GPU performance stav (po Sprint 64):** GEMM i MHA kernely jsou tiled,
@@ -56,7 +66,9 @@ v overnight runu (nano-GPT scale ~10M params, GTX 1650).
   batchovaný přes `eval_step_batch` (kapacita = `max_batch`). Per-step je
   compute-bound (GTX 1650) — další zrychlení = menší práce (f16, flash
   attention), ne dispatch. CPU eval je rayon-paralelní; CPU linear/tied-head
-  smyčky jsou pozičně blokované (bit-exact, neměnit pořadí akumulace).
+  smyčky jsou pozičně blokované a dot product jede přes `linalg::dot`
+  (8-lane FMA pod target-cpu=native) — deterministické, ale NE bit-identické
+  se sekvenční redukcí (neporovnávej sub-noise-floor BPB se starými logy).
 - **Live viz** (`--features viz --viz`) je čistě additivní — kompiluje
   Bevy 0.18 jako optional dep, default build/CI nezasahuje. Viz thread
   čte `Arc<Mutex<TrainingSnapshot>>` přes `try_lock`, trénink píše
@@ -64,6 +76,21 @@ v overnight runu (nano-GPT scale ~10M params, GTX 1650).
   grad norem (max layer = 1.0, floor 0.18) — víc viditelné než absolutní
   scaling. Mesh2d + `bevy::sprite_render::ColorMaterial` všude pro
   kreslení (Sprite::from_color v 0.18 renderuje nic).
+- **PHAGE governor** (`--governor`, `src/governor/`) je čistě additivní,
+  default off, **CPU i GPU**. Core je backend-agnostický (`TrialBackend`
+  trait: snapshot/restore/paired_diff); `CpuTrialBackend` snapshotuje přes
+  `Clone`, `GpuTrialBackend` přes on-device buffer copy
+  (`DecoderTransformerGpu::snapshot_state/restore_state`, žádný host
+  readback) — proto trialy/reflex běží na GPU plnou rychlostí. Aktuuje
+  výhradně přes `MathState` (MSV): per-step skaláry (LR/momentum/wd/clip),
+  které smyčka staví znovu každý krok → žádná realokace, žádná rekompilace.
+  Smyčka jen volá `begin_step` (aplikace MSV) a `end_step(.., &mut dyn
+  TrialBackend)`. Žádná změna se neadoptuje na korelaci — jen po párovém
+  probe-rollout sekvenčním testu nad noise floor
+  (`tests/governor.rs::cs_aa_false_positive_control` hlídá false-adopt).
+  **GPU pozor:** divergence se klíčuje JEN na loss — `grad_norm` je na
+  non-report stepech NaN (skipnutý readback), ne divergence. Bandit paměť:
+  `<ckpt>.phage` TSV (cross-run).
 
 # Code style
 

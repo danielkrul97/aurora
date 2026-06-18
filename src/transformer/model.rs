@@ -46,6 +46,35 @@ pub struct TransformerConfig {
     /// Zero-init the FFN down-projection (like w_o), so each block
     /// starts as the identity. Init-only — not stored in checkpoints.
     pub zero_ffn_proj: bool,
+    /// Logit z-loss weight: adds `z_loss·mean(logsumexp(logits)²)` to the
+    /// CE objective (PaLM). Regularizes logit scale. 0.0 = off.
+    pub z_loss: f32,
+    /// LR multiplier for the embedding/head Adam groups (w_tok/w_pos/
+    /// w_head) relative to the scheduled base LR. nanoGPT-speedrun lever:
+    /// embeddings often want a faster LR than Muon-driven hidden matrices.
+    /// 1.0 = off.
+    pub embed_lr_mult: f32,
+    /// Additive per-vocab bias on the LM-head logits, initialized to the
+    /// log unigram token frequency (thermo precedent). false = off.
+    pub head_bias: bool,
+    /// Parallel (GPT-J) block topology: `x + attn(ln1(x)) + ffn(ln2(x))`
+    /// instead of the sequential `ffn` reading the post-attention residual.
+    pub parallel_block: bool,
+    /// Per-channel LayerScale gates on the attn/FFN branch outputs (CaiT),
+    /// init ~1e-4 so each block starts near identity. false = off.
+    pub layerscale: bool,
+    /// SwiGLU gated FFN (adds a gate projection). Pass a reduced `d_ff`
+    /// (≈⅔) to stay iso-parameter with the 2-matrix FFN. false = off.
+    pub swiglu: bool,
+    /// Canon causal depthwise-conv kernel size, mixed into the residual
+    /// stream ahead of each block (lightweight local mixing). 0 = off.
+    pub canon_kernel: usize,
+    /// Differential attention (DIFF Transformer): two-softmax minus a
+    /// learned per-head λ. Needs an even d_head. false = off.
+    pub diff_attn: bool,
+    /// Number of learnable "sink"/register tokens prepended to every
+    /// sequence (always attendable, not scored). 0 = off.
+    pub sink_tokens: usize,
 }
 
 impl Default for TransformerConfig {
@@ -84,6 +113,15 @@ impl TransformerConfig {
             untied_head: false,
             softcap: 0.0,
             zero_ffn_proj: false,
+            z_loss: 0.0,
+            embed_lr_mult: 1.0,
+            head_bias: false,
+            parallel_block: false,
+            layerscale: false,
+            swiglu: false,
+            canon_kernel: 0,
+            diff_attn: false,
+            sink_tokens: 0,
         }
     }
 }
@@ -94,6 +132,10 @@ pub struct DecoderTransformer {
     pub embed: EmbedWeights,
     /// Untied LM head `[vocab * d_model]`; `None` = tied to `w_tok`.
     pub w_head: Option<Vec<f32>>,
+    /// Additive LM-head bias `[vocab]`; `None` = off.
+    pub head_bias: Option<Vec<f32>>,
+    /// Learnable sink/register rows `[sink_tokens * d_model]`; `None` = off.
+    pub sink: Option<Vec<f32>>,
     pub blocks: Vec<TransformerBlock>,
     pub final_ln: LayerNorm,
     pub adam: AdamState,
@@ -106,6 +148,8 @@ pub struct AdamState {
     pub g_w_tok: AdamGroup,
     pub g_w_pos: AdamGroup,
     pub g_w_head: AdamGroup,
+    pub g_head_bias: AdamGroup,
+    pub g_sink: AdamGroup,
     pub blocks: Vec<BlockAdam>,
     pub g_final_gamma: AdamGroup,
     pub g_final_beta: AdamGroup,
@@ -123,6 +167,10 @@ pub struct BlockAdam {
     pub ln2_beta: AdamGroup,
     pub w_fc: AdamGroup,
     pub w_proj: AdamGroup,
+    pub ls1: AdamGroup,
+    pub ls2: AdamGroup,
+    pub canon_w: AdamGroup,
+    pub mha_lambda: AdamGroup,
 }
 
 /// Muon momentum state for the six matrix params per block (Q/K/V/O,
@@ -141,10 +189,20 @@ pub struct BlockMuon {
     pub w_o: MuonGroup,
     pub w_fc: MuonGroup,
     pub w_proj: MuonGroup,
+    pub w_gate: MuonGroup,
 }
 
 impl DecoderTransformer {
     pub fn new<R: Rng>(config: TransformerConfig, rng: &mut R) -> Self {
+        // Differential attention splits each head's Q/K in half; an odd
+        // d_head would silently drop the last channel from both maps.
+        if config.diff_attn {
+            let d_head = config.d_model / config.n_head;
+            assert!(
+                d_head % 2 == 0,
+                "diff_attn requires an even d_head (d_model/n_head), got {d_head}"
+            );
+        }
         let mut embed = EmbedWeights::new(config.vocab, config.d_model, config.seq_len_max, rng);
         embed.use_pos = !config.rope;
         let blocks: Vec<TransformerBlock> = (0..config.n_layer)
@@ -154,6 +212,7 @@ impl DecoderTransformer {
                     config.n_head,
                     config.d_ff,
                     config.n_layer,
+                    config.swiglu,
                     rng,
                 );
                 blk.mha.rope = config.rope;
@@ -161,6 +220,20 @@ impl DecoderTransformer {
                 blk.ln1.rms = config.rmsnorm;
                 blk.ln2.rms = config.rmsnorm;
                 blk.ffn.relu2 = config.relu2;
+                blk.parallel = config.parallel_block;
+                if config.layerscale {
+                    blk.layerscale = true;
+                    blk.ls1 = vec![1e-4_f32; config.d_model];
+                    blk.ls2 = vec![1e-4_f32; config.d_model];
+                }
+                if config.canon_kernel > 0 {
+                    blk.canon_k = config.canon_kernel;
+                    blk.canon_w = vec![0.0_f32; config.d_model * config.canon_kernel];
+                }
+                if config.diff_attn {
+                    blk.mha.diff_attn = true;
+                    blk.mha.lambda = vec![0.8_f32; config.n_head];
+                }
                 if config.zero_ffn_proj {
                     blk.ffn.w_proj.w.fill(0.0);
                 }
@@ -174,6 +247,13 @@ impl DecoderTransformer {
         let w_head = config
             .untied_head
             .then(|| vec![0.0_f32; config.vocab * config.d_model]);
+        let head_bias = config.head_bias.then(|| vec![0.0_f32; config.vocab]);
+        let sink = (config.sink_tokens > 0).then(|| {
+            let scale = 0.02_f32 * 3.0_f32.sqrt();
+            (0..config.sink_tokens * config.d_model)
+                .map(|_| (rng.random::<f32>() * 2.0 - 1.0) * scale)
+                .collect::<Vec<f32>>()
+        });
 
         let d = config.d_model;
         let d_ff = config.d_ff;
@@ -188,11 +268,17 @@ impl DecoderTransformer {
             ln2_beta: AdamGroup::zeros(d),
             w_fc: AdamGroup::zeros(d * d_ff),
             w_proj: AdamGroup::zeros(d_ff * d),
+            ls1: AdamGroup::zeros(if config.layerscale { d } else { 0 }),
+            ls2: AdamGroup::zeros(if config.layerscale { d } else { 0 }),
+            canon_w: AdamGroup::zeros(if config.canon_kernel > 0 { d * config.canon_kernel } else { 0 }),
+            mha_lambda: AdamGroup::zeros(if config.diff_attn { config.n_head } else { 0 }),
         };
         let adam = AdamState {
             g_w_tok: AdamGroup::zeros(config.vocab * d),
             g_w_pos: AdamGroup::zeros(config.seq_len_max * d),
             g_w_head: AdamGroup::zeros(if config.untied_head { config.vocab * d } else { 0 }),
+            g_head_bias: AdamGroup::zeros(if config.head_bias { config.vocab } else { 0 }),
+            g_sink: AdamGroup::zeros(if config.sink_tokens > 0 { config.sink_tokens * d } else { 0 }),
             blocks: (0..config.n_layer).map(|_| block_adam()).collect(),
             g_final_gamma: AdamGroup::zeros(d),
             g_final_beta: AdamGroup::zeros(d),
@@ -204,6 +290,7 @@ impl DecoderTransformer {
             w_o: MuonGroup::zeros(d * d),
             w_fc: MuonGroup::zeros(d * d_ff),
             w_proj: MuonGroup::zeros(d_ff * d),
+            w_gate: MuonGroup::zeros(if config.swiglu { d * d_ff } else { 0 }),
         };
         let muon = MuonState {
             blocks: (0..config.n_layer).map(|_| block_muon()).collect(),
@@ -212,6 +299,8 @@ impl DecoderTransformer {
             config,
             embed,
             w_head,
+            head_bias,
+            sink,
             blocks,
             final_ln,
             adam,
@@ -229,6 +318,55 @@ impl DecoderTransformer {
         let embed = self.config.vocab * d + self.config.seq_len_max * d;
         let head = if self.config.untied_head { self.config.vocab * d } else { 0 };
         embed + head + self.config.n_layer * per_block + 2 * d
+    }
+
+    /// Blend this model (the EMA shadow) toward `live`:
+    /// `θ_ema ← decay·θ_ema + (1−decay)·θ_live` over every parameter.
+    /// For weight-averaged evaluation. Both models must share a layout.
+    pub fn ema_update(&mut self, live: &DecoderTransformer, decay: f32) {
+        let keep = decay;
+        let take = 1.0 - decay;
+        let blend = |e: &mut [f32], l: &[f32]| {
+            for (a, b) in e.iter_mut().zip(l) {
+                *a = keep * *a + take * *b;
+            }
+        };
+        blend(&mut self.embed.w_tok, &live.embed.w_tok);
+        blend(&mut self.embed.w_pos, &live.embed.w_pos);
+        if let (Some(e), Some(l)) = (self.w_head.as_mut(), live.w_head.as_ref()) {
+            blend(e, l);
+        }
+        if let (Some(e), Some(l)) = (self.head_bias.as_mut(), live.head_bias.as_ref()) {
+            blend(e, l);
+        }
+        if let (Some(e), Some(l)) = (self.sink.as_mut(), live.sink.as_ref()) {
+            blend(e, l);
+        }
+        for (eb, lb) in self.blocks.iter_mut().zip(&live.blocks) {
+            blend(&mut eb.ln1.gamma, &lb.ln1.gamma);
+            blend(&mut eb.ln1.beta, &lb.ln1.beta);
+            blend(&mut eb.mha.w_q.w, &lb.mha.w_q.w);
+            blend(&mut eb.mha.w_k.w, &lb.mha.w_k.w);
+            blend(&mut eb.mha.w_v.w, &lb.mha.w_v.w);
+            blend(&mut eb.mha.w_o.w, &lb.mha.w_o.w);
+            blend(&mut eb.ln2.gamma, &lb.ln2.gamma);
+            blend(&mut eb.ln2.beta, &lb.ln2.beta);
+            blend(&mut eb.ffn.w_fc.w, &lb.ffn.w_fc.w);
+            blend(&mut eb.ffn.w_proj.w, &lb.ffn.w_proj.w);
+            if let (Some(e), Some(l)) = (eb.ffn.w_gate.as_mut(), lb.ffn.w_gate.as_ref()) {
+                blend(&mut e.w, &l.w);
+            }
+            // canon_w / lambda are empty when their feature is off, so the
+            // blend is a no-op there.
+            blend(&mut eb.canon_w, &lb.canon_w);
+            blend(&mut eb.mha.lambda, &lb.mha.lambda);
+            if eb.layerscale {
+                blend(&mut eb.ls1, &lb.ls1);
+                blend(&mut eb.ls2, &lb.ls2);
+            }
+        }
+        blend(&mut self.final_ln.gamma, &live.final_ln.gamma);
+        blend(&mut self.final_ln.beta, &live.final_ln.beta);
     }
 }
 
@@ -254,11 +392,39 @@ impl ModelGrads {
         if config.untied_head {
             embed.d_w_head = vec![0.0; config.vocab * config.d_model];
         }
+        if config.head_bias {
+            embed.d_head_bias = vec![0.0; config.vocab];
+        }
+        let mut blocks: Vec<TransformerBlockGrads> = (0..config.n_layer)
+            .map(|_| TransformerBlockGrads::zeros(config.d_model, config.d_ff))
+            .collect();
+        if config.layerscale {
+            for bg in &mut blocks {
+                bg.d_ls1 = vec![0.0; config.d_model];
+                bg.d_ls2 = vec![0.0; config.d_model];
+            }
+        }
+        if config.swiglu {
+            for bg in &mut blocks {
+                bg.d_ffn.d_w_gate.d_w = vec![0.0; config.d_model * config.d_ff];
+            }
+        }
+        if config.canon_kernel > 0 {
+            for bg in &mut blocks {
+                bg.d_canon = vec![0.0; config.d_model * config.canon_kernel];
+            }
+        }
+        if config.diff_attn {
+            for bg in &mut blocks {
+                bg.d_mha.d_lambda = vec![0.0; config.n_head];
+            }
+        }
+        if config.sink_tokens > 0 {
+            embed.d_sink = vec![0.0; config.sink_tokens * config.d_model];
+        }
         Self {
             embed,
-            blocks: (0..config.n_layer)
-                .map(|_| TransformerBlockGrads::zeros(config.d_model, config.d_ff))
-                .collect(),
+            blocks,
             final_ln: LayerNormGrads::zeros(config.d_model),
         }
     }
@@ -303,6 +469,9 @@ impl ModelGrads {
             for v in &b.d_mha.d_w_o.d_w {
                 s += v * v;
             }
+            for v in &b.d_mha.d_lambda {
+                s += v * v;
+            }
             for v in &b.d_ln2.d_gamma {
                 s += v * v;
             }
@@ -315,11 +484,29 @@ impl ModelGrads {
             for v in &b.d_ffn.d_w_proj.d_w {
                 s += v * v;
             }
+            for v in &b.d_ffn.d_w_gate.d_w {
+                s += v * v;
+            }
+            for v in &b.d_canon {
+                s += v * v;
+            }
+            for v in &b.d_ls1 {
+                s += v * v;
+            }
+            for v in &b.d_ls2 {
+                s += v * v;
+            }
         }
         for v in &self.final_ln.d_gamma {
             s += v * v;
         }
         for v in &self.final_ln.d_beta {
+            s += v * v;
+        }
+        for v in &self.embed.d_head_bias {
+            s += v * v;
+        }
+        for v in &self.embed.d_sink {
             s += v * v;
         }
         s.sqrt()
@@ -352,11 +539,29 @@ impl ModelGrads {
             for v in &b.d_ln2.d_beta {
                 s += v * v;
             }
+            for v in &b.d_canon {
+                s += v * v;
+            }
+            for v in &b.d_ls1 {
+                s += v * v;
+            }
+            for v in &b.d_ls2 {
+                s += v * v;
+            }
+            for v in &b.d_mha.d_lambda {
+                s += v * v;
+            }
         }
         for v in &self.final_ln.d_gamma {
             s += v * v;
         }
         for v in &self.final_ln.d_beta {
+            s += v * v;
+        }
+        for v in &self.embed.d_head_bias {
+            s += v * v;
+        }
+        for v in &self.embed.d_sink {
             s += v * v;
         }
         s.sqrt()
@@ -386,11 +591,29 @@ impl ModelGrads {
             for v in &mut b.d_ln2.d_beta {
                 *v *= factor;
             }
+            for v in &mut b.d_canon {
+                *v *= factor;
+            }
+            for v in &mut b.d_ls1 {
+                *v *= factor;
+            }
+            for v in &mut b.d_ls2 {
+                *v *= factor;
+            }
+            for v in &mut b.d_mha.d_lambda {
+                *v *= factor;
+            }
         }
         for v in &mut self.final_ln.d_gamma {
             *v *= factor;
         }
         for v in &mut self.final_ln.d_beta {
+            *v *= factor;
+        }
+        for v in &mut self.embed.d_head_bias {
+            *v *= factor;
+        }
+        for v in &mut self.embed.d_sink {
             *v *= factor;
         }
     }
@@ -424,6 +647,9 @@ impl ModelGrads {
             for v in &mut b.d_mha.d_w_o.d_w {
                 *v *= factor;
             }
+            for v in &mut b.d_mha.d_lambda {
+                *v *= factor;
+            }
             for v in &mut b.d_ln2.d_gamma {
                 *v *= factor;
             }
@@ -436,11 +662,29 @@ impl ModelGrads {
             for v in &mut b.d_ffn.d_w_proj.d_w {
                 *v *= factor;
             }
+            for v in &mut b.d_ffn.d_w_gate.d_w {
+                *v *= factor;
+            }
+            for v in &mut b.d_canon {
+                *v *= factor;
+            }
+            for v in &mut b.d_ls1 {
+                *v *= factor;
+            }
+            for v in &mut b.d_ls2 {
+                *v *= factor;
+            }
         }
         for v in &mut self.final_ln.d_gamma {
             *v *= factor;
         }
         for v in &mut self.final_ln.d_beta {
+            *v *= factor;
+        }
+        for v in &mut self.embed.d_head_bias {
+            *v *= factor;
+        }
+        for v in &mut self.embed.d_sink {
             *v *= factor;
         }
     }
@@ -457,9 +701,16 @@ impl ModelGrads {
         add(&mut self.embed.d_w_tok, &other.embed.d_w_tok);
         add(&mut self.embed.d_w_pos, &other.embed.d_w_pos);
         add(&mut self.embed.d_w_head, &other.embed.d_w_head);
+        add(&mut self.embed.d_head_bias, &other.embed.d_head_bias);
+        add(&mut self.embed.d_sink, &other.embed.d_sink);
         for (sb, ob) in self.blocks.iter_mut().zip(&other.blocks) {
             add(&mut sb.d_ln1.d_gamma, &ob.d_ln1.d_gamma);
             add(&mut sb.d_ln1.d_beta, &ob.d_ln1.d_beta);
+            add(&mut sb.d_ls1, &ob.d_ls1);
+            add(&mut sb.d_ls2, &ob.d_ls2);
+            add(&mut sb.d_ffn.d_w_gate.d_w, &ob.d_ffn.d_w_gate.d_w);
+            add(&mut sb.d_canon, &ob.d_canon);
+            add(&mut sb.d_mha.d_lambda, &ob.d_mha.d_lambda);
             add(&mut sb.d_mha.d_w_q.d_w, &ob.d_mha.d_w_q.d_w);
             add(&mut sb.d_mha.d_w_k.d_w, &ob.d_mha.d_w_k.d_w);
             add(&mut sb.d_mha.d_w_v.d_w, &ob.d_mha.d_w_v.d_w);
@@ -477,7 +728,20 @@ impl ModelGrads {
 impl DecoderTransformer {
     /// Forward a single sequence of length `T`. Returns `(logits[T*V], cache)`.
     pub fn forward(&self, tokens: &[u32]) -> (Vec<f32>, ForwardCache) {
-        let (mut h, embed_cache) = embed_forward(&self.embed, tokens);
+        let (h_real, embed_cache) = embed_forward(&self.embed, tokens);
+        let d = self.config.d_model;
+        let k = self.config.sink_tokens;
+        // Prepend K learnable sink/register rows (always-attendable, scored
+        // nowhere): they occupy positions 0..K, real tokens shift to K..
+        let mut h = match self.sink.as_ref() {
+            Some(sink) => {
+                let mut hh = Vec::with_capacity(sink.len() + h_real.len());
+                hh.extend_from_slice(sink);
+                hh.extend_from_slice(&h_real);
+                hh
+            }
+            None => h_real,
+        };
 
         let mut block_caches = Vec::with_capacity(self.blocks.len());
         for blk in &self.blocks {
@@ -487,12 +751,23 @@ impl DecoderTransformer {
         }
         let (h_final, final_ln_cache) = layer_norm_forward(&self.final_ln, &h);
         let head_w = self.w_head.as_deref().unwrap_or(&self.embed.w_tok);
+        // Score only the real positions (h_final[K..]).
+        let head_input = &h_final[k * d..];
         let mut logits = tied_lm_head_forward(
-            &h_final,
+            head_input,
             head_w,
             self.config.vocab,
             self.config.d_model,
         );
+        if let Some(hb) = self.head_bias.as_ref() {
+            let v = self.config.vocab;
+            for ti in 0..logits.len() / v {
+                let row = &mut logits[ti * v..(ti + 1) * v];
+                for c in 0..v {
+                    row[c] += hb[c];
+                }
+            }
+        }
         let cap = self.config.softcap;
         if cap > 0.0 {
             for l in &mut logits {
@@ -528,7 +803,8 @@ impl DecoderTransformer {
         let t = targets.len();
         let v = self.config.vocab;
         let d = self.config.d_model;
-        debug_assert_eq!(cache.h_final.len(), t * d);
+        let k = self.config.sink_tokens;
+        debug_assert_eq!(cache.h_final.len(), (k + t) * d);
         debug_assert_eq!(logits.len(), t * v);
 
         let mut total_loss = 0.0_f32;
@@ -540,6 +816,7 @@ impl DecoderTransformer {
         // factor is recovered from them (tanh = logit/cap), no extra cache.
         let inv_t = 1.0_f32 / t as f32;
         let cap = self.config.softcap;
+        let zw = self.config.z_loss;
         for ti in 0..t {
             let row = &logits[ti * v..(ti + 1) * v];
             let drow = &mut d_logits[ti * v..(ti + 1) * v];
@@ -554,26 +831,60 @@ impl DecoderTransformer {
             let tgt = targets[ti] as usize;
             let p_target = (drow[tgt] * inv_sum).max(1e-12);
             total_loss += -p_target.ln();
-            drow[tgt] -= sum;
-            if cap > 0.0 {
-                let inv_cap = 1.0 / cap;
-                for c in 0..v {
-                    let th = row[c] * inv_cap;
-                    drow[c] *= inv_sum * inv_t * (1.0 - th * th);
-                }
+            // Logit z-loss (PaLM): penalize logsumexp drift. z = logsumexp(row);
+            // d(zw·z²)/d logit_c = 2·zw·z·softmax_c, folded into the softmax
+            // scale below. The same softcap chain factor (1-tanh²) applies to
+            // both CE and z-loss since z is a function of the capped logits.
+            // zw = 0 reduces to plain CE exactly.
+            let zfac = if zw > 0.0 {
+                let z = max + sum.ln();
+                total_loss += zw * z * z;
+                1.0 + 2.0 * zw * z
             } else {
-                for c in 0..v {
-                    drow[c] *= inv_sum * inv_t;
+                1.0
+            };
+            let inv_cap = if cap > 0.0 { 1.0 / cap } else { 0.0 };
+            for c in 0..v {
+                let mut g = drow[c] * inv_sum * zfac;
+                if c == tgt {
+                    g -= 1.0;
                 }
+                if cap > 0.0 {
+                    let th = row[c] * inv_cap;
+                    g *= 1.0 - th * th;
+                }
+                drow[c] = g * inv_t;
             }
         }
 
-        // LM head backward (into d_w_head when untied, else d_w_tok).
+        // LM-head bias gradient: d_logits are already d(loss)/d(raw logits)
+        // (the softcap chain factor is folded in above), and raw logits =
+        // matmul + head_bias, so d(loss)/d head_bias[c] = Σ_t d_logits[t,c].
+        if self.head_bias.is_some() {
+            let dhb = &mut grads.embed.d_head_bias;
+            for ti in 0..t {
+                let drow = &d_logits[ti * v..(ti + 1) * v];
+                for c in 0..v {
+                    dhb[c] += drow[c];
+                }
+            }
+        }
+        // LM head backward (into d_w_head when untied, else d_w_tok). With
+        // sink tokens the head saw only the real positions (h_final[K..]).
         let head_w = self.w_head.as_deref().unwrap_or(&self.embed.w_tok);
-        let d_h_final = if self.config.untied_head {
-            lm_head_backward(&cache.h_final, head_w, &d_logits, v, d, &mut grads.embed.d_w_head)
+        let head_input = &cache.h_final[k * d..];
+        let d_head_input = if self.config.untied_head {
+            lm_head_backward(head_input, head_w, &d_logits, v, d, &mut grads.embed.d_w_head)
         } else {
-            lm_head_backward(&cache.h_final, head_w, &d_logits, v, d, &mut grads.embed.d_w_tok)
+            lm_head_backward(head_input, head_w, &d_logits, v, d, &mut grads.embed.d_w_tok)
+        };
+        // Re-expand to the full (K+t) sequence; sinks received no direct loss.
+        let d_h_final = if k > 0 {
+            let mut full = vec![0.0_f32; (k + t) * d];
+            full[k * d..].copy_from_slice(&d_head_input);
+            full
+        } else {
+            d_head_input
         };
         // Final LayerNorm backward.
         let d_pre_final = layer_norm_backward(
@@ -594,10 +905,16 @@ impl DecoderTransformer {
             );
         }
 
-        // Embedding backward (token + positional). Note: token
-        // gradients ALSO accrue from the tied LM head above — same
-        // grads.embed buffer, additive.
-        embed_backward(&self.embed, &cache.embed, &d_h, &mut grads.embed);
+        // Sink/register gradient is the leading K rows of d_h; the rest go
+        // to the token/positional embedding backward.
+        if k > 0 {
+            for (g, dh) in grads.embed.d_sink.iter_mut().zip(&d_h[..k * d]) {
+                *g += *dh;
+            }
+            embed_backward(&self.embed, &cache.embed, &d_h[k * d..], &mut grads.embed);
+        } else {
+            embed_backward(&self.embed, &cache.embed, &d_h, &mut grads.embed);
+        }
 
         total_loss / t as f32
     }
@@ -609,12 +926,13 @@ impl DecoderTransformer {
     pub fn step_adamw(&mut self, grads: &ModelGrads, config: &AdamWConfig) {
         self.step += 1;
         let (bc1, bc2) = bias_correction(self.step as usize, config.beta1, config.beta2);
+        let embed_cfg = AdamWConfig { lr: config.lr * self.config.embed_lr_mult, ..*config };
 
         adamw_apply(
             &mut self.embed.w_tok,
             &grads.embed.d_w_tok,
             &mut self.adam.g_w_tok,
-            config,
+            &embed_cfg,
             bc1,
             bc2,
             true,
@@ -623,7 +941,7 @@ impl DecoderTransformer {
             &mut self.embed.w_pos,
             &grads.embed.d_w_pos,
             &mut self.adam.g_w_pos,
-            config,
+            &embed_cfg,
             bc1,
             bc2,
             false,
@@ -633,11 +951,17 @@ impl DecoderTransformer {
                 w_head,
                 &grads.embed.d_w_head,
                 &mut self.adam.g_w_head,
-                config,
+                &embed_cfg,
                 bc1,
                 bc2,
                 true,
             );
+        }
+        if let Some(hb) = self.head_bias.as_mut() {
+            adamw_apply(hb, &grads.embed.d_head_bias, &mut self.adam.g_head_bias, &embed_cfg, bc1, bc2, false);
+        }
+        if let Some(sink) = self.sink.as_mut() {
+            adamw_apply(sink, &grads.embed.d_sink, &mut self.adam.g_sink, &embed_cfg, bc1, bc2, false);
         }
         for (li, blk) in self.blocks.iter_mut().enumerate() {
             let ba = &mut self.adam.blocks[li];
@@ -652,6 +976,16 @@ impl DecoderTransformer {
             adamw_apply(&mut blk.ln2.beta, &bg.d_ln2.d_beta, &mut ba.ln2_beta, config, bc1, bc2, false);
             adamw_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut ba.w_fc, config, bc1, bc2, true);
             adamw_apply(&mut blk.ffn.w_proj.w, &bg.d_ffn.d_w_proj.d_w, &mut ba.w_proj, config, bc1, bc2, true);
+            if blk.layerscale {
+                adamw_apply(&mut blk.ls1, &bg.d_ls1, &mut ba.ls1, config, bc1, bc2, false);
+                adamw_apply(&mut blk.ls2, &bg.d_ls2, &mut ba.ls2, config, bc1, bc2, false);
+            }
+            if blk.canon_k > 0 {
+                adamw_apply(&mut blk.canon_w, &bg.d_canon, &mut ba.canon_w, config, bc1, bc2, false);
+            }
+            if blk.mha.diff_attn {
+                adamw_apply(&mut blk.mha.lambda, &bg.d_mha.d_lambda, &mut ba.mha_lambda, config, bc1, bc2, false);
+            }
         }
         adamw_apply(
             &mut self.final_ln.gamma,
@@ -702,10 +1036,17 @@ impl DecoderTransformer {
         // params (Q/K/V/O, FC, Proj) go through the parallel Muon section.
         // AdamW and Muon touch disjoint params, so ordering all-AdamW then
         // all-Muon is equivalent to the previous interleaved order.
-        adamw_apply(&mut self.embed.w_tok, &grads.embed.d_w_tok, &mut self.adam.g_w_tok, adam_cfg, bc1, bc2, true);
-        adamw_apply(&mut self.embed.w_pos, &grads.embed.d_w_pos, &mut self.adam.g_w_pos, adam_cfg, bc1, bc2, false);
+        let embed_cfg = AdamWConfig { lr: adam_cfg.lr * self.config.embed_lr_mult, ..*adam_cfg };
+        adamw_apply(&mut self.embed.w_tok, &grads.embed.d_w_tok, &mut self.adam.g_w_tok, &embed_cfg, bc1, bc2, true);
+        adamw_apply(&mut self.embed.w_pos, &grads.embed.d_w_pos, &mut self.adam.g_w_pos, &embed_cfg, bc1, bc2, false);
         if let Some(w_head) = self.w_head.as_mut() {
-            adamw_apply(w_head, &grads.embed.d_w_head, &mut self.adam.g_w_head, adam_cfg, bc1, bc2, true);
+            adamw_apply(w_head, &grads.embed.d_w_head, &mut self.adam.g_w_head, &embed_cfg, bc1, bc2, true);
+        }
+        if let Some(hb) = self.head_bias.as_mut() {
+            adamw_apply(hb, &grads.embed.d_head_bias, &mut self.adam.g_head_bias, &embed_cfg, bc1, bc2, false);
+        }
+        if let Some(sink) = self.sink.as_mut() {
+            adamw_apply(sink, &grads.embed.d_sink, &mut self.adam.g_sink, &embed_cfg, bc1, bc2, false);
         }
         for (li, ba) in self.adam.blocks.iter_mut().enumerate() {
             let blk = &mut self.blocks[li];
@@ -714,6 +1055,16 @@ impl DecoderTransformer {
             adamw_apply(&mut blk.ln1.beta, &bg.d_ln1.d_beta, &mut ba.ln1_beta, adam_cfg, bc1, bc2, false);
             adamw_apply(&mut blk.ln2.gamma, &bg.d_ln2.d_gamma, &mut ba.ln2_gamma, adam_cfg, bc1, bc2, false);
             adamw_apply(&mut blk.ln2.beta, &bg.d_ln2.d_beta, &mut ba.ln2_beta, adam_cfg, bc1, bc2, false);
+            if blk.layerscale {
+                adamw_apply(&mut blk.ls1, &bg.d_ls1, &mut ba.ls1, adam_cfg, bc1, bc2, false);
+                adamw_apply(&mut blk.ls2, &bg.d_ls2, &mut ba.ls2, adam_cfg, bc1, bc2, false);
+            }
+            if blk.canon_k > 0 {
+                adamw_apply(&mut blk.canon_w, &bg.d_canon, &mut ba.canon_w, adam_cfg, bc1, bc2, false);
+            }
+            if blk.mha.diff_attn {
+                adamw_apply(&mut blk.mha.lambda, &bg.d_mha.d_lambda, &mut ba.mha_lambda, adam_cfg, bc1, bc2, false);
+            }
         }
         adamw_apply(&mut self.final_ln.gamma, &grads.final_ln.d_gamma, &mut self.adam.g_final_gamma, adam_cfg, bc1, bc2, false);
         adamw_apply(&mut self.final_ln.beta, &grads.final_ln.d_beta, &mut self.adam.g_final_beta, adam_cfg, bc1, bc2, false);
@@ -736,6 +1087,9 @@ impl DecoderTransformer {
                 muon_apply(&mut blk.mha.w_o.w, &bg.d_mha.d_w_o.d_w, &mut bm.w_o, d, d, muon_cfg, scratch);
                 muon_apply(&mut blk.ffn.w_fc.w, &bg.d_ffn.d_w_fc.d_w, &mut bm.w_fc, d, d_ff, muon_cfg, scratch);
                 muon_apply(&mut blk.ffn.w_proj.w, &bg.d_ffn.d_w_proj.d_w, &mut bm.w_proj, d_ff, d, muon_cfg, scratch);
+                if let Some(wg) = blk.ffn.w_gate.as_mut() {
+                    muon_apply(&mut wg.w, &bg.d_ffn.d_w_gate.d_w, &mut bm.w_gate, d, d_ff, muon_cfg, scratch);
+                }
             });
     }
 

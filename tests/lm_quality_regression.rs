@@ -199,6 +199,132 @@ fn checkpoint_v3_round_trip_preserves_loss() {
 }
 
 #[test]
+fn checkpoint_v6_round_trip_preserves_canon() {
+    let mut rng = StdRng::seed_from_u64(0xCA6);
+    let cfg = TransformerConfig {
+        vocab: 32,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        canon_kernel: 3,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // Move taps off the zero init so the round-trip actually moves bits.
+    for blk in &mut model.blocks {
+        blk.canon_w = (0..cfg.d_model * 3).map(|i| (i as f32 * 0.013).sin()).collect();
+    }
+
+    let tokens: Vec<u32> = (0..16u32).collect();
+    let input = &tokens[..15];
+    let (logits_before, _) = model.forward(input);
+
+    let tmp = std::env::temp_dir().join("aurora_ckpt_v6_canon.bin");
+    checkpoint::save(&tmp, &model, 0, model.step).expect("save");
+    let loaded = checkpoint::load(&tmp).expect("load");
+
+    assert_eq!(loaded.model.config.canon_kernel, 3, "canon_kernel not preserved");
+    for (b1, b2) in model.blocks.iter().zip(loaded.model.blocks.iter()) {
+        assert_eq!(b1.canon_w.len(), b2.canon_w.len(), "canon_w length mismatch");
+        for (a, b) in b1.canon_w.iter().zip(&b2.canon_w) {
+            assert!((a - b).abs() < 1e-6, "canon_w mismatch after round-trip");
+        }
+    }
+    let (logits_after, _) = loaded.model.forward(input);
+    for (a, b) in logits_before.iter().zip(&logits_after) {
+        assert!((a - b).abs() < 1e-5, "logits differ after canon round-trip");
+    }
+
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn checkpoint_v7_round_trip_preserves_all_features() {
+    // Every V7-serialized feature at once — swiglu + layerscale +
+    // parallel_block + diff_attn + head_bias + sink + canon — so a regress
+    // that drops one tensor from save/load fails here, not silently in a run.
+    let mut rng = StdRng::seed_from_u64(0xA11);
+    let cfg = TransformerConfig {
+        vocab: 32,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 48,
+        seq_len_max: 16,
+        swiglu: true,
+        layerscale: true,
+        parallel_block: true,
+        diff_attn: true,
+        head_bias: true,
+        sink_tokens: 2,
+        canon_kernel: 3,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // Move every feature tensor off its init so the round-trip moves bits.
+    model.head_bias = Some((0..cfg.vocab).map(|i| (i as f32 * 0.011).sin()).collect());
+    model.sink =
+        Some((0..cfg.sink_tokens * cfg.d_model).map(|i| (i as f32 * 0.007).cos()).collect());
+    for (li, blk) in model.blocks.iter_mut().enumerate() {
+        let s = (li + 1) as f32;
+        blk.canon_w = (0..cfg.d_model * cfg.canon_kernel)
+            .map(|i| (i as f32 * 0.013 * s).sin())
+            .collect();
+        blk.ls1 = (0..cfg.d_model).map(|i| 0.1 + (i as f32 * 0.02).sin()).collect();
+        blk.ls2 = (0..cfg.d_model).map(|i| 0.2 + (i as f32 * 0.03).cos()).collect();
+        blk.mha.lambda = (0..cfg.n_head).map(|h| 0.5 + 0.1 * h as f32).collect();
+        for (i, v) in blk.ffn.w_gate.as_mut().expect("swiglu gate").w.iter_mut().enumerate() {
+            *v = (i as f32 * 0.005 * s).sin() * 0.1;
+        }
+    }
+
+    let tokens: Vec<u32> = (0..16u32).collect();
+    let input = &tokens[..15];
+    let (logits_before, _) = model.forward(input);
+
+    let tmp = std::env::temp_dir().join("aurora_ckpt_v7_all.bin");
+    checkpoint::save(&tmp, &model, 0, model.step).expect("save");
+    let lm = checkpoint::load(&tmp).expect("load").model;
+
+    assert!(
+        lm.config.swiglu
+            && lm.config.layerscale
+            && lm.config.parallel_block
+            && lm.config.diff_attn
+            && lm.config.head_bias,
+        "arch flags not preserved"
+    );
+    assert_eq!(lm.config.sink_tokens, 2, "sink_tokens not preserved");
+    assert_eq!(lm.config.canon_kernel, 3, "canon_kernel not preserved");
+
+    let approx = |a: &[f32], b: &[f32], what: &str| {
+        assert_eq!(a.len(), b.len(), "{what} length mismatch");
+        for (x, y) in a.iter().zip(b) {
+            assert!((x - y).abs() < 1e-6, "{what} mismatch after round-trip");
+        }
+    };
+    approx(model.head_bias.as_ref().unwrap(), lm.head_bias.as_ref().unwrap(), "head_bias");
+    approx(model.sink.as_ref().unwrap(), lm.sink.as_ref().unwrap(), "sink");
+    for (b1, b2) in model.blocks.iter().zip(&lm.blocks) {
+        approx(&b1.canon_w, &b2.canon_w, "canon_w");
+        approx(&b1.ls1, &b2.ls1, "ls1");
+        approx(&b1.ls2, &b2.ls2, "ls2");
+        approx(&b1.mha.lambda, &b2.mha.lambda, "lambda");
+        approx(
+            &b1.ffn.w_gate.as_ref().unwrap().w,
+            &b2.ffn.w_gate.as_ref().unwrap().w,
+            "w_gate",
+        );
+    }
+    let (logits_after, _) = lm.forward(input);
+    approx(&logits_before, &logits_after, "logits");
+
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
 fn checkpoint_round_trip_preserves_rope_flag() {
     let mut rng = StdRng::seed_from_u64(0x99);
     let cfg = TransformerConfig {

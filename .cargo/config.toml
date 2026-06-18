@@ -1,0 +1,12 @@
+# Phase 1: build for the host CPU. The dense matmul dot-product inner
+# loops (src/attention.rs::linear_forward, tied-head) are otherwise
+# SSE2-only on the generic x86-64 baseline — no AVX2, no FMA. On the
+# i5-12400F (Alder Lake) native unlocks AVX2 + FMA.
+#
+# A/B-gated: the thermo sibling found target-cpu=native SLOWER for its
+# bandwidth-bound conv, but Aurora's matmuls are compute-bound (roofline),
+# so the call has to be made by measurement, not assumption. FMA also
+# fuses a*b+c to a single rounding, so results shift within tolerance vs
+# the SSE2 build (lm_quality_regression stays green; not bit-identical).
+[build]
+rustflags = ["-C", "target-cpu=native"]

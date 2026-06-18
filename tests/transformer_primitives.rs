@@ -233,7 +233,7 @@ fn ffn_backward_matches_numerical() {
     let d_ff = 12;
     let t = 3;
 
-    let w = FfnWeights::new(d_model, d_ff, 2, &mut rng);
+    let w = FfnWeights::new(d_model, d_ff, 2, false, &mut rng);
     let x = random_vec(t * d_model, &mut rng);
     let upstream = random_vec(t * d_model, &mut rng);
 
@@ -452,7 +452,7 @@ fn relu2_ffn_backward_matches_numerical() {
     let d_ff = 12;
     let t = 3;
 
-    let mut w = FfnWeights::new(d_model, d_ff, 2, &mut rng);
+    let mut w = FfnWeights::new(d_model, d_ff, 2, false, &mut rng);
     w.relu2 = true;
     let x = random_vec(t * d_model, &mut rng);
     let upstream = random_vec(t * d_model, &mut rng);
@@ -622,6 +622,545 @@ fn zero_ffn_proj_zeroes_only_proj_init() {
     for blk in &model.blocks {
         assert!(blk.ffn.w_proj.w.iter().all(|&v| v == 0.0), "w_proj not zeroed");
         assert!(blk.ffn.w_fc.w.iter().any(|&v| v != 0.0), "w_fc unexpectedly zeroed");
+    }
+}
+
+#[test]
+fn z_loss_model_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0x2105);
+    let cfg = TransformerConfig {
+        vocab: 12,
+        d_model: 8,
+        n_layer: 1,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        z_loss: 0.3,
+        // Exercise the z-loss × softcap chain factor together.
+        softcap: 2.0,
+        ..TransformerConfig::default()
+    };
+    let model = DecoderTransformer::new(cfg.clone(), &mut rng);
+
+    let tokens: Vec<u32> = vec![3, 7, 1, 9, 4];
+    let targets: Vec<u32> = vec![7, 1, 9, 4, 2];
+
+    // Objective must match backward(): mean CE + z_loss·mean(logsumexp²),
+    // both over the SAME post-softcap logits the model emits.
+    let obj = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            let z = max + sum.ln();
+            total += -(row[targets[ti] as usize] - z) + m.config.z_loss * z * z;
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    let mut grads = ModelGrads::zeros(&cfg);
+    let loss = model.backward(&cache, &logits, &targets, &mut grads);
+    assert!(
+        (loss - obj(&model)).abs() < 1e-4,
+        "backward loss {loss} != CE+z-loss objective {}",
+        obj(&model)
+    );
+
+    for i in [0, 25, 60] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.embed.w_tok[i] += EPS;
+        mm.embed.w_tok[i] -= EPS;
+        let g = (obj(&mp) - obj(&mm)) / (2.0 * EPS);
+        let err = rel_err(grads.embed.d_w_tok[i], g);
+        assert!(err < TOL, "z-loss d_w_tok[{i}]: analytic {} vs numeric {g} (err {err})", grads.embed.d_w_tok[i]);
+    }
+    for i in [0, 5, 17] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[0].mha.w_q.w[i] += EPS;
+        mm.blocks[0].mha.w_q.w[i] -= EPS;
+        let g = (obj(&mp) - obj(&mm)) / (2.0 * EPS);
+        let err = rel_err(grads.blocks[0].d_mha.d_w_q.d_w[i], g);
+        assert!(err < TOL, "z-loss d_w_q[{i}]: analytic {} vs numeric {g} (err {err})", grads.blocks[0].d_mha.d_w_q.d_w[i]);
+    }
+}
+
+#[test]
+fn head_bias_model_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0xB1A5);
+    let cfg = TransformerConfig {
+        vocab: 12,
+        d_model: 8,
+        n_layer: 1,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        head_bias: true,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // Randomize the bias so its gradient path is actually exercised.
+    model.head_bias = Some(random_vec(cfg.vocab, &mut rng));
+
+    let tokens: Vec<u32> = vec![3, 7, 1, 9, 4];
+    let targets: Vec<u32> = vec![7, 1, 9, 4, 2];
+
+    let ce = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            total += -(row[targets[ti] as usize] - max - sum.ln());
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    let mut grads = ModelGrads::zeros(&cfg);
+    let loss = model.backward(&cache, &logits, &targets, &mut grads);
+    assert!((loss - ce(&model)).abs() < 1e-4, "backward loss != forward CE");
+
+    for i in [0, 4, 9, 11] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.head_bias.as_mut().unwrap()[i] += EPS;
+        mm.head_bias.as_mut().unwrap()[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let err = rel_err(grads.embed.d_head_bias[i], g);
+        assert!(err < TOL, "d_head_bias[{i}]: analytic {} vs numeric {g} (err {err})", grads.embed.d_head_bias[i]);
+    }
+    for i in [0, 25, 60] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.embed.w_tok[i] += EPS;
+        mm.embed.w_tok[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let err = rel_err(grads.embed.d_w_tok[i], g);
+        assert!(err < TOL, "head_bias d_w_tok[{i}]: analytic {} vs numeric {g} (err {err})", grads.embed.d_w_tok[i]);
+    }
+}
+
+#[test]
+fn parallel_block_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0x9A2A);
+    let cfg = TransformerConfig {
+        vocab: 11,
+        d_model: 8,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        parallel_block: true,
+        ..TransformerConfig::default()
+    };
+    let model = DecoderTransformer::new(cfg.clone(), &mut rng);
+
+    let tokens: Vec<u32> = vec![2, 5, 1, 8, 3];
+    let targets: Vec<u32> = vec![5, 1, 8, 3, 0];
+
+    let ce = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            total += -(row[targets[ti] as usize] - max - sum.ln());
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    let mut grads = ModelGrads::zeros(&cfg);
+    model.backward(&cache, &logits, &targets, &mut grads);
+
+    // FFN reads x in parallel mode — its grad path differs from sequential.
+    for i in [0, 7, 31] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[1].ffn.w_fc.w[i] += EPS;
+        mm.blocks[1].ffn.w_fc.w[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let err = rel_err(grads.blocks[1].d_ffn.d_w_fc.d_w[i], g);
+        assert!(err < TOL, "parallel d_w_fc[{i}]: analytic {} vs numeric {g} (err {err})", grads.blocks[1].d_ffn.d_w_fc.d_w[i]);
+    }
+    for i in [0, 3, 7] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[0].ln2.gamma[i] += EPS;
+        mm.blocks[0].ln2.gamma[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        // Abs fallback: LN-γ grads here are O(1e-4); f32 central differences
+        // lose ~1 digit at that scale, so a relative check alone is unstable.
+        let a = grads.blocks[0].d_ln2.d_gamma[i];
+        let err = rel_err(a, g);
+        assert!(err < TOL || (a - g).abs() < 2e-4, "parallel d_ln2_gamma[{i}]: analytic {a} vs numeric {g} (err {err})");
+    }
+    for i in [0, 13, 40] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[1].mha.w_q.w[i] += EPS;
+        mm.blocks[1].mha.w_q.w[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let err = rel_err(grads.blocks[1].d_mha.d_w_q.d_w[i], g);
+        assert!(err < TOL, "parallel d_w_q[{i}]: analytic {} vs numeric {g} (err {err})", grads.blocks[1].d_mha.d_w_q.d_w[i]);
+    }
+}
+
+#[test]
+fn layerscale_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0x15CA);
+    let cfg = TransformerConfig {
+        vocab: 11,
+        d_model: 8,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        layerscale: true,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // Move the gates off the ~1e-4 identity init so their grads are non-trivial.
+    for blk in &mut model.blocks {
+        blk.ls1 = random_vec(cfg.d_model, &mut rng);
+        blk.ls2 = random_vec(cfg.d_model, &mut rng);
+    }
+
+    let tokens: Vec<u32> = vec![2, 5, 1, 8, 3];
+    let targets: Vec<u32> = vec![5, 1, 8, 3, 0];
+
+    let ce = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            total += -(row[targets[ti] as usize] - max - sum.ln());
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    let mut grads = ModelGrads::zeros(&cfg);
+    model.backward(&cache, &logits, &targets, &mut grads);
+
+    for li in 0..2 {
+        for c in [0usize, 3, 7] {
+            let mut mp = model.clone();
+            let mut mm = model.clone();
+            mp.blocks[li].ls1[c] += EPS;
+            mm.blocks[li].ls1[c] -= EPS;
+            let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+            let a = grads.blocks[li].d_ls1[c];
+            assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "d_ls1 blk{li}[{c}]: analytic {a} vs numeric {g}");
+
+            let mut mp = model.clone();
+            let mut mm = model.clone();
+            mp.blocks[li].ls2[c] += EPS;
+            mm.blocks[li].ls2[c] -= EPS;
+            let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+            let a = grads.blocks[li].d_ls2[c];
+            assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "d_ls2 blk{li}[{c}]: analytic {a} vs numeric {g}");
+        }
+    }
+    // Downstream attn weight still correct with gates active.
+    for i in [0, 31, 60] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[1].mha.w_q.w[i] += EPS;
+        mm.blocks[1].mha.w_q.w[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.blocks[1].d_mha.d_w_q.d_w[i];
+        assert!(rel_err(a, g) < TOL, "ls d_w_q blk1[{i}]: analytic {a} vs numeric {g}");
+    }
+}
+
+#[test]
+fn swiglu_ffn_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0x5417);
+    let cfg = TransformerConfig {
+        vocab: 11,
+        d_model: 8,
+        n_layer: 1,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        swiglu: true,
+        ..TransformerConfig::default()
+    };
+    let model = DecoderTransformer::new(cfg.clone(), &mut rng);
+
+    let tokens: Vec<u32> = vec![2, 5, 1, 8, 3];
+    let targets: Vec<u32> = vec![5, 1, 8, 3, 0];
+
+    let ce = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            total += -(row[targets[ti] as usize] - max - sum.ln());
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    let mut grads = ModelGrads::zeros(&cfg);
+    model.backward(&cache, &logits, &targets, &mut grads);
+
+    // Gate projection (the SwiGLU-specific path).
+    for i in [0, 50, 120] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[0].ffn.w_gate.as_mut().unwrap().w[i] += EPS;
+        mm.blocks[0].ffn.w_gate.as_mut().unwrap().w[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.blocks[0].d_ffn.d_w_gate.d_w[i];
+        assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "d_w_gate[{i}]: analytic {a} vs numeric {g}");
+    }
+    // Up (w_fc) and down (w_proj) projections under the gated activation.
+    for i in [0, 50, 120] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[0].ffn.w_fc.w[i] += EPS;
+        mm.blocks[0].ffn.w_fc.w[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.blocks[0].d_ffn.d_w_fc.d_w[i];
+        assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "swiglu d_w_fc[{i}]: analytic {a} vs numeric {g}");
+
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[0].ffn.w_proj.w[i] += EPS;
+        mm.blocks[0].ffn.w_proj.w[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.blocks[0].d_ffn.d_w_proj.d_w[i];
+        assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "swiglu d_w_proj[{i}]: analytic {a} vs numeric {g}");
+    }
+}
+
+#[test]
+fn canon_block_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0xCA40);
+    let cfg = TransformerConfig {
+        vocab: 11,
+        d_model: 8,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        canon_kernel: 3,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // Move taps off the zero (identity) init so the conv path is exercised.
+    for blk in &mut model.blocks {
+        blk.canon_w = random_vec(cfg.d_model * 3, &mut rng);
+    }
+
+    let tokens: Vec<u32> = vec![2, 5, 1, 8, 3];
+    let targets: Vec<u32> = vec![5, 1, 8, 3, 0];
+
+    let ce = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            total += -(row[targets[ti] as usize] - max - sum.ln());
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    let mut grads = ModelGrads::zeros(&cfg);
+    model.backward(&cache, &logits, &targets, &mut grads);
+
+    for li in 0..2 {
+        for i in [0usize, 5, 23] {
+            let mut mp = model.clone();
+            let mut mm = model.clone();
+            mp.blocks[li].canon_w[i] += EPS;
+            mm.blocks[li].canon_w[i] -= EPS;
+            let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+            let a = grads.blocks[li].d_canon[i];
+            assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "d_canon blk{li}[{i}]: analytic {a} vs numeric {g}");
+        }
+    }
+    // Downstream attn weight still correct with the conv active.
+    for i in [0, 13, 40] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[1].mha.w_q.w[i] += EPS;
+        mm.blocks[1].mha.w_q.w[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.blocks[1].d_mha.d_w_q.d_w[i];
+        assert!(rel_err(a, g) < TOL, "canon d_w_q blk1[{i}]: analytic {a} vs numeric {g}");
+    }
+}
+
+#[test]
+fn diff_attn_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0xD1FF);
+    let cfg = TransformerConfig {
+        vocab: 11,
+        d_model: 8,
+        n_layer: 1,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        diff_attn: true,
+        ..TransformerConfig::default()
+    };
+    let mut model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // w_o is zero-init (MHA = identity), which nulls the attention path;
+    // randomize it so Q/K/V/λ gradients are actually exercised.
+    model.blocks[0].mha.w_o.w = random_vec(cfg.d_model * cfg.d_model, &mut rng);
+
+    let tokens: Vec<u32> = vec![2, 5, 1, 8, 3];
+    let targets: Vec<u32> = vec![5, 1, 8, 3, 0];
+
+    let ce = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            total += -(row[targets[ti] as usize] - max - sum.ln());
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    let mut grads = ModelGrads::zeros(&cfg);
+    model.backward(&cache, &logits, &targets, &mut grads);
+
+    // Learned per-head λ.
+    for h in [0usize, 1] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[0].mha.lambda[h] += EPS;
+        mm.blocks[0].mha.lambda[h] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.blocks[0].d_mha.d_lambda[h];
+        assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "d_lambda[{h}]: analytic {a} vs numeric {g}");
+    }
+    // Q (split into the two maps) and V (shared) projections.
+    for i in [0, 20, 50] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[0].mha.w_q.w[i] += EPS;
+        mm.blocks[0].mha.w_q.w[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.blocks[0].d_mha.d_w_q.d_w[i];
+        assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "diff d_w_q[{i}]: analytic {a} vs numeric {g}");
+
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.blocks[0].mha.w_v.w[i] += EPS;
+        mm.blocks[0].mha.w_v.w[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.blocks[0].d_mha.d_w_v.d_w[i];
+        assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "diff d_w_v[{i}]: analytic {a} vs numeric {g}");
+    }
+}
+
+#[test]
+fn sink_tokens_backward_matches_numerical() {
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let mut rng = StdRng::seed_from_u64(0x5141);
+    let cfg = TransformerConfig {
+        vocab: 11,
+        d_model: 8,
+        n_layer: 1,
+        n_head: 2,
+        d_ff: 16,
+        seq_len_max: 8,
+        sink_tokens: 2,
+        ..TransformerConfig::default()
+    };
+    let model = DecoderTransformer::new(cfg.clone(), &mut rng);
+
+    let tokens: Vec<u32> = vec![2, 5, 1, 8, 3];
+    let targets: Vec<u32> = vec![5, 1, 8, 3, 0];
+
+    let ce = |m: &DecoderTransformer| -> f32 {
+        let (logits, _) = m.forward(&tokens);
+        let v = m.config.vocab;
+        let t = targets.len();
+        let mut total = 0.0_f32;
+        for ti in 0..t {
+            let row = &logits[ti * v..(ti + 1) * v];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+            total += -(row[targets[ti] as usize] - max - sum.ln());
+        }
+        total / t as f32
+    };
+
+    let (logits, cache) = model.forward(&tokens);
+    assert_eq!(logits.len(), targets.len() * cfg.vocab, "sink must not change scored length");
+    let mut grads = ModelGrads::zeros(&cfg);
+    model.backward(&cache, &logits, &targets, &mut grads);
+
+    // Sink/register rows (2 * 8 = 16 elements).
+    for i in [0usize, 7, 15] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.sink.as_mut().unwrap()[i] += EPS;
+        mm.sink.as_mut().unwrap()[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.embed.d_sink[i];
+        assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "d_sink[{i}]: analytic {a} vs numeric {g}");
+    }
+    // Token embedding still correct alongside the sinks.
+    for i in [0, 25, 60] {
+        let mut mp = model.clone();
+        let mut mm = model.clone();
+        mp.embed.w_tok[i] += EPS;
+        mm.embed.w_tok[i] -= EPS;
+        let g = (ce(&mp) - ce(&mm)) / (2.0 * EPS);
+        let a = grads.embed.d_w_tok[i];
+        assert!(rel_err(a, g) < TOL || (a - g).abs() < 2e-4, "sink d_w_tok[{i}]: analytic {a} vs numeric {g}");
     }
 }
 

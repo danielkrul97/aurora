@@ -664,6 +664,63 @@ fn full_transformer_rope_forward_and_grads_match_cpu() {
 }
 
 #[test]
+fn full_transformer_canon_forward_and_grads_match_cpu() {
+    // Canon causal depthwise conv: forward (canon_out feeds ln1 + residual)
+    // and backward (canon_dx maps dx back, canon_dw accumulates g_canon_w).
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0xCA0E);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        canon_kernel: 3,
+        ..TransformerConfig::default()
+    };
+    let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    // Move taps off the zero init so the conv path is actually exercised
+    // (deterministic, no Rng-trait dependency in this test file).
+    for blk in &mut cpu_model.blocks {
+        blk.canon_w = (0..cfg.d_model * 3).map(|i| ((i as f32) * 0.017).sin() * 0.1).collect();
+    }
+    let cpu_model = cpu_model;
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..8u32).map(|i| (i * 5 + 3) % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let (cpu_logits, cpu_cache) = cpu_model.forward(&tokens);
+    let mut cpu_grads = ModelGrads::zeros(&cfg);
+    let cpu_loss = cpu_model.clone().backward(&cpu_cache, &cpu_logits, &targets, &mut cpu_grads);
+
+    gpu_model.zero_grad();
+    let gpu_loss = gpu_model.train_step(&tokens, &targets);
+
+    let loss_diff = (cpu_loss - gpu_loss).abs();
+    assert!(loss_diff < 5e-2, "canon loss CPU {cpu_loss} vs GPU {gpu_loss}, diff {loss_diff}");
+
+    for li in 0..cfg.n_layer {
+        // Canon tap gradient (the new dw-reduction kernel).
+        let gpu_g_canon = gpu_model.p.blocks[li].g_canon_w.download(&gpu_model.ctx);
+        let err_canon = max_rel_err(&cpu_grads.blocks[li].d_canon, &gpu_g_canon);
+        assert!(err_canon < 5e-2, "canon g_canon_w layer {li} err {err_canon}");
+        // Downstream q-proj grad depends on the canon-mixed input (forward path).
+        let gpu_g_w_q = gpu_model.p.blocks[li].g_w_q.download(&gpu_model.ctx);
+        let err_q = max_rel_err(&cpu_grads.blocks[li].d_mha.d_w_q.d_w, &gpu_g_w_q);
+        assert!(err_q < 5e-2, "canon g_w_q layer {li} err {err_q}");
+    }
+    // Embedding grad flows through the canon dx mapping (backward path).
+    let gpu_g_w_tok = gpu_model.p.g_w_tok.download(&gpu_model.ctx);
+    let err_tok = max_rel_err(&cpu_grads.embed.d_w_tok, &gpu_g_w_tok);
+    assert!(err_tok < 5e-2, "canon g_w_tok err {err_tok}");
+}
+
+#[test]
 fn full_transformer_tier1_forward_and_grads_match_cpu() {
     // Whole Tier-1 pack at once: rope + rmsnorm + relu2 + qk-norm +
     // untied head + softcap. Catches any kernel whose mode flag isn't

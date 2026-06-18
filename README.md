@@ -58,14 +58,14 @@ WGSL, Vulkan/Metal/DX12).
 - **`aurora_train` example** — hlavní entry point. CLI: `--d-model`,
   `--n-layer`, `--n-head`, `--d-ff`, `--seq-len`, `--batch-size`, `--lr`,
   `--warmup-steps`, `--weight-decay`, `--grad-clip`, `--gpu` (opt-in),
-  `--viz` (opt-in).
+  `--viz` (opt-in), `--governor` (opt-in, CPU + GPU).
 - **JSONL structured metrics** (`--metrics path.jsonl`) — `run` / `step` /
   `epoch_done` / `checkpoint` events, per-event flush
 - **`scripts/overnight.sh`** — nohup wrapper s pre-flight checks
 - **Anti-regrese**: `transformer_primitives` (6 numerických gradient
   testů), `transformer_smoke` (3 convergence testů), `lm_quality_regression`
   (3 testů), `stability` (7 testů), `gpu_parity` (13 testů s `--features gpu`),
-  `kv_cache` (3 testů).
+  `kv_cache` (3 testů), `governor` (12 testů — PHAGE).
 
 ### Live vizualizace (Bevy, opt-in)
 - **`src/viz/`** + cargo feature `viz` — real-time Bevy 0.18 okno
@@ -74,6 +74,30 @@ WGSL, Vulkan/Metal/DX12).
 - Trénink běží ve worker threadu, viz na main threadu, sdílí
   `Arc<Mutex<TrainingSnapshot>>` — žádný impact na throughput
 - Window close = trénink pokračuje headless
+
+### Runtime efficiency governor — PHAGE (opt-in, CPU + GPU)
+- **`src/governor/`** + flag `--governor` — za běhu hlídá efektivitu
+  tréninku (`η = −Δloss/Δwall`), lokalizuje původce stagnace a mění **živou
+  matematiku** (LR / Muon-LR / momentum / weight-decay / grad-clip přes
+  `MathState` vektor) bez rekompilace — Aurora ty skaláry staví znovu každý
+  krok, takže governor je jen čte odjinud.
+- **Bezpečnost přes verifier** (jádro): žádná změna se neadoptuje na
+  korelaci. Každý kandidát projde **párovým probe-rollout** (snapshot →
+  krátký rollout pod kontrolou vs. léčbou nad sdílenými vahami/daty) a
+  **anytime-valid sekvenčním testem** (normal-mixture confidence sequence),
+  který adoptuje jen efekt **nad noise floor**; jinak revert / below-floor.
+  Většina kandidátů je pod floor a governor je správně odmítne.
+- **Backend-agnostický core** (`TrialBackend` trait). CPU snapshotuje přes
+  `Clone`; **GPU přes on-device buffer copy** (`snapshot_state`/
+  `restore_state`, žádný host readback), takže reflex rollback i párové
+  trialy běží na GPU plnou rychlostí.
+- **Vrstvy**: vitals (multi-timescale EWMA) → diagnosis (posterior nad
+  taxonomií poruch: lr-too-hot/cold, grad-noise, throughput…) → pharmacy
+  (Gaussian-Thompson bandit nad fault-licencovanými rameny) → verifier →
+  paměť (`<ckpt>.phage` TSV, cross-run učení). Divergence řeší reflex
+  (snapshot rollback + LR cut, bez trialu).
+- `governor` JSONL eventy (`--metrics`), 12 CPU + 2 GPU unit testů
+  (`tests/governor.rs`, `tests/governor_gpu.rs`).
 
 ## Spuštění
 
@@ -100,6 +124,15 @@ cargo run --release --features gpu --example aurora_train -- \
   --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 \
   --seq-len 256 --batch-size 16 --epochs 20 \
   --lr 6e-4 --warmup-steps 2000
+
+# Runtime efficiency governor — PHAGE (hlídá efektivitu + hot-swap živé
+# matematiky). Eventy v JSONL, paměť .phage. Přidej --features gpu --gpu pro
+# on-device trialy (snapshot/restore přímo na GPU, žádný host readback).
+cargo run --release --example aurora_train -- \
+  --corpus data/enwik8_10m.txt --vocab 4096 \
+  --d-model 384 --n-layer 6 --n-head 6 --d-ff 1536 \
+  --seq-len 256 --batch-size 16 --epochs 20 \
+  --lr 6e-4 --warmup-steps 2000 --metrics logs/gov.jsonl --governor
 
 # Live visualization (Bevy okno + CLI souběžně, --features viz,gpu)
 cargo run --release --features viz,gpu --example aurora_train -- \

@@ -1,0 +1,77 @@
+no checkpoint at experiments/results/screen10/sink.ckpt — fresh init
+════════════════════════════════════════════════════════════
+ Aurora train  ·  decoder-only transformer  ·  4.3M params  ·  CPU
+════════════════════════════════════════════════════════════
+ corpus       : data/enwik8_10m.txt (10000000 bytes)
+ tokens       : 2921076 (BPE vocab 4096, encode 5.2s)
+ train / val  : 2628968 / 292108
+ model        : d=256 L=4 h=4 dff=1024 ctx=256 pos=learned
+ arch         : norm=ln act=gelu qk_norm=false head=tied softcap=0 zero_proj=false
+ lr schedule  : cosine (decay_frac 0.4)
+ optim        : muon hybrid | matrix lr 2.00e-2, momentum 0.95, wd 0 | embed/LN adamw lr 6.00e-4 → 6.00e-5
+              : warmup 200 step, adamw wd 0.1, clip 1
+ epochs       : 1 (from 0) batch 16
+ checkpoint   : experiments/results/screen10/sink.ckpt
+════════════════════════════════════════════════════════════
+
+── epoch 0 ───────────────────────────────
+  step      12  chunk    12/641    loss 8.306  bpb 3.516  lr 3.60e-5  gn 0.47    37.3s
+  step      24  chunk    24/641    loss 8.191  bpb 3.495  lr 7.20e-5  gn 0.50    74.9s
+  step      36  chunk    36/641    loss 8.020  bpb 3.467  lr 1.08e-4  gn 0.54   112.5s
+  step      48  chunk    48/641    loss 7.831  bpb 3.436  lr 1.44e-4  gn 0.60   150.0s
+  step      60  chunk    60/641    loss 7.688  bpb 3.404  lr 1.80e-4  gn 0.57   187.7s
+  step      72  chunk    72/641    loss 7.535  bpb 3.371  lr 2.16e-4  gn 0.43   225.3s
+  step      84  chunk    84/641    loss 7.424  bpb 3.341  lr 2.52e-4  gn 0.41   263.1s
+  step      96  chunk    96/641    loss 7.426  bpb 3.315  lr 2.88e-4  gn 0.48   300.8s
+  step     108  chunk   108/641    loss 7.325  bpb 3.292  lr 3.24e-4  gn 0.46   338.6s
+  step     120  chunk   120/641    loss 7.294  bpb 3.271  lr 3.60e-4  gn 0.54   376.2s
+  step     132  chunk   132/641    loss 7.178  bpb 3.251  lr 3.96e-4  gn 0.58   414.1s
+  step     144  chunk   144/641    loss 7.127  bpb 3.230  lr 4.32e-4  gn 0.89   451.9s
+  step     156  chunk   156/641    loss 6.933  bpb 3.208  lr 4.68e-4  gn 0.64   489.7s
+  step     168  chunk   168/641    loss 6.827  bpb 3.185  lr 5.04e-4  gn 0.59   527.7s
+  step     180  chunk   180/641    loss 6.722  bpb 3.164  lr 5.40e-4  gn 0.60   565.5s
+  step     192  chunk   192/641    loss 6.658  bpb 3.142  lr 5.76e-4  gn 0.65   603.5s
+  step     204  chunk   204/641    loss 6.580  bpb 3.120  lr 6.00e-4  gn 0.72   641.2s
+  step     216  chunk   216/641    loss 6.541  bpb 3.100  lr 5.98e-4  gn 0.60   678.9s
+  step     228  chunk   228/641    loss 6.529  bpb 3.081  lr 5.95e-4  gn 0.66   717.4s
+  step     240  chunk   240/641    loss 6.418  bpb 3.062  lr 5.90e-4  gn 0.71   755.6s
+  step     252  chunk   252/641    loss 6.466  bpb 3.046  lr 5.82e-4  gn 0.69   793.6s
+  step     264  chunk   264/641    loss 6.395  bpb 3.030  lr 5.73e-4  gn 0.66   831.8s
+  step     276  chunk   276/641    loss 6.367  bpb 3.014  lr 5.62e-4  gn 0.78   869.9s
+  step     288  chunk   288/641    loss 6.351  bpb 2.999  lr 5.50e-4  gn 0.71   908.2s
+  step     300  chunk   300/641    loss 6.272  bpb 2.985  lr 5.36e-4  gn 0.69   946.3s
+  step     312  chunk   312/641    loss 6.222  bpb 2.970  lr 5.20e-4  gn 0.72   984.3s
+  step     324  chunk   324/641    loss 6.183  bpb 2.956  lr 5.03e-4  gn 0.77  1022.5s
+  step     336  chunk   336/641    loss 6.336  bpb 2.944  lr 4.84e-4  gn 0.73  1060.8s
+  step     348  chunk   348/641    loss 6.235  bpb 2.934  lr 4.65e-4  gn 0.69  1098.7s
+  step     360  chunk   360/641    loss 6.001  bpb 2.922  lr 4.45e-4  gn 0.78  1137.0s
+  step     372  chunk   372/641    loss 5.900  bpb 2.909  lr 4.23e-4  gn 0.78  1175.1s
+  step     384  chunk   384/641    loss 6.061  bpb 2.898  lr 4.01e-4  gn 0.80  1213.1s
+  step     396  chunk   396/641    loss 6.004  bpb 2.886  lr 3.79e-4  gn 0.73  1251.3s
+  step     408  chunk   408/641    loss 5.990  bpb 2.875  lr 3.56e-4  gn 0.75  1289.2s
+  step     420  chunk   420/641    loss 6.099  bpb 2.867  lr 3.33e-4  gn 0.74  1327.4s
+  step     432  chunk   432/641    loss 6.037  bpb 2.858  lr 3.10e-4  gn 0.73  1365.9s
+  step     444  chunk   444/641    loss 5.907  bpb 2.848  lr 2.87e-4  gn 0.79  1403.7s
+  step     456  chunk   456/641    loss 6.026  bpb 2.839  lr 2.64e-4  gn 0.73  1442.0s
+  step     468  chunk   468/641    loss 5.819  bpb 2.830  lr 2.42e-4  gn 0.77  1480.7s
+  step     480  chunk   480/641    loss 5.871  bpb 2.822  lr 2.21e-4  gn 0.83  1518.9s
+  step     492  chunk   492/641    loss 5.853  bpb 2.813  lr 2.00e-4  gn 0.80  1556.9s
+  step     504  chunk   504/641    loss 5.986  bpb 2.805  lr 1.80e-4  gn 0.73  1595.3s
+  step     516  chunk   516/641    loss 5.928  bpb 2.798  lr 1.62e-4  gn 0.80  1633.4s
+  step     528  chunk   528/641    loss 5.875  bpb 2.791  lr 1.44e-4  gn 0.91  1671.4s
+  step     540  chunk   540/641    loss 5.917  bpb 2.784  lr 1.28e-4  gn 0.89  1709.4s
+  step     552  chunk   552/641    loss 5.786  bpb 2.777  lr 1.14e-4  gn 0.70  1747.8s
+  step     564  chunk   564/641    loss 5.777  bpb 2.770  lr 1.01e-4  gn 0.75  1785.9s
+  step     576  chunk   576/641    loss 5.673  bpb 2.763  lr 8.93e-5  gn 0.81  1824.1s
+  step     588  chunk   588/641    loss 5.919  bpb 2.756  lr 7.97e-5  gn 0.79  1862.2s
+  step     600  chunk   600/641    loss 5.667  bpb 2.750  lr 7.20e-5  gn 0.76  1900.3s
+  step     612  chunk   612/641    loss 5.785  bpb 2.744  lr 6.61e-5  gn 0.80  1938.5s
+  step     624  chunk   624/641    loss 5.874  bpb 2.738  lr 6.22e-5  gn 0.78  1976.6s
+  step     636  chunk   636/641    loss 5.723  bpb 2.733  lr 6.02e-5  gn 0.76  2014.4s
+  done   train bpb 2.731  val bpb 2.465  2058.7s (eval 28.4s)
+  checkpoint → experiments/results/screen10/sink.ckpt
+  sample:
+    seed: "ons. To the Athenians it "
+    cont: "we aps to sciential countries has been not choysearched, and there to the practice over the agree to teachers made represento that also about from [[a_musics]] to the deced breolled greater architectia]]. Tw)\n* Velheabtional to's par]]s after all sia]] on the Garfasch from [[Ly]] and [[Zehome is identiface lans in David Bard|Set]] made the struction. Ai]], American Cimplice with [[SGeographs.) was revols, remaining as a li the sts and renews may port against part on the ple "
+
+Total time 2075.3s   best val bpb 2.465   steps planned 641
