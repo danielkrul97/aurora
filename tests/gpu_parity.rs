@@ -1223,6 +1223,64 @@ fn muon_hybrid_step_matches_cpu() {
     assert!(err_ln < 5e-2, "ln1.gamma[0] drift {err_ln}");
 }
 
+#[test]
+fn embed_lr_mult_step_matches_cpu() {
+    // embed_lr_mult scales the AdamW LR for w_tok/w_pos/w_head only. If the
+    // GPU step dropped it (as it did originally), those params would move at
+    // 1× while the CPU moves at 3× — a large drift the parity check catches.
+    use aurora::gpu::DecoderTransformerGpu;
+    use aurora::optimizer::{AdamWConfig, MuonConfig};
+    use aurora::transformer::{DecoderTransformer, ModelGrads, TransformerConfig};
+
+    let Some(ctx) = ctx_or_skip() else { return };
+    let mut rng = StdRng::seed_from_u64(0xE3B_1357);
+    let cfg = TransformerConfig {
+        vocab: 16,
+        d_model: 32,
+        n_layer: 2,
+        n_head: 2,
+        d_ff: 64,
+        seq_len_max: 16,
+        untied_head: true,
+        embed_lr_mult: 3.0,
+        ..TransformerConfig::default()
+    };
+    let mut cpu_model = DecoderTransformer::new(cfg.clone(), &mut rng);
+    let mut gpu_model = DecoderTransformerGpu::from_cpu(&cpu_model, ctx, 1);
+
+    let tokens: Vec<u32> = (0..8u32).map(|i| i % cfg.vocab as u32).collect();
+    let targets: Vec<u32> = tokens.iter().map(|&t| (t + 1) % cfg.vocab as u32).collect();
+
+    let muon = MuonConfig { lr: 0.02, momentum: 0.95, nesterov: true, weight_decay: 0.0, ns_steps: 5 };
+    let adam = AdamWConfig { lr: 3e-3, weight_decay: 0.0, ..AdamWConfig::default() };
+
+    let mut grads = ModelGrads::zeros(&cfg);
+    let (cpu_logits, cache) = cpu_model.forward(&tokens);
+    let _ = cpu_model.backward(&cache, &cpu_logits, &targets, &mut grads);
+    DecoderTransformer::clip_grads_adamw_subset(&mut grads, 1.0);
+    cpu_model.step_muon_hybrid(&grads, &muon, &adam);
+
+    gpu_model.zero_grad();
+    let _ = gpu_model.train_step(&tokens, &targets);
+    let _ = gpu_model.clip_grads_adamw_subset(1.0, false);
+    gpu_model.step_muon_hybrid(&muon, &adam);
+
+    // Embedding groups (scaled LR) must match CPU.
+    let gpu_tok = gpu_model.p.w_tok.download(&gpu_model.ctx);
+    assert!(max_rel_err(&cpu_model.embed.w_tok, &gpu_tok) < 5e-2, "w_tok (embed LR) drift");
+    let gpu_pos = gpu_model.p.w_pos.download(&gpu_model.ctx);
+    assert!(max_rel_err(&cpu_model.embed.w_pos, &gpu_pos) < 5e-2, "w_pos (embed LR) drift");
+    let gpu_head = gpu_model.p.w_head.as_ref().unwrap().download(&gpu_model.ctx);
+    let cpu_head = cpu_model.w_head.as_ref().unwrap();
+    assert!(max_rel_err(cpu_head, &gpu_head) < 5e-2, "w_head (embed LR) drift");
+
+    // Non-embed params (unscaled LR) must also still match.
+    let gpu_w_q = gpu_model.p.blocks[0].w_q.download(&gpu_model.ctx);
+    assert!(max_rel_err(&cpu_model.blocks[0].mha.w_q.w, &gpu_w_q) < 5e-2, "w_q drift");
+    let gpu_ln = gpu_model.p.blocks[0].ln1_gamma.download(&gpu_model.ctx);
+    assert!(max_rel_err(&cpu_model.blocks[0].ln1.gamma, &gpu_ln) < 5e-2, "ln1.gamma drift");
+}
+
 /// Loss must drop after a handful of Muon steps on GPU — same shape as
 /// `train_step_then_adam_loss_decreases` but routed through
 /// `step_muon_hybrid`.

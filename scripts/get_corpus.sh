@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Download text corpora for char-LM training.
-# Usage: bash scripts/get_corpus.sh [tiny|shakespeare-complete|wikitext2|enwik8|enwik8-10m|enwik9]
+# Usage: bash scripts/get_corpus.sh [tiny|shakespeare-complete|wikitext2|enwik8|enwik8-10m|enwik9|enwik9-800m]
 # Default: tiny (1.1 MB tiny-shakespeare from karpathy/char-rnn).
 #
 # Wikipedia variants (Matt Mahoney compression-benchmark dumps):
-#   enwik8     — 100 MB, first 1e8 bytes of enwiki-20060303 dump
-#                (canonical char-LM benchmark, used in Hutter Prize)
-#   enwik8-10m — first 10 MB of enwik8 (quick experiments)
-#   enwik9     — 1 GB, first 1e9 bytes (heavy training)
+#   enwik8      — 100 MB, first 1e8 bytes of enwiki-20060303 dump
+#                 (canonical char-LM benchmark, used in Hutter Prize)
+#   enwik8-10m  — first 10 MB of enwik8 (quick experiments)
+#   enwik9      — 1 GB, first 1e9 bytes (heavy training)
+#   enwik9-800m — first 8e8 bytes of enwik9 (overnight, sub-1 GB)
 
 set -euo pipefail
 
@@ -52,9 +53,17 @@ case "$which" in
     archive=data/enwik9.zip
     member=enwik9
     ;;
+  enwik9-800m)
+    out=data/enwik9_800m.txt
+    url=https://mattmahoney.net/dc/enwik9.zip
+    direct=no
+    archive=data/enwik9.zip
+    member=enwik9
+    truncate_bytes=800000000
+    ;;
   *)
     echo "unknown corpus: $which" >&2
-    echo "  options: tiny, shakespeare-complete, wikitext2, enwik8, enwik8-10m, enwik9" >&2
+    echo "  options: tiny, shakespeare-complete, wikitext2, enwik8, enwik8-10m, enwik9, enwik9-800m" >&2
     exit 1
     ;;
 esac

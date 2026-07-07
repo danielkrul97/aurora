@@ -214,6 +214,9 @@ pub(crate) struct GradOps {
     /// skip the AdamW dispatch for matrix params and by
     /// `clip_grads_adamw_subset` to exclude them from the clip norm.
     pub is_matrix: bool,
+    /// Embedding/head group (w_tok/w_pos/w_head): its AdamW LR is scaled
+    /// by `config.embed_lr_mult`.
+    pub embed: bool,
     pub gn_offset: u32,
     pub zerob_bind: wgpu::BindGroup,
     pub adamw_bind: wgpu::BindGroup,
@@ -736,6 +739,7 @@ fn build_grad_ops(
             n,
             apply_wd,
             is_matrix,
+            embed: false,
             gn_offset,
             zerob_bind: zerob.build_bind(ctx, grad),
             adamw_bind: adamw.build_bind(ctx, params, grad, m1, m2),
@@ -770,6 +774,12 @@ fn build_grad_ops(
             push(&blk.canon_w, &blk.g_canon_w, &blk.m1.canon_w, &blk.m2.canon_w,
                  (d * cfg.canon_kernel) as u32, false, false);
         }
+    }
+    // w_tok/w_pos (+ untied w_head) lead the op list; their AdamW LR is
+    // scaled by embed_lr_mult at dispatch time.
+    let n_embed = 2 + usize::from(p.w_head.is_some());
+    for op in &mut ops[..n_embed] {
+        op.embed = true;
     }
     ops
 }
@@ -2011,12 +2021,17 @@ impl DecoderTransformerGpu {
             });
             pass.set_pipeline(&self.adamw.pipeline);
             for op in &self.grad_ops {
+                let lr = if op.embed {
+                    config.lr * self.config.embed_lr_mult
+                } else {
+                    config.lr
+                };
                 self.adamw.dispatch_with_bind(
                     &mut pass,
                     &op.adamw_bind,
                     op.n,
                     op.apply_wd,
-                    config.lr,
+                    lr,
                     config.beta1,
                     config.beta2,
                     config.eps,
@@ -2056,12 +2071,17 @@ impl DecoderTransformerGpu {
                 if op.is_matrix {
                     continue;
                 }
+                let lr = if op.embed {
+                    adam_cfg.lr * self.config.embed_lr_mult
+                } else {
+                    adam_cfg.lr
+                };
                 self.adamw.dispatch_with_bind(
                     &mut pass,
                     &op.adamw_bind,
                     op.n,
                     op.apply_wd,
-                    adam_cfg.lr,
+                    lr,
                     adam_cfg.beta1,
                     adam_cfg.beta2,
                     adam_cfg.eps,

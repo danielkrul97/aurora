@@ -26,7 +26,7 @@
 
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -551,7 +551,7 @@ fn main() -> ExitCode {
     let actual_vocab = bpe.vocab_size();
 
     let t_encode = Instant::now();
-    let tokens = bpe.encode(&corpus);
+    let tokens = encode_with_cache(&corpus, &bpe, &cli.corpus, cli.vocab);
     let encode_s = t_encode.elapsed().as_secs_f64();
     let comp = (corpus.len() as f32) / (tokens.len() as f32);
     drop(corpus);
@@ -676,9 +676,6 @@ fn main() -> ExitCode {
         }
         if cli.z_loss != 0.0 {
             unsupported.push("--z-loss");
-        }
-        if cli.embed_lr_mult != 1.0 {
-            unsupported.push("--embed-lr-mult (incl. via --tier4)");
         }
         if !unsupported.is_empty() {
             eprintln!(
@@ -932,6 +929,7 @@ fn run_training_loop(mut ctx: TrainCtx) {
             gov_cfg,
             ctx.cli.muon_momentum,
             ctx.cli.weight_decay,
+            ctx.cli.muon_wd,
             total_steps_for_lr as u64,
             ctx.cli.warmup_steps as u64,
             ctx.cli.seed,
@@ -1307,7 +1305,16 @@ fn run_training_loop(mut ctx: TrainCtx) {
         let val_bpb = evaluate(eval_model, val_toks, ctx.cli.seq_len, ctx.comp, ctx.cli.eval_windows_cap);
         let eval_s = eval_start.elapsed().as_secs_f64();
         if let Some(gov) = governor.as_mut() {
-            gov.set_val_gap(val_bpb - train_bpb);
+            for line in &gov.observe_eval(val_bpb, train_bpb) {
+                if let Some(m) = metrics.as_mut() {
+                    m.raw(line);
+                }
+                if line.contains("early_stop") {
+                    println!("  ⚠ EARLY-STOP doporučeno (val roste od svého minima): {line}");
+                } else {
+                    println!("  ⚙ {line}");
+                }
+            }
         }
         if val_bpb < best_val {
             best_val = val_bpb;
@@ -1533,6 +1540,121 @@ fn load_or_train_bpe(
         }
         Ok(tok)
     }
+}
+
+const TOKEN_CACHE_MAGIC: &[u8; 4] = b"ATK1";
+
+fn token_cache_path(corpus: &Path, vocab: usize) -> PathBuf {
+    let stem = corpus
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("corpus");
+    PathBuf::from(format!("data/{stem}_{vocab}.tokens"))
+}
+
+fn merges_fingerprint(merges: &[(u32, u32)]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &(a, b) in merges {
+        for byte in a.to_le_bytes().iter().chain(b.to_le_bytes().iter()) {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// BPE-encode the corpus, caching the token stream next to it. Keyed by
+/// corpus length + merge fingerprint, so a changed corpus or tokenizer
+/// re-encodes transparently. Encoding 8e8 bytes is minutes of work and ~GB
+/// of RAM; the cache turns reruns and resumes into a sub-second read.
+fn encode_with_cache(
+    corpus: &[u8],
+    bpe: &BpeTokenizer,
+    corpus_path: &Path,
+    vocab: usize,
+) -> Vec<u32> {
+    let path = token_cache_path(corpus_path, vocab);
+    let fp = merges_fingerprint(bpe.merges());
+    if let Some(tokens) = load_token_cache(&path, corpus.len() as u64, vocab as u32, fp) {
+        println!(" token cache  : hit {} ({} tokens)", path.display(), tokens.len());
+        return tokens;
+    }
+    let tokens = bpe.encode(corpus);
+    match save_token_cache(&path, corpus.len() as u64, vocab as u32, fp, &tokens) {
+        Ok(()) => println!(" token cache  : wrote {} ({} tokens)", path.display(), tokens.len()),
+        Err(e) => eprintln!("⚠ token cache write failed ({}): {e}", path.display()),
+    }
+    tokens
+}
+
+fn load_token_cache(path: &Path, corpus_len: u64, vocab: u32, fp: u64) -> Option<Vec<u32>> {
+    let mut r = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic).ok()?;
+    if &magic != TOKEN_CACHE_MAGIC {
+        return None;
+    }
+    let mut u64buf = [0u8; 8];
+    let mut u32buf = [0u8; 4];
+    r.read_exact(&mut u64buf).ok()?;
+    if u64::from_le_bytes(u64buf) != corpus_len {
+        return None;
+    }
+    r.read_exact(&mut u32buf).ok()?;
+    if u32::from_le_bytes(u32buf) != vocab {
+        return None;
+    }
+    r.read_exact(&mut u64buf).ok()?;
+    if u64::from_le_bytes(u64buf) != fp {
+        return None;
+    }
+    r.read_exact(&mut u64buf).ok()?;
+    let n = u64::from_le_bytes(u64buf) as usize;
+    let mut tokens = Vec::with_capacity(n);
+    let mut buf = vec![0u8; 4 * 65536];
+    let mut remaining = n;
+    while remaining > 0 {
+        let take = remaining.min(65536);
+        r.read_exact(&mut buf[..take * 4]).ok()?;
+        for k in 0..take {
+            tokens.push(u32::from_le_bytes([
+                buf[4 * k],
+                buf[4 * k + 1],
+                buf[4 * k + 2],
+                buf[4 * k + 3],
+            ]));
+        }
+        remaining -= take;
+    }
+    Some(tokens)
+}
+
+fn save_token_cache(
+    path: &Path,
+    corpus_len: u64,
+    vocab: u32,
+    fp: u64,
+    tokens: &[u32],
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+    w.write_all(TOKEN_CACHE_MAGIC)?;
+    w.write_all(&corpus_len.to_le_bytes())?;
+    w.write_all(&vocab.to_le_bytes())?;
+    w.write_all(&fp.to_le_bytes())?;
+    w.write_all(&(tokens.len() as u64).to_le_bytes())?;
+    let mut buf = Vec::with_capacity(4 * 65536);
+    for chunk in tokens.chunks(65536) {
+        buf.clear();
+        for &t in chunk {
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        w.write_all(&buf)?;
+    }
+    w.flush()?;
+    Ok(())
 }
 
 /// Window starts for overlapping-window eval (stride = seq_len/2).

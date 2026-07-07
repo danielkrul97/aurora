@@ -99,13 +99,17 @@ impl Arm {
             ArmKind::MuonLrUp | ArmKind::MuonLrDown => t.muon_lr_scale *= self.factor,
             ArmKind::ClipUp | ArmKind::ClipDown => t.grad_clip_scale *= self.factor,
             ArmKind::WdUp => {
-                t.weight_decay = if t.weight_decay < 1e-6 {
-                    0.05
-                } else {
-                    t.weight_decay * self.factor
-                };
+                // Scale both decays so the matrix bulk (Muon) is regularized,
+                // not just the AdamW embed/head group. Introduce a base value
+                // when a decay starts at ~0 (Muon WD is often 0).
+                t.weight_decay = if t.weight_decay < 1e-6 { 0.1 } else { t.weight_decay * self.factor };
+                t.muon_weight_decay =
+                    if t.muon_weight_decay < 1e-6 { 0.05 } else { t.muon_weight_decay * self.factor };
             }
-            ArmKind::WdDown => t.weight_decay *= self.factor,
+            ArmKind::WdDown => {
+                t.weight_decay *= self.factor;
+                t.muon_weight_decay *= self.factor;
+            }
             // Move the momentum gap (1−m) closer to / further from 1.
             ArmKind::MomentumUp => t.momentum = 1.0 - (1.0 - t.momentum) / self.factor,
             ArmKind::MomentumDown => t.momentum = 1.0 - (1.0 - t.momentum) * self.factor,
@@ -124,7 +128,7 @@ pub fn licensed_arms(fault: Fault) -> Vec<Arm> {
         Fault::GradNoiseHigh => {
             vec![Arm::new(ArmKind::LrDown, 0.8), Arm::new(ArmKind::MomentumUp, 1.5)]
         }
-        Fault::OverfitOnset => vec![Arm::new(ArmKind::WdUp, 1.5)],
+        Fault::OverfitOnset => vec![Arm::new(ArmKind::WdUp, 2.0)],
         _ => vec![],
     }
 }

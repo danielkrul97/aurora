@@ -45,6 +45,26 @@ use std::path::PathBuf;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
+/// Evals past the best val before the early-stop recommendation fires.
+const EARLY_STOP_PATIENCE: u32 = 2;
+/// Consecutive probation reverts before the governor gives up on the slow
+/// lever and falls back to report-only (the human must intervene).
+const GIVE_UP_REVERTS: u32 = 3;
+/// Slack on the val-degradation rate when deciding to keep a probation —
+/// keep unless the change made the trajectory clearly worse than its trend.
+const PROBATION_RATE_MARGIN: f32 = 0.01;
+/// Floor on trial-driven LR/Muon-LR cooling. The short paired rollout is
+/// biased toward lower LR (less immediate loss variance), so without a bound
+/// `lr_down` ratchets the LR down against a tuned schedule. A deeper cut is
+/// clamped to an A/A probe (→ BelowFloor → backoff) instead of ratcheting.
+/// Genuine divergence still cuts harder via the reflex, which bypasses this.
+const MIN_TRIAL_LR_SCALE: f32 = 0.5;
+/// After this many consecutive below-floor trials the inter-trial cooldown
+/// grows as `cooldown · 2^min(streak, cap)`, so a converged governor stops
+/// burning probe rollouts. Any adopt / revert / divergence / regime change
+/// resets the streak back to dense probing.
+const QUIET_BACKOFF_CAP: u32 = 6;
+
 #[derive(Clone, Debug)]
 pub struct GovernorConfig {
     /// Run diagnosis (and maybe open a trial) every N steps when idle.
@@ -119,10 +139,28 @@ impl Calib {
     }
 }
 
+/// Tentative commit of a slow-acting lever (weight decay for overfitting),
+/// whose effect a short paired rollout can't see. It is applied live and
+/// kept only if val BPB doesn't regress at the next eval — a *guarded direct
+/// action*, not a rigorous A/B. The keep/revert is a safety net (did val get
+/// worse?), not a counterfactual efficacy test, so it is weaker than the
+/// fast-lever sequential test; documented as such.
+struct Probation {
+    fault: Fault,
+    arm: Arm,
+    regime: Regime,
+    pre_msv: MathState,
+    baseline_val: f32,
+    /// Per-eval val change just before the commit — the trajectory the
+    /// change has to beat (rate-based keep, not absolute).
+    baseline_rate: f32,
+}
+
 enum GovState {
     Idle,
     Calibrating(Calib),
     Trialing(Trial),
+    Probation(Probation),
 }
 
 pub struct Governor {
@@ -139,6 +177,16 @@ pub struct Governor {
     trials_done: u32,
     snapshotted_once: bool,
     calibrated: bool,
+    last_step: u64,
+    last_val: f32,
+    prev_val: f32,
+    best_val: f32,
+    best_eval: u32,
+    eval_count: u32,
+    probation_reverts: u32,
+    overfit_givenup: bool,
+    quiet_streak: u32,
+    last_regime: Regime,
     mem_path: Option<PathBuf>,
 }
 
@@ -147,6 +195,7 @@ impl Governor {
         cfg: GovernorConfig,
         base_momentum: f32,
         base_weight_decay: f32,
+        base_muon_wd: f32,
         total_steps: u64,
         warmup_steps: u64,
         seed: u64,
@@ -154,7 +203,7 @@ impl Governor {
     ) -> Self {
         let bandit = mem_path.as_ref().map_or_else(Bandit::default, |p| Bandit::load(p));
         Self {
-            committed: MathState::identity(base_momentum, base_weight_decay),
+            committed: MathState::identity(base_momentum, base_weight_decay, base_muon_wd),
             vitals: Vitals::new(total_steps, warmup_steps),
             reflex: Reflex::default(),
             bandit,
@@ -166,6 +215,16 @@ impl Governor {
             trials_done: 0,
             snapshotted_once: false,
             calibrated: false,
+            last_step: 0,
+            last_val: f32::INFINITY,
+            prev_val: f32::INFINITY,
+            best_val: f32::INFINITY,
+            best_eval: 0,
+            eval_count: 0,
+            probation_reverts: 0,
+            overfit_givenup: false,
+            quiet_streak: 0,
+            last_regime: Regime::Warmup,
             mem_path,
             cfg,
         }
@@ -187,8 +246,65 @@ impl Governor {
         self.vitals.eta()
     }
 
-    pub fn set_val_gap(&mut self, gap: f32) {
-        self.vitals.set_val_gap(gap);
+    /// Observe an epoch eval. Updates the overfit signal and resolves an
+    /// active slow-lever probation: keep the tentative commit unless val BPB
+    /// regressed vs the pre-commit baseline, in which case revert it.
+    pub fn observe_eval(&mut self, val_bpb: f32, train_bpb: f32) -> Vec<String> {
+        let mut events = Vec::new();
+        self.vitals.set_val_gap(val_bpb - train_bpb);
+        self.eval_count += 1;
+
+        if matches!(self.state, GovState::Probation(_)) {
+            let (fault, arm, regime, pre, baseline, base_rate) = match &self.state {
+                GovState::Probation(p) => {
+                    (p.fault, p.arm, p.regime, p.pre_msv, p.baseline_val, p.baseline_rate)
+                }
+                _ => unreachable!(),
+            };
+            // Rate-based, not absolute: during monotonic overfitting val rises
+            // no matter what, so keep unless the change made the trajectory
+            // clearly *worse than it was already heading*.
+            let probation_rate = val_bpb - baseline;
+            let worsened = probation_rate > base_rate + PROBATION_RATE_MARGIN;
+            let kind = if worsened {
+                self.committed = pre;
+                self.probation_reverts += 1;
+                "probation_revert"
+            } else {
+                self.probation_reverts = 0;
+                "probation_keep"
+            };
+            self.bandit.reward(regime, fault, arm, -probation_rate);
+            self.cooldown_until = self.last_step + self.cfg.cooldown;
+            events.push(self.ev(self.last_step, kind, regime, fault.label(), arm.label(), val_bpb, base_rate, 0));
+            self.state = GovState::Idle;
+            if self.probation_reverts >= GIVE_UP_REVERTS && !self.overfit_givenup {
+                self.overfit_givenup = true;
+                events.push(self.ev(self.last_step, "probation_giveup", regime, fault.label(), arm.label(), val_bpb, 0.0, 0));
+            }
+        }
+
+        // Early-stop recommendation. The governor can't un-train, but it sees
+        // the val trajectory: if we are N evals past the best, recommend
+        // stopping loudly (mid-run overfitting is the human's call).
+        if val_bpb < self.best_val {
+            self.best_val = val_bpb;
+            self.best_eval = self.eval_count;
+        }
+        let since_best = self.eval_count - self.best_eval;
+        if since_best >= EARLY_STOP_PATIENCE {
+            events.push(self.ev_earlystop(val_bpb, since_best));
+        }
+
+        self.prev_val = self.last_val;
+        self.last_val = val_bpb;
+        events
+    }
+
+    /// True once the run is `EARLY_STOP_PATIENCE` evals past its best val —
+    /// the host may break the epoch loop on this if it wants auto-stop.
+    pub fn should_stop(&self) -> bool {
+        self.best_eval > 0 && self.eval_count.saturating_sub(self.best_eval) >= EARLY_STOP_PATIENCE
     }
 
     pub fn save_memory(&self) {
@@ -203,7 +319,14 @@ impl Governor {
     pub fn end_step(&mut self, s: StepSample, backend: &mut dyn TrialBackend) -> Vec<String> {
         let mut events = Vec::new();
         self.vitals.push(&s);
+        self.last_step = s.step;
         let fp = self.vitals.fingerprint();
+        // A regime change shifts the bandit's context (and the schedule phase),
+        // so resume dense probing rather than carrying a stale quiet streak.
+        if fp.regime != self.last_regime {
+            self.last_regime = fp.regime;
+            self.quiet_streak = 0;
+        }
 
         if let ReflexAction::CutLr(c) = self.reflex.check(&fp, &s) {
             if self.snapshotted_once {
@@ -212,6 +335,7 @@ impl Governor {
             self.committed.lr_scale *= c;
             self.committed.muon_lr_scale *= c;
             self.committed.clamp();
+            self.quiet_streak = 0;
             self.cooldown_until = s.step + self.cfg.cooldown;
             self.state = GovState::Idle;
             events.push(self.ev(s.step, "reflex", fp.regime, "divergence", "cut_lr", c, 0.0, 0));
@@ -234,10 +358,50 @@ impl Governor {
                     let (fault, p) = diag.top();
                     if fault.is_actionable() && p >= self.cfg.fault_threshold {
                         let arms = licensed_arms(fault);
-                        if !arms.is_empty() && self.calibrated {
+                        if arms.is_empty() {
+                            // nothing licensed — fall through
+                        } else if fault.is_slow() {
+                            // Slow lever (weight decay) — a paired rollout can't
+                            // see its effect, so tentatively commit it live and
+                            // verify at the next eval. Once we've given up
+                            // (repeated reverts), the early-stop reco carries
+                            // the signal instead.
+                            if !self.overfit_givenup {
+                                let arm =
+                                    self.bandit.select(fp.regime, fault, &arms, &mut self.rng);
+                                let pre = self.committed;
+                                self.committed = arm.target(&self.committed);
+                                self.committed.clamp();
+                                let base_rate = if self.prev_val.is_finite() {
+                                    self.last_val - self.prev_val
+                                } else {
+                                    0.0
+                                };
+                                events.push(self.ev(
+                                    s.step, "probation_begin", fp.regime, fault.label(),
+                                    arm.label(), self.last_val, base_rate, 0,
+                                ));
+                                self.state = GovState::Probation(Probation {
+                                    fault,
+                                    arm,
+                                    regime: fp.regime,
+                                    pre_msv: pre,
+                                    baseline_val: self.last_val,
+                                    baseline_rate: base_rate,
+                                });
+                            }
+                        } else if self.calibrated {
                             let arm = self.bandit.select(fp.regime, fault, &arms, &mut self.rng);
                             let mut treatment = arm.target(&self.committed);
                             treatment.clamp();
+                            // Bound trial-driven cooling: a would-be cut past the
+                            // floor (or past an already-cut level) collapses to an
+                            // A/A probe, so it reads BelowFloor instead of ratcheting
+                            // the LR down on the rollout's short-horizon bias.
+                            let floor_lr = MIN_TRIAL_LR_SCALE.min(self.committed.lr_scale);
+                            let floor_mlr = MIN_TRIAL_LR_SCALE.min(self.committed.muon_lr_scale);
+                            treatment.lr_scale = treatment.lr_scale.max(floor_lr);
+                            treatment.muon_lr_scale = treatment.muon_lr_scale.max(floor_mlr);
                             let cs = ConfidenceSequence::new(self.cfg.cs);
                             let trial = Trial::new(
                                 fault, arm, fp.regime, self.committed, treatment, cs, s.step,
@@ -247,7 +411,7 @@ impl Governor {
                                 0.0, 0,
                             ));
                             self.state = GovState::Trialing(trial);
-                        } else if !arms.is_empty() {
+                        } else {
                             // Calibrate the noise floor once before the first
                             // real trial — measures the true paired σ.
                             let calib_arm = Arm::new(ArmKind::LrUp, 1.3);
@@ -316,6 +480,7 @@ impl Governor {
                         self.committed = treatment;
                         self.committed.clamp();
                         self.bandit.reward(regime, fault, arm, effect);
+                        self.quiet_streak = 0;
                         self.cooldown_until = s.step + self.cfg.cooldown;
                         self.trials_done += 1;
                         events.push(self.ev(
@@ -326,6 +491,7 @@ impl Governor {
                     }
                     Verdict::Revert => {
                         self.bandit.reward(regime, fault, arm, effect);
+                        self.quiet_streak = 0;
                         self.cooldown_until = s.step + self.cfg.cooldown;
                         self.trials_done += 1;
                         events.push(self.ev(
@@ -336,7 +502,9 @@ impl Governor {
                     }
                     Verdict::BelowFloor => {
                         self.bandit.reward(regime, fault, arm, 0.0);
-                        self.cooldown_until = s.step + self.cfg.cooldown;
+                        self.quiet_streak = self.quiet_streak.saturating_add(1);
+                        let mult = 1u64 << self.quiet_streak.min(QUIET_BACKOFF_CAP);
+                        self.cooldown_until = s.step + self.cfg.cooldown * mult;
                         self.trials_done += 1;
                         events.push(self.ev(
                             s.step, "trial_belowfloor", regime, fault.label(), arm.label(), effect,
@@ -346,6 +514,7 @@ impl Governor {
                     }
                 }
             }
+            GovState::Probation(_) => {}
         }
         events
     }
@@ -371,6 +540,20 @@ impl Governor {
             self.committed.muon_lr_scale,
             self.committed.weight_decay,
             self.committed.grad_clip_scale,
+        )
+    }
+
+    fn ev_earlystop(&self, val: f32, since_best: u32) -> String {
+        format!(
+            "{{\"event\":\"governor\",\"step\":{},\"kind\":\"early_stop\",\"regime\":\"{}\",\"fault\":\"overfit\",\"arm\":\"stop\",\"eta\":{:.6},\"val\":{:.4},\"best_val\":{:.4},\"best_epoch\":{},\"evals_past_best\":{since_best},\"wd\":{:.4},\"muon_wd\":{:.4}}}",
+            self.last_step,
+            self.vitals.regime().label(),
+            self.vitals.eta(),
+            val,
+            self.best_val,
+            self.best_eval.saturating_sub(1),
+            self.committed.weight_decay,
+            self.committed.muon_weight_decay,
         )
     }
 }

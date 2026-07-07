@@ -93,6 +93,9 @@ fn fp(slope: f32, noise: f32, level: f32, grad: f32, spike: f32, cv: f32, dt: f3
         dt_drift: dt,
         diverging: false,
         val_gap: 0.0,
+        // Diagnosis now reads the long-horizon trend, not the per-step slope:
+        // a negative slope (improving loss) maps to a positive trend.
+        loss_trend: -slope * 2.0,
         lr_rising: false,
         lr_falling: false,
     }
@@ -112,9 +115,47 @@ fn diagnosis_distinguishes_faults() {
     let well = diagnose(&fp(-0.02, 0.01, 2.0, 0.5, 1.0, 0.2, 1.0, Regime::Mid));
     assert_eq!(well.top().0, Fault::Healthy, "{:?}", well.posterior);
 
-    // Step time drifting up -> ThroughputRegression dominates.
-    let slow = diagnose(&fp(-0.02, 0.01, 2.0, 0.5, 1.0, 0.2, 1.5, Regime::Mid));
+    // Stalled + step time drifting up -> ThroughputRegression dominates.
+    let slow = diagnose(&fp(-0.00005, 0.01, 2.0, 0.5, 1.0, 0.2, 1.5, Regime::Mid));
     assert_eq!(slow.top().0, Fault::ThroughputRegression, "{:?}", slow.posterior);
+}
+
+#[test]
+fn diagnosis_ignores_healthy_descent_through_noise() {
+    // The run's bug: per-step loss is noisy but the long-horizon trend is
+    // clearly improving. Must read Healthy, not LrTooCold.
+    let healthy = diagnose(&fp(0.0, 0.2, 5.0, 0.5, 1.0, 0.2, 1.0, Regime::Mid));
+    // loss_trend defaults to 0 from a 0 slope -> not improving; supply a real
+    // positive trend directly.
+    let mut fpr = fp(0.0, 0.2, 5.0, 0.5, 1.0, 0.2, 1.0, Regime::Mid);
+    fpr.loss_trend = 0.02; // 2% relative improvement over the horizon
+    assert_eq!(diagnose(&fpr).top().0, Fault::Healthy, "{:?}", diagnose(&fpr).posterior);
+    let _ = healthy;
+}
+
+#[test]
+fn diagnosis_suppresses_noise_hot_but_keeps_real_uptrend() {
+    // The enwik9 over-cool root cause: a flat/noisy loss (σ≈0.25) makes the
+    // mid/slow EWMAs cross, so loss_trend reads transiently negative *within the
+    // noise band*. That must NOT be lr_too_hot — else the governor cools a
+    // healthy LR. (level 3.0, noise 0.35 -> band ~0.12; a 0.012 cross is noise.)
+    let mut noisy = fp(0.0, 0.35, 3.0, 0.5, 1.0, 0.2, 1.0, Regime::Mid);
+    noisy.loss_trend = -0.012;
+    assert_ne!(
+        diagnose(&noisy).top().0,
+        Fault::LrTooHot,
+        "noise-induced worsening mis-fired lr_too_hot: {:?}",
+        diagnose(&noisy).posterior
+    );
+    // A genuine up-trend (loss climbing well past the band) must still fire hot.
+    let mut real = fp(0.0, 0.35, 3.0, 0.5, 1.0, 0.2, 1.0, Regime::Mid);
+    real.loss_trend = -0.20;
+    assert_eq!(
+        diagnose(&real).top().0,
+        Fault::LrTooHot,
+        "a real up-trend past the noise band must still be lr_too_hot: {:?}",
+        diagnose(&real).posterior
+    );
 }
 
 #[test]
@@ -211,7 +252,7 @@ fn calibration_enables_adoption_below_default_floor() {
     };
 
     let run = |cfg: GovernorConfig, seed: u64| -> bool {
-        let mut gov = Governor::new(cfg, 0.95, 0.1, 100_000, 0, seed, None);
+        let mut gov = Governor::new(cfg, 0.95, 0.1, 0.0, 100_000, 0, seed, None);
         let mut backend = MockBackend { rng: StdRng::seed_from_u64(seed ^ 0xABC), mean: 0.010, noise: 0.004 };
         for step in 1..=4000u64 {
             // Constant plateau, constant LR (not falling) -> lr_too_cold fires.
@@ -250,7 +291,7 @@ fn reflex_fires_on_divergence_not_noise() {
 
 #[test]
 fn mathstate_apply_and_clamp() {
-    let mut s = MathState::identity(0.95, 0.1);
+    let mut s = MathState::identity(0.95, 0.1, 0.0);
     let mut adam = AdamWConfig { lr: 1.0, ..AdamWConfig::default() };
     let mut muon = MuonConfig { lr: 1.0, ..MuonConfig::default() };
     let clip = s.apply_optim(&mut adam, &mut muon, 2.0);
@@ -360,7 +401,7 @@ fn paired_rollout_identity_cancels_to_zero() {
     let probe_in: Vec<Vec<u32>> = (0..4).map(|w| toks[w * 20..w * 20 + seq_len].to_vec()).collect();
     let probe_tg: Vec<Vec<u32>> = (0..4).map(|w| toks[w * 20 + 1..w * 20 + seq_len + 1].to_vec()).collect();
     let starts = vec![100, 200, 300];
-    let id = MathState::identity(0.95, 0.1);
+    let id = MathState::identity(0.95, 0.1, 0.0);
 
     let diff = paired_rollout_sample(
         &model, &toks, &starts, &probe_in, &probe_tg, seq_len, 1.0, 1e-3, 2e-2, 0.0, 1.0, &id, &id,
@@ -387,7 +428,7 @@ fn governor_runs_a_trial_end_to_end() {
     let (probe_in, probe_out) = build_probe(&val, cfg.seq_len_max, 4);
 
     let gcfg = GovernorConfig { diag_every: 20, snapshot_every: 25, cooldown: 30, horizon: 3, probe_windows: 4, fault_threshold: 0.5, max_trials: 5, calib_samples: 8, cs: CsConfig { n_max: 12, ..CsConfig::default() } };
-    let mut gov = Governor::new(gcfg, 0.95, 0.1, 1000, 0, 5, None);
+    let mut gov = Governor::new(gcfg, 0.95, 0.1, 0.0, 1000, 0, 5, None);
     let mut safe: Option<DecoderTransformer> = None;
     let mut brng = StdRng::seed_from_u64(99);
 
@@ -426,4 +467,211 @@ fn governor_runs_a_trial_end_to_end() {
     v.push(&StepSample { step: 1, loss: 3.0, grad_norm: 0.5, dt_secs: 0.01, lr: 1e-3, muon_lr: 2e-2 });
     v.push(&StepSample { step: 2, loss: 2.5, grad_norm: 0.5, dt_secs: 0.01, lr: 1e-3, muon_lr: 2e-2 });
     assert!(v.eta().is_finite());
+}
+
+#[test]
+fn probation_keeps_or_reverts_wd_on_val() {
+    // Overfit → tentatively raise WD live; keep if val improves at the next
+    // eval, revert if it regresses.
+    let gcfg = GovernorConfig {
+        diag_every: 5,
+        snapshot_every: 100_000,
+        cooldown: 5,
+        horizon: 1,
+        probe_windows: 1,
+        fault_threshold: 0.5,
+        max_trials: 50,
+        calib_samples: 4,
+        cs: CsConfig::default(),
+    };
+    let run = |val_after: f32| -> f32 {
+        let mut gov = Governor::new(gcfg.clone(), 0.95, 0.1, 0.0, 100_000, 0, 1, None);
+        let mut backend = MockBackend { rng: StdRng::seed_from_u64(1), mean: 0.0, noise: 0.001 };
+        // First eval establishes a big overfit gap and the baseline val.
+        let _ = gov.observe_eval(2.0, 1.5);
+        let mut began = false;
+        for step in 1..=60u64 {
+            let s = StepSample { step, loss: 3.0, grad_norm: 0.5, dt_secs: 0.01, lr: 1e-3, muon_lr: 2e-2 };
+            let _ = gov.begin_step(1e-3, 2e-2);
+            if gov.end_step(s, &mut backend).iter().any(|e| e.contains("probation_begin")) {
+                began = true;
+                break;
+            }
+        }
+        assert!(began, "probation never opened on a big overfit gap");
+        assert!(gov.committed().weight_decay > 0.1 + 1e-6, "WD not tentatively raised");
+        let _ = gov.observe_eval(val_after, 1.5);
+        gov.committed().weight_decay
+    };
+    assert!(run(1.8) > 0.1 + 1e-6, "improved val should keep the raised WD");
+    assert!((run(2.1) - 0.1).abs() < 1e-6, "regressed val should revert the WD");
+}
+
+#[test]
+fn wd_up_arm_raises_both_decays() {
+    // Fix 3: wd_up must regularize the Muon matrix bulk too, not just AdamW.
+    let base = MathState::identity(0.95, 0.1, 0.0);
+    let t = Arm::new(ArmKind::WdUp, 2.0).target(&base);
+    assert!(t.weight_decay > 0.1 + 1e-6, "adam wd should rise: {}", t.weight_decay);
+    assert!(t.muon_weight_decay > 1e-6, "muon wd should be introduced: {}", t.muon_weight_decay);
+}
+
+#[test]
+fn early_stop_recommends_after_patience() {
+    // Fix 1: val improves then worsens -> recommend stop 2 evals past best.
+    let mut gov = Governor::new(GovernorConfig::default(), 0.95, 0.1, 0.0, 100_000, 0, 1, None);
+    let vals = [3.0_f32, 2.5, 2.0, 2.1, 2.2, 2.3]; // best at eval 3 (idx 2)
+    let mut fired_at = None;
+    for (i, &v) in vals.iter().enumerate() {
+        if gov.observe_eval(v, v - 0.1).iter().any(|e| e.contains("early_stop")) && fired_at.is_none() {
+            fired_at = Some(i);
+        }
+    }
+    assert_eq!(fired_at, Some(4), "early_stop should fire exactly 2 evals past the best");
+    assert!(gov.should_stop());
+}
+
+#[test]
+fn probation_keeps_when_degradation_slows() {
+    // Fix 2: val still rises, but slower than the pre-commit trend -> the WD
+    // change helped, so keep it (the old absolute test would have reverted).
+    let gcfg = GovernorConfig {
+        diag_every: 5, snapshot_every: 100_000, cooldown: 5, horizon: 1, probe_windows: 1,
+        fault_threshold: 0.5, max_trials: 50, calib_samples: 4, cs: CsConfig::default(),
+    };
+    let mut gov = Governor::new(gcfg, 0.95, 0.1, 0.0, 100_000, 0, 1, None);
+    let mut backend = MockBackend { rng: StdRng::seed_from_u64(1), mean: 0.0, noise: 0.001 };
+    let _ = gov.observe_eval(2.0, 1.5); // big overfit gap
+    let _ = gov.observe_eval(2.05, 1.5); // base_rate = +0.05
+    let mut began = false;
+    for step in 1..=60u64 {
+        let s = StepSample { step, loss: 3.0, grad_norm: 0.5, dt_secs: 0.01, lr: 1e-3, muon_lr: 2e-2 };
+        let _ = gov.begin_step(1e-3, 2e-2);
+        if gov.end_step(s, &mut backend).iter().any(|e| e.contains("probation_begin")) {
+            began = true;
+            break;
+        }
+    }
+    assert!(began, "probation never opened");
+    let wd = gov.committed().weight_decay;
+    assert!(wd > 0.1 + 1e-6);
+    // probation_rate = 2.07 - 2.05 = +0.02 < base_rate 0.05 -> keep.
+    let evs = gov.observe_eval(2.07, 1.5);
+    assert!(evs.iter().any(|e| e.contains("probation_keep")), "slower degradation should keep: {evs:?}");
+    assert!((gov.committed().weight_decay - wd).abs() < 1e-6, "kept wd must persist");
+}
+
+#[test]
+fn probation_gives_up_after_repeated_reverts() {
+    // Fix 4: when the WD lever keeps making things worse, stop probating.
+    let gcfg = GovernorConfig {
+        diag_every: 5, snapshot_every: 100_000, cooldown: 0, horizon: 1, probe_windows: 1,
+        fault_threshold: 0.5, max_trials: 999, calib_samples: 4, cs: CsConfig::default(),
+    };
+    let mut gov = Governor::new(gcfg, 0.95, 0.1, 0.0, 100_000, 0, 1, None);
+    let mut backend = MockBackend { rng: StdRng::seed_from_u64(1), mean: 0.0, noise: 0.001 };
+    let _ = gov.observe_eval(2.0, 1.5);
+    let mut val = 2.0_f32;
+    let mut step: u64 = 1;
+    let mut saw_giveup = false;
+    for cycle in 0..6 {
+        let mut began = false;
+        let end = step + 200;
+        while step <= end {
+            let s = StepSample { step, loss: 3.0, grad_norm: 0.5, dt_secs: 0.01, lr: 1e-3, muon_lr: 2e-2 };
+            let _ = gov.begin_step(1e-3, 2e-2);
+            let opened = gov.end_step(s, &mut backend).iter().any(|e| e.contains("probation_begin"));
+            step += 1;
+            if opened {
+                began = true;
+                break;
+            }
+        }
+        if !began {
+            continue;
+        }
+        val += 0.2 * (cycle as f32 + 1.0); // accelerating worsening -> revert each time
+        if gov.observe_eval(val, 1.5).iter().any(|e| e.contains("probation_giveup")) {
+            saw_giveup = true;
+            break;
+        }
+    }
+    assert!(saw_giveup, "governor should give up after repeated reverts");
+}
+
+/// Backend that models the real paired-rollout bias: a lower LR "wins" the
+/// short rollout (less immediate variance), and an identical (A/A) pair
+/// cancels to ~0. This is what makes unbounded `lr_down` ratchet in the wild.
+struct ArmAwareMock {
+    rng: StdRng,
+    gain: f32,
+    noise: f32,
+}
+
+impl TrialBackend for ArmAwareMock {
+    fn snapshot_safe(&mut self) {}
+    fn restore_safe(&mut self) {}
+    fn paired_diff(&mut self, c: &MathState, t: &MathState, _lr: f32, _mlr: f32) -> f32 {
+        let delta = (c.lr_scale - t.lr_scale) + (c.muon_lr_scale - t.muon_lr_scale);
+        self.gain * delta + gauss(&mut self.rng, 0.0, self.noise)
+    }
+}
+
+#[test]
+fn governor_caps_lr_cooling_at_floor() {
+    // Prong A. In the enwik9 run the governor ratcheted lr_scale 1.0 -> 0.168
+    // (six ×0.7 adopts) because the short paired rollout always favors a lower
+    // LR. With a cooling-wins backend the floor must cap the cumulative cut at
+    // 0.5; without the fix this test would see min_lr ~0.17.
+    let gcfg = GovernorConfig {
+        diag_every: 15, snapshot_every: 100_000, cooldown: 15, horizon: 1,
+        probe_windows: 1, fault_threshold: 0.5, max_trials: 100_000, calib_samples: 6,
+        cs: CsConfig { sigma: 0.006, floor: 0.003, n_max: 12, ..CsConfig::default() },
+    };
+    let mut gov = Governor::new(gcfg, 0.95, 0.1, 0.0, 100_000, 0, 3, None);
+    let mut backend = ArmAwareMock { rng: StdRng::seed_from_u64(0xABC), gain: 0.06, noise: 0.002 };
+    let mut min_lr = 1.0f32;
+    for step in 1..=8000u64 {
+        // Flat loss + a grad spike on each diagnosis step => a *genuine*
+        // lr_too_hot through the grad-spike term (the de-noised diagnosis no
+        // longer fires hot on loss noise, so we drive a real fault here).
+        let grad = if step % 15 == 0 { 3.0 } else { 0.3 };
+        let s = StepSample { step, loss: 3.0, grad_norm: grad, dt_secs: 0.01, lr: 1e-3, muon_lr: 2e-2 };
+        let _ = gov.begin_step(1e-3, 2e-2);
+        let _ = gov.end_step(s, &mut backend);
+        let c = gov.committed();
+        min_lr = min_lr.min(c.lr_scale.min(c.muon_lr_scale));
+    }
+    assert!(min_lr >= 0.5 - 1e-3, "trial cooling broke the 0.5 floor: {min_lr}");
+    assert!(min_lr <= 0.71, "cooling never engaged — test didn't exercise the floor: {min_lr}");
+}
+
+#[test]
+fn governor_backs_off_probing_when_nothing_adopts() {
+    // Prong B. The run burned ~38% of wall-clock on 212 trials that never
+    // adopted. Under a plateau where nothing clears the floor, the below-floor
+    // backoff must widen the inter-trial cooldown geometrically.
+    let gcfg = GovernorConfig {
+        diag_every: 10, snapshot_every: 100_000, cooldown: 10, horizon: 1,
+        probe_windows: 1, fault_threshold: 0.5, max_trials: 100_000, calib_samples: 4,
+        cs: CsConfig { sigma: 0.02, floor: 0.01, n_max: 8, ..CsConfig::default() },
+    };
+    let mut gov = Governor::new(gcfg, 0.95, 0.1, 0.0, 100_000, 0, 1, None);
+    // Zero-mean tiny noise -> every trial resolves BelowFloor.
+    let mut backend = MockBackend { rng: StdRng::seed_from_u64(123), mean: 0.0, noise: 0.001 };
+    let mut trial_steps = Vec::new();
+    for step in 1..=4000u64 {
+        let s = StepSample { step, loss: 3.0, grad_norm: 0.5, dt_secs: 0.01, lr: 1e-3, muon_lr: 2e-2 };
+        let _ = gov.begin_step(1e-3, 2e-2);
+        if gov.end_step(s, &mut backend).iter().any(|e| e.contains("trial_begin")) {
+            trial_steps.push(step);
+        }
+    }
+    assert!(trial_steps.len() >= 4, "need several trials to judge backoff: {trial_steps:?}");
+    let first_gap = trial_steps[1] - trial_steps[0];
+    let last_gap = trial_steps[trial_steps.len() - 1] - trial_steps[trial_steps.len() - 2];
+    assert!(
+        last_gap >= 4 * first_gap.max(1),
+        "below-floor backoff did not thin probes: gaps {first_gap} -> {last_gap} ({trial_steps:?})"
+    );
 }

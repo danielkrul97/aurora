@@ -215,14 +215,38 @@ impl BpeTokenizer {
         if self.merges.is_empty() {
             return bytes.iter().map(|&b| u32::from(b)).collect();
         }
-        let n = bytes.len();
-        if n == 0 {
+        if bytes.is_empty() {
             return Vec::new();
         }
 
         let mut rank: HashMap<(u32, u32), usize> = HashMap::with_capacity(self.merges.len());
         for (i, &m) in self.merges.iter().enumerate() {
             rank.insert(m, i);
+        }
+
+        // The chunk encoder builds a per-byte linked-list + heap (~36 B per
+        // input byte), single-threaded. On a multi-GB corpus that is tens of
+        // GB of RAM and minutes of work. Splitting into independent chunks
+        // caps memory at chunk size and lets rayon encode them in parallel;
+        // merges never cross a boundary, so a few tokens per boundary differ
+        // from a global pass — negligible for a 1e8+ byte char-LM corpus, and
+        // collect() over the indexed iterator keeps chunk order deterministic.
+        const CHUNK_BYTES: usize = 16 * 1024 * 1024;
+        if bytes.len() <= CHUNK_BYTES {
+            return Self::encode_chunk(bytes, &rank);
+        }
+        use rayon::prelude::*;
+        let parts: Vec<Vec<u32>> = bytes
+            .par_chunks(CHUNK_BYTES)
+            .map(|chunk| Self::encode_chunk(chunk, &rank))
+            .collect();
+        parts.concat()
+    }
+
+    fn encode_chunk(bytes: &[u8], rank: &HashMap<(u32, u32), usize>) -> Vec<u32> {
+        let n = bytes.len();
+        if n == 0 {
+            return Vec::new();
         }
 
         const NIL: usize = usize::MAX;

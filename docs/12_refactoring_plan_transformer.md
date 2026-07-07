@@ -935,6 +935,54 @@ Verifikace: `calibration_sigma_is_what_unblocks_adoption` (σ=0.02→BelowFloor,
 `regime_warmup_is_capped`, `calibration_enables_adoption_below_default_floor`
 (MockBackend). 16 governor + 2 GPU testů zelených.
 
+**Follow-up po 8-epoch běhu (val 1.656, train 1.227 ⇒ gap 0.43 = overfit).** Běh
+odhalil dvě věci: governer mlel ~2500 stepů falešný `lr_too_cold` (verifier vždy
+revertoval, žádná škoda) a správně diagnostikoval `overfit_onset → wd_up`, ale
+4-step rollout pomalý WD efekt nevidí (belowfloor). Dvě opravy:
+4. **Long-horizon trend místo per-step slope** — zlepšení/step (~0.003) ≪ batch
+   noise (~0.2), takže vyhlazený slope čte ~0 a zdravý sestup vypadá jako plató.
+   Diagnóza teď čte `Fingerprint::loss_trend = (loss_slow − loss_mid)/loss_slow`
+   (dvojitá EWMA, šum-robustní). Smoke (10 epoch, tiny_200k): **0 falešných
+   cold** (předtím desítky). `healthy` capnut na 3.0, aby rychlý train-loss
+   nezadusil strukturální fault (overfit/throughput žijí na jiné ose).
+5. **Slow-lever probation** (`Probation` state) — pro pomalé páky (WD), co rollout
+   neuvidí: tentativní *živý* commit + ověření na příštím evalu (keep když val
+   neregresuje, jinak revert). Guarded direct action, NE rigorózní A/B —
+   safety net (regresoval val?), ne kontrafaktuál. Smoke: na gap 0.43 governer
+   poprvé **sáhl na páku** — zvedl wd 0.10→0.15, val neregresoval → keep.
+   (Pozn.: `wd_up` zatím škáluje jen AdamW-group WD = embed/head; matrix bulk
+   jede na Muon-WD mimo MSV — rozšíření = silnější regularizace.)
+
+Verifikace: `diagnosis_ignores_healthy_descent_through_noise`,
+`probation_keeps_or_reverts_wd_on_val`. 18 governor + 2 GPU + anti-regrese zelené.
+
+**Follow-up po 14-epoch běhu (val peak 1.656 @ ep5, pak 8 epoch overfit do 1.944).**
+Běh ukázal: governor **poprvé adoptoval fast-lever** (`lr_too_hot → lr_down`,
+`lr_scale → 0.7`, effect +0.0075 > margin 0.0044 — kalibrovaná σ to konečně
+pustila), a jako **diagnostik byl perfektní** (overfit od ep6, přesně v bodě
+obratu). Ale probation **revertovala 8/8** a odhalila 4 věci:
+1. **`muon_weight_decay` do MSV** + `wd_up` ×2 (z ×1.5). `wd_up` teď škáluje
+   AdamW i Muon WD (matrix bulk, ne jen embeddingy); zavádí Muon WD 0.05 když
+   je 0. Bez toho byla páka prakticky k ničemu.
+2. **Rate-based probation keep** — při monotónním overfittingu val roste tak
+   jako tak, takže absolutní „val regresoval → revert" revertuje všechno.
+   Teď: keep pokud změna nezhoršila *rychlost* degradace vs trend před
+   commitem (`Probation::baseline_rate`). Smoke (12 ep): 2 keep / 0 revert
+   (předtím 8/8 revert), WD se **ratchetuje** 0.1→0.2→0.4 (adam) + 0→0.05→0.1
+   (muon).
+3. **Early-stop recommendation** — governor sleduje val trajektorii a od
+   `EARLY_STOP_PATIENCE` (2) evalů za minimem hlasitě emituje `early_stop`
+   event (best_val + best_epoch). `should_stop()` pro volitelný auto-break.
+   Pro overfit režim je to ta jediná akční věc — živé WD memorizaci nezabrání.
+4. **Give-up po `GIVE_UP_REVERTS` (3) revertech** → report-only (early-stop
+   reco nese signál dál), ať governor nemele marnou probation.
+
+Verifikace: `wd_up_arm_raises_both_decays`, `early_stop_recommends_after_patience`,
+`probation_keeps_when_degradation_slows`, `probation_gives_up_after_repeated_reverts`.
+22 governor + 2 GPU + anti-regrese zelené. **Meta:** governor jako *diagnostik*
+(early-stop, overfit) funguje i tam, kde *aktuátor* (živé WD) na hluboký overfit
+strukturálně nestačí — pravý fix je lidský: míň epoch / víc dat.
+
 ---
 
 # Sprint 69 — Performance: měřicí základ + GPU occupancy

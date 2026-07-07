@@ -107,6 +107,11 @@ pub struct Fingerprint {
     pub diverging: bool,
     /// val_bpb − train_bpb at the last epoch eval (overfit signal).
     pub val_gap: f32,
+    /// Relative loss improvement over a long horizon: `(slow_ewma −
+    /// mid_ewma) / slow_ewma`, positive = still learning. Robust to per-step
+    /// batch noise (which buries the tiny per-step slope), so it separates a
+    /// real plateau from healthy-descent-through-noise.
+    pub loss_trend: f32,
     /// Scheduled LR is currently ramping up (warmup) — elevated grads are
     /// expected, so "too hot" is a false alarm here.
     pub lr_rising: bool,
@@ -117,6 +122,7 @@ pub struct Fingerprint {
 
 pub struct Vitals {
     loss_fast: Ewma,
+    loss_mid: Ewma,
     loss_slow: Ewma,
     dloss: Ewma,
     dloss_sq: Ewma,
@@ -140,7 +146,8 @@ impl Vitals {
     pub fn new(total_steps: u64, warmup_steps: u64) -> Self {
         Self {
             loss_fast: Ewma::new(0.3),
-            loss_slow: Ewma::new(0.02),
+            loss_mid: Ewma::new(0.05),
+            loss_slow: Ewma::new(0.01),
             dloss: Ewma::new(0.1),
             dloss_sq: Ewma::new(0.1),
             grad_slow: Ewma::new(0.03),
@@ -165,6 +172,7 @@ impl Vitals {
         }
         if s.loss.is_finite() {
             self.loss_fast.push(s.loss);
+            self.loss_mid.push(s.loss);
             self.loss_slow.push(s.loss);
             self.prev_loss = Some(s.loss);
         }
@@ -245,6 +253,8 @@ impl Vitals {
         let lr_ref = self.lr_slow.get();
         let lr_rising = lr_ref > 1e-12 && lr_now > lr_ref * 1.005;
         let lr_falling = lr_ref > 1e-12 && lr_now < lr_ref * 0.995;
+        let slow = self.loss_slow.get();
+        let loss_trend = (slow - self.loss_mid.get()) / slow.max(1e-6);
         Fingerprint {
             regime: self.regime(),
             loss_slope: self.loss_slope(),
@@ -256,6 +266,7 @@ impl Vitals {
             dt_drift: self.dt_fast.get() / self.dt_slow.get().max(1e-9),
             diverging,
             val_gap: self.val_gap,
+            loss_trend,
             lr_rising,
             lr_falling,
         }
